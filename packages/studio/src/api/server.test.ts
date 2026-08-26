@@ -7202,4 +7202,17 @@ describe("createStudioServer daemon lifecycle", () => {
     expect(saveChapterIndexMock).not.toHaveBeenCalled();
   });
 
+  it.each(["RUNNING", "APPROVED", "HISTORICAL_ONLY"])("does not project %s resume evidence as formal recovery without verified Core authority", async (status) => {
+    const evidenceDir = join(root, "books", "demo-book", "story", "runtime", "bounded-autonomous", "chapter-0003");
+    await mkdir(evidenceDir, { recursive: true });
+    await writeFile(join(evidenceDir, "resume-review.json"), JSON.stringify(status === "HISTORICAL_ONLY" ? { modelOutcomes: [] } : { status }), "utf-8");
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/books/demo-book/chapters/3");
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ formalOfflineRecoveryRequired: false });
+  });
+
 });

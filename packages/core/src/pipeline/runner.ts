@@ -76,6 +76,11 @@ import {
   createRangeObservation,
   writeProductionRunSnapshot,
 } from "../production/harness.js";
+import {
+  loadAutonomousProductionState,
+  verifyFormalPendingChapterRecoveryEvidence,
+  type AutonomousRunProgress,
+} from "../production/bounded-autonomous-controller.js";
 
 const SEQUENCE_LEVEL_CATEGORIES = new Set([
   "Pacing Monotony", "节奏单调",
@@ -1456,7 +1461,16 @@ export class PipelineRunner {
       }
       originalContent = await this.readChapterContent(bookDir, chapterNumber);
 
-      if (await this.loadAutonomousResumeEvidence(bookDir, chapterNumber)) {
+      const autonomousRuntime = await loadAutonomousProductionState<AutonomousRunProgress>(this.config.projectRoot, bookId);
+      const formalOfflineRecoveryRequired = autonomousRuntime?.jobId
+        ? await verifyFormalPendingChapterRecoveryEvidence({
+            projectRoot: this.config.projectRoot,
+            bookId,
+            jobId: autonomousRuntime.jobId,
+            pendingChapterNumber: chapterNumber,
+          })
+        : false;
+      if (formalOfflineRecoveryRequired) {
         return { chapterNumber, status: "FORMAL_OFFLINE_RECOVERY_REQUIRED", revisionCount: 0, findings: [], bodyChanged: false };
       }
       if (chapter.status === "approved" || chapter.status === "accepted-with-findings") {
@@ -1480,15 +1494,20 @@ export class PipelineRunner {
             }
           : item));
       };
-      const resolvePassing = async (findings: ReadonlyArray<AuditIssue>, revisionCount: number): Promise<ExistingChapterReviewResult> => {
-        const status = findings.length === 0 ? "APPROVED" : "ACCEPTED_WITH_FINDINGS";
+      const resolveTerminalDecision = async (audit: AuditResult, revisionCount: number): Promise<ExistingChapterReviewResult | null> => {
+        const decision = classifyFinalAuditDecision(audit);
+        if (decision !== "APPROVED" && decision !== "ACCEPTED_WITH_FINDINGS") return null;
+        const status = decision;
+        const findings = audit.issues;
         await terminalize(status === "APPROVED" ? "approved" : "accepted-with-findings", findings);
         const currentContent = await this.readChapterContent(bookDir, chapterNumber);
         return { chapterNumber, status, revisionCount, findings, bodyChanged: currentContent !== originalContent };
       };
 
       const audit = await this.auditDraft(bookId, chapterNumber);
-      if (audit.passed) return await resolvePassing(audit.issues, 0);
+      const initialTerminal = await resolveTerminalDecision(audit, 0);
+      if (initialTerminal) return initialTerminal;
+      let contradictoryDecision = classifyFinalAuditDecision(audit) === "REVIEW_DECISION_CONTRADICTORY";
 
       const latestChapter = Math.max(...index.map((item) => item.number));
       if (chapterNumber !== latestChapter) {
@@ -1501,7 +1520,7 @@ export class PipelineRunner {
         };
       }
 
-      const maximumRevisions = Math.min(2, Math.max(1, this.config.writingReviewRetries ?? 1));
+      const maximumRevisions = Math.min(2, Math.max(0, this.config.writingReviewRetries ?? 1));
       let findings = audit.issues;
       let attemptedRevisions = 0;
       for (let revisionCount = 1; revisionCount <= maximumRevisions; revisionCount++) {
@@ -1511,14 +1530,26 @@ export class PipelineRunner {
           ...finding,
           suggestion: finding.suggestion ?? "",
         })) ?? findings;
-        if (revised.applied && revised.auditPassed) return await resolvePassing(findings, revisionCount);
+        if (revised.applied) {
+          const postRevisionAudit: AuditResult = {
+            passed: revised.auditPassed === true,
+            issues: findings,
+            summary: "Post-revision audit decision.",
+            overallScore: revised.auditOverallScore,
+            dimensionScores: revised.auditDimensionScores,
+          };
+          const terminal = await resolveTerminalDecision(postRevisionAudit, revisionCount);
+          if (terminal) return terminal;
+          contradictoryDecision ||= classifyFinalAuditDecision(postRevisionAudit) === "REVIEW_DECISION_CONTRADICTORY";
+        }
         if (!revised.applied) break;
       }
 
       const currentContent = await this.readChapterContent(bookDir, chapterNumber);
       return {
         chapterNumber,
-        status: findings.some((finding) => finding.severity === "critical")
+        status: contradictoryDecision || findings.some((finding) => finding.severity === "critical"
+          || finding.blocking === true || finding.explicitSeverity === "CRITICAL" || finding.explicitSeverity === "MAJOR")
           ? "BLOCKED_CRITICAL_FINDINGS"
           : "HELD_AFTER_TWO_REVISIONS",
         revisionCount: attemptedRevisions,

@@ -3242,18 +3242,17 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       const paddedNum = String(num).padStart(4, "0");
       const match = files.find((f) => f.startsWith(paddedNum) && f.endsWith(".md"));
       if (!match) return c.json({ error: "Chapter not found" }, 404);
-      const [content, index] = await Promise.all([
+      const [content, index, autonomousView] = await Promise.all([
         readFile(join(chaptersDir, match), "utf-8"),
         state.loadChapterIndex(id),
+        loadAutonomousView(id).catch(() => null),
       ]);
-      const evidencePath = join(bookDir, "story", "runtime", "bounded-autonomous", `chapter-${paddedNum}`, "resume-review.json");
-      const formalOfflineRecoveryRequired = await access(evidencePath).then(() => true).catch(() => false);
       return c.json({
         chapterNumber: num,
         filename: match,
         content,
         status: index.find((chapter) => chapter.number === num)?.status ?? null,
-        formalOfflineRecoveryRequired,
+        formalOfflineRecoveryRequired: autonomousView?.finalReviewRecovery?.chapter === num,
       });
     } catch {
       return c.json({ error: "Chapter not found" }, 404);
