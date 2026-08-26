@@ -234,7 +234,7 @@ export function projectAutonomousProductionView(params: {
           rescueGeneration: "REUSED" as const,
           rescueArtifactIdentity: `VERIFIED_CHAPTER_${String(auditFailed.number).padStart(3, "0")}` as const,
           finalReview: "PRESERVED" as const,
-          finalReviewDecision: "PASSED_WITH_NONBLOCKING_FINDINGS" as const,
+          finalReviewDecision: params.offlineFinalizationPlan.finalReview.decision,
           writerRegeneration: false as const,
           normalRevisionRegeneration: false as const,
           rescueRevisionRegeneration: false as const,

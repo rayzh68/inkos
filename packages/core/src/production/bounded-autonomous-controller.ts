@@ -736,6 +736,29 @@ export interface FormalPendingChapterRecoveryPlan {
     readonly overallScore: number;
     readonly issues: AcceptedFinalReview["issues"];
   };
+  readonly stateSettlement: {
+    readonly proofRelativePath: "state-settlement-proof.json";
+    readonly proofSha256: string;
+    readonly snapshotId: string;
+    readonly candidateBodySha256: string;
+    readonly artifacts: ReadonlyArray<{
+      readonly sourceRelativePath: string;
+      readonly targetRelativePath: string;
+      readonly sha256: string;
+      readonly content: string;
+    }>;
+  };
+  readonly provenance: {
+    readonly revisionCount: number;
+    readonly logicReviewCount: number;
+    readonly commercialReviewCount: number;
+    readonly roleUsage: Readonly<Record<string, {
+      readonly promptTokens: number;
+      readonly completionTokens: number;
+      readonly totalTokens: number;
+      readonly actualCostUsd?: number;
+    }>>;
+  };
   readonly bindings: ReadonlyArray<{
     readonly logicalStepId: string;
     readonly sourceLogicalStepId: string;
@@ -840,6 +863,161 @@ function extractRescueCandidate(content: string): string {
   return match[1].trim();
 }
 
+const SETTLEMENT_MARKDOWN_FILES = [
+  "current_state.md",
+  "pending_hooks.md",
+  "chapter_summaries.md",
+  "particle_ledger.md",
+  "subplot_board.md",
+  "emotional_arcs.md",
+  "character_matrix.md",
+] as const;
+
+const SETTLEMENT_STRUCTURED_FILES = [
+  "manifest.json",
+  "current_state.json",
+  "hooks.json",
+  "chapter_summaries.json",
+] as const;
+
+interface RecoveryUsage {
+  readonly promptTokens: number;
+  readonly completionTokens: number;
+  readonly totalTokens: number;
+  readonly actualCostUsd?: number;
+}
+
+function parseRecoveryUsage(value: unknown, label: string): Record<string, RecoveryUsage> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`OFFLINE_FINALIZATION_PROVENANCE_INVALID:${label}`);
+  }
+  const result: Record<string, RecoveryUsage> = {};
+  for (const [role, raw] of Object.entries(value)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new Error(`OFFLINE_FINALIZATION_PROVENANCE_INVALID:${label}:${role}`);
+    }
+    const usage = raw as Partial<RecoveryUsage>;
+    if (![usage.promptTokens, usage.completionTokens, usage.totalTokens].every((token) => Number.isInteger(token) && token! >= 0)
+      || usage.totalTokens !== usage.promptTokens! + usage.completionTokens!
+      || (usage.actualCostUsd !== undefined && (!Number.isFinite(usage.actualCostUsd) || usage.actualCostUsd < 0))) {
+      throw new Error(`OFFLINE_FINALIZATION_PROVENANCE_INVALID:${label}:${role}`);
+    }
+    result[role] = {
+      promptTokens: usage.promptTokens!,
+      completionTokens: usage.completionTokens!,
+      totalTokens: usage.totalTokens!,
+      ...(usage.actualCostUsd !== undefined ? { actualCostUsd: usage.actualCostUsd } : {}),
+    };
+  }
+  return result;
+}
+
+function resolveRecoveryProvenance(evidence: Record<string, unknown>): FormalPendingChapterRecoveryPlan["provenance"] {
+  const revisionCount = evidence.revisionCount;
+  const logicReviewCount = evidence.logicReviewCount;
+  const commercialReviewCount = evidence.commercialReviewCount;
+  if (!Number.isInteger(revisionCount) || (revisionCount as number) < 0 || (revisionCount as number) > 2
+    || !Number.isInteger(logicReviewCount) || (logicReviewCount as number) < 0
+    || !Number.isInteger(commercialReviewCount) || (commercialReviewCount as number) < 0) {
+    throw new Error("OFFLINE_FINALIZATION_PROVENANCE_INVALID");
+  }
+  const baseline = parseRecoveryUsage(evidence.baselineRoleUsage ?? {}, "baselineRoleUsage");
+  const current = parseRecoveryUsage(evidence.roleUsage ?? {}, "roleUsage");
+  const roleUsage: Record<string, RecoveryUsage> = { ...baseline };
+  for (const [role, usage] of Object.entries(current)) {
+    const prior = roleUsage[role];
+    roleUsage[role] = prior ? {
+      promptTokens: prior.promptTokens + usage.promptTokens,
+      completionTokens: prior.completionTokens + usage.completionTokens,
+      totalTokens: prior.totalTokens + usage.totalTokens,
+      ...(prior.actualCostUsd !== undefined || usage.actualCostUsd !== undefined
+        ? { actualCostUsd: (prior.actualCostUsd ?? 0) + (usage.actualCostUsd ?? 0) }
+        : {}),
+    } : usage;
+  }
+  return {
+    revisionCount: revisionCount as number,
+    logicReviewCount: logicReviewCount as number,
+    commercialReviewCount: commercialReviewCount as number,
+    roleUsage,
+  };
+}
+
+async function resolveStateSettlementProof(params: {
+  readonly bookDir: string;
+  readonly evidenceDir: string;
+  readonly evidence: Record<string, unknown>;
+  readonly bookId: string;
+  readonly jobId: string;
+  readonly chapterNumber: number;
+  readonly candidateBodySha256: string;
+}): Promise<FormalPendingChapterRecoveryPlan["stateSettlement"]> {
+  const reference = params.evidence.stateSettlementProof as { readonly relativePath?: unknown; readonly sha256?: unknown } | undefined;
+  if (reference?.relativePath !== "state-settlement-proof.json" || !/^[a-f0-9]{64}$/u.test(String(reference.sha256 ?? ""))) {
+    throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE");
+  }
+  const proofBytes = await readFile(join(params.evidenceDir, reference.relativePath));
+  if (sha256(proofBytes) !== reference.sha256) throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE");
+  const proof = JSON.parse(proofBytes.toString("utf-8")) as {
+    readonly schema_version?: unknown;
+    readonly evidence_type?: unknown;
+    readonly book_id?: unknown;
+    readonly job_id?: unknown;
+    readonly chapter_number?: unknown;
+    readonly snapshot_id?: unknown;
+    readonly rescue_candidate_body_sha256?: unknown;
+    readonly artifacts?: ReadonlyArray<{
+      readonly source_relative_path?: unknown;
+      readonly target_relative_path?: unknown;
+      readonly sha256?: unknown;
+    }>;
+  };
+  if (proof.schema_version !== "1.0" || proof.evidence_type !== "OFFLINE_FINALIZATION_STATE_SETTLEMENT_PROOF"
+    || proof.book_id !== params.bookId || proof.job_id !== params.jobId || proof.chapter_number !== params.chapterNumber
+    || typeof proof.snapshot_id !== "string" || !proof.snapshot_id.trim()
+    || proof.rescue_candidate_body_sha256 !== params.candidateBodySha256 || !Array.isArray(proof.artifacts)) {
+    throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE");
+  }
+  const expected = [
+    ...SETTLEMENT_MARKDOWN_FILES.map((name) => ({
+      sourceRelativePath: `story/snapshots/${params.chapterNumber}/${name}`,
+      targetRelativePath: `story/${name}`,
+    })),
+    ...SETTLEMENT_STRUCTURED_FILES.map((name) => ({
+      sourceRelativePath: `story/snapshots/${params.chapterNumber}/state/${name}`,
+      targetRelativePath: `story/state/${name}`,
+    })),
+  ];
+  if (proof.artifacts.length !== expected.length) throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE");
+  const artifacts = await Promise.all(expected.map(async (required) => {
+    const matches = proof.artifacts!.filter((artifact) => artifact.source_relative_path === required.sourceRelativePath
+      && artifact.target_relative_path === required.targetRelativePath);
+    if (matches.length !== 1 || !/^[a-f0-9]{64}$/u.test(String(matches[0]!.sha256 ?? ""))) {
+      throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE");
+    }
+    const bytes = await readFile(join(params.bookDir, required.sourceRelativePath));
+    if (sha256(bytes) !== matches[0]!.sha256) throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE");
+    const content = bytes.toString("utf-8");
+    if (!Buffer.from(content, "utf-8").equals(bytes)) throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE");
+    return { ...required, sha256: matches[0]!.sha256 as string, content };
+  }));
+  const manifest = JSON.parse(artifacts.find((artifact) => artifact.sourceRelativePath.endsWith("/state/manifest.json"))!.content) as { readonly schemaVersion?: unknown; readonly lastAppliedChapter?: unknown };
+  const currentState = JSON.parse(artifacts.find((artifact) => artifact.sourceRelativePath.endsWith("/state/current_state.json"))!.content) as { readonly chapter?: unknown };
+  const summaries = JSON.parse(artifacts.find((artifact) => artifact.sourceRelativePath.endsWith("/state/chapter_summaries.json"))!.content) as { readonly rows?: ReadonlyArray<{ readonly chapter?: unknown }> };
+  if (manifest.schemaVersion !== 2 || manifest.lastAppliedChapter !== params.chapterNumber
+    || currentState.chapter !== params.chapterNumber
+    || !Array.isArray(summaries.rows) || !summaries.rows.some((row) => row.chapter === params.chapterNumber)) {
+    throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE");
+  }
+  return {
+    proofRelativePath: "state-settlement-proof.json",
+    proofSha256: reference.sha256 as string,
+    snapshotId: proof.snapshot_id,
+    candidateBodySha256: params.candidateBodySha256,
+    artifacts,
+  };
+}
+
 async function resolveFormalPendingChapterRecoveryPlanUnsafe(params: {
   readonly projectRoot: string;
   readonly bookId: string;
@@ -876,8 +1054,9 @@ async function resolveFormalPendingChapterRecoveryPlanUnsafe(params: {
   if (pending.length !== 1 || pending[0]!.status !== "audit-failed") throw new Error("OFFLINE_FINALIZATION_CHAPTER_STATE_INVALID");
 
   const chapter = String(params.pendingChapterNumber).padStart(4, "0");
-  const evidenceBytes = await readFile(join(bookDir, "story", "runtime", "bounded-autonomous", `chapter-${chapter}`, "resume-review.json"));
-  const evidence = JSON.parse(evidenceBytes.toString("utf-8")) as {
+  const evidenceDir = join(bookDir, "story", "runtime", "bounded-autonomous", `chapter-${chapter}`);
+  const evidenceBytes = await readFile(join(evidenceDir, "resume-review.json"));
+  const evidence = JSON.parse(evidenceBytes.toString("utf-8")) as Record<string, unknown> & {
     readonly chapter_number?: number;
     readonly status?: string;
     readonly modelOutcomes?: ReadonlyArray<{ readonly modelCallId?: string }>;
@@ -942,6 +1121,23 @@ async function resolveFormalPendingChapterRecoveryPlanUnsafe(params: {
   const accepted = parseAcceptedFinalReview(finalSource.artifact.response.content);
   if (!accepted) throw new Error("OFFLINE_FINALIZATION_FINAL_REVIEW_NOT_ACCEPTED");
   const candidateBody = extractRescueCandidate(rescueSource.artifact.response.content);
+  const candidateBodySha256 = sha256(candidateBody);
+  let stateSettlement: FormalPendingChapterRecoveryPlan["stateSettlement"];
+  try {
+    stateSettlement = await resolveStateSettlementProof({
+      bookDir,
+      evidenceDir,
+      evidence,
+      bookId: params.bookId,
+      jobId: params.jobId,
+      chapterNumber: params.pendingChapterNumber,
+      candidateBodySha256,
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message === "OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE") throw error;
+    throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE", { cause: error });
+  }
+  const provenance = resolveRecoveryProvenance(evidence);
   const expectedBindings = [
     { source: rescueSource, targetRole: "reviser", targetStage: "RESCUE_REVISING_2" },
     { source: finalSource, targetRole: "logicAuditor", targetStage: "LOGIC_REVIEW" },
@@ -1022,7 +1218,7 @@ async function resolveFormalPendingChapterRecoveryPlanUnsafe(params: {
       sourceArtifactSha256: sha256(rescueSource.bytes),
       sourceContentSha256: rescueSource.artifact.content_sha256,
       candidateBody,
-      candidateBodySha256: sha256(candidateBody),
+      candidateBodySha256,
     },
     finalReview: {
       sourceLogicalStepId: finalSource.artifact.logical_step_id,
@@ -1032,6 +1228,8 @@ async function resolveFormalPendingChapterRecoveryPlanUnsafe(params: {
       overallScore: accepted.overallScore,
       issues: accepted.issues,
     },
+    stateSettlement,
+    provenance,
     bindings,
     failedReentryArtifacts,
   };
@@ -1046,6 +1244,9 @@ export async function resolveFormalPendingChapterRecoveryPlan(params: {
   try {
     return await resolveFormalPendingChapterRecoveryPlanUnsafe(params);
   } catch (error) {
+    if (error instanceof Error && error.message === "OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE") {
+      throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE", { cause: error });
+    }
     throw new Error("OFFLINE_FINALIZATION_EVIDENCE_NOT_PROVABLE", { cause: error });
   }
 }
@@ -1056,10 +1257,10 @@ export async function finalizePendingChapterOfflinePlan(params: {
 }): Promise<{
   readonly chapterNumber: number;
   readonly status: "approved" | "accepted-with-findings";
-  readonly revisionCount: 2;
-  readonly logicReviewCount: 2;
-  readonly commercialReviewCount: 0;
-  readonly roleUsage: Readonly<Record<string, never>>;
+  readonly revisionCount: number;
+  readonly logicReviewCount: number;
+  readonly commercialReviewCount: number;
+  readonly roleUsage: FormalPendingChapterRecoveryPlan["provenance"]["roleUsage"];
 }> {
   const plan = params.plan;
   const verified = await resolveFormalPendingChapterRecoveryPlan({
@@ -1083,22 +1284,36 @@ export async function finalizePendingChapterOfflinePlan(params: {
   const finalBody = `${heading}\n\n${plan.rescue.candidateBody}`;
   const status = plan.finalReview.decision === "APPROVED" ? "approved" as const : "accepted-with-findings" as const;
   const updatedAt = new Date().toISOString();
+  const tokenUsage = Object.values(plan.provenance.roleUsage).reduce((total, usage) => ({
+    promptTokens: total.promptTokens + usage.promptTokens,
+    completionTokens: total.completionTokens + usage.completionTokens,
+    totalTokens: total.totalTokens + usage.totalTokens,
+    ...(total.actualCostUsd !== undefined || usage.actualCostUsd !== undefined
+      ? { actualCostUsd: (total.actualCostUsd ?? 0) + (usage.actualCostUsd ?? 0) }
+      : {}),
+  }), { promptTokens: 0, completionTokens: 0, totalTokens: 0 } as RecoveryUsage);
   const updatedIndex = index.map((entry) => entry.number === plan.pendingChapterNumber ? {
     ...entry,
     status,
     wordCount: countChapterLength(plan.rescue.candidateBody, resolveLengthCountingMode(bookLanguage)),
     updatedAt,
     auditIssues: plan.finalReview.issues.map((issue) => `[${issue.severity}] ${issue.description}`),
+    tokenUsage,
+    roleUsage: plan.provenance.roleUsage,
     autonomousReview: {
       status: plan.finalReview.decision,
       grade: plan.finalReview.overallScore >= 90 ? "A" as const : plan.finalReview.overallScore >= 80 ? "B" as const : "C" as const,
-      revisionCount: 2,
+      revisionCount: plan.provenance.revisionCount,
     },
   } : entry);
   const runtimePath = join(bookDir, "story", "runtime", "bounded-autonomous", "production-state.json");
   const runtime = JSON.parse(await readFile(runtimePath, "utf-8")) as Record<string, unknown>;
   const writes: Array<{ readonly relativePath: string; readonly content: string }> = [
     { relativePath: join("chapters", plan.chapterFile), content: finalBody },
+    ...plan.stateSettlement.artifacts.map((artifact) => ({
+      relativePath: artifact.targetRelativePath,
+      content: artifact.content,
+    })),
     { relativePath: join("chapters", "index.json"), content: `${JSON.stringify(updatedIndex, null, 2)}\n` },
     { relativePath: join("story", "runtime", "bounded-autonomous", "production-state.json"), content: `${JSON.stringify({
       ...runtime,
@@ -1142,6 +1357,12 @@ export async function finalizePendingChapterOfflinePlan(params: {
       corrected_bindings: plan.bindings.map((binding) => ({ logical_step_id: binding.logicalStepId, authority_sha256: binding.authoritySha256, file_sha256: binding.fileSha256 })),
       rescue_artifact: { logical_step_id: plan.rescue.sourceLogicalStepId, artifact_sha256: plan.rescue.sourceArtifactSha256, content_sha256: plan.rescue.sourceContentSha256 },
       final_review_artifact: { logical_step_id: plan.finalReview.sourceLogicalStepId, artifact_sha256: plan.finalReview.sourceArtifactSha256, content_sha256: plan.finalReview.sourceContentSha256 },
+      state_settlement_proof: {
+        relative_path: plan.stateSettlement.proofRelativePath,
+        sha256: plan.stateSettlement.proofSha256,
+        snapshot_id: plan.stateSettlement.snapshotId,
+        rescue_candidate_body_sha256: plan.stateSettlement.candidateBodySha256,
+      },
       failed_reentry_artifacts: plan.failedReentryArtifacts.map((artifact) => ({ logical_step_id: artifact.logicalStepId, artifact_sha256: artifact.artifactSha256, content_sha256: artifact.contentSha256 })),
     };
     try {
@@ -1154,7 +1375,14 @@ export async function finalizePendingChapterOfflinePlan(params: {
     }
   }
   await commitAtomicFileSet({ rootDir: bookDir, writes });
-  return { chapterNumber: plan.pendingChapterNumber, status, revisionCount: 2, logicReviewCount: 2, commercialReviewCount: 0, roleUsage: {} };
+  return {
+    chapterNumber: plan.pendingChapterNumber,
+    status,
+    revisionCount: plan.provenance.revisionCount,
+    logicReviewCount: plan.provenance.logicReviewCount,
+    commercialReviewCount: plan.provenance.commercialReviewCount,
+    roleUsage: plan.provenance.roleUsage,
+  };
 }
 
 function logicalProviderStepId(params: {

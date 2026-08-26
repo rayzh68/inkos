@@ -6685,7 +6685,14 @@ describe("createStudioServer daemon lifecycle", () => {
     const { deriveAutonomousJobIdentity, loadBookProductionMap } = await import("@actalk/inkos-core");
     const normalizedMap = await loadBookProductionMap(root, "demo-book");
     const jobId = deriveAutonomousJobIdentity({ map: normalizedMap!, mode: "current-volume", nextChapter: 5 });
-    const admittedPlan = { kind: "FORMAL_OFFLINE_FINALIZATION", recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED", bookId: "demo-book", jobId, pendingChapterNumber: 4 };
+    const admittedPlan = {
+      kind: "FORMAL_OFFLINE_FINALIZATION",
+      recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED",
+      bookId: "demo-book",
+      jobId,
+      pendingChapterNumber: 4,
+      finalReview: { decision: "ACCEPTED_WITH_FINDINGS" },
+    };
     resolveFormalPendingChapterRecoveryPlanMock.mockResolvedValue(admittedPlan);
     finalizePendingChapterOfflineMock.mockImplementationOnce(async (plan) => {
       expect(plan).toBe(admittedPlan);

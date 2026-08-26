@@ -712,6 +712,43 @@ describe("bounded autonomous production controller", () => {
       const rescueBody = "RESCUE_BODY_B";
       expect(oldBody).not.toBe(rescueBody);
       await writeFile(join(chaptersDir, "0004_Pending.md"), `# Chapter 4\n\n${oldBody}`, "utf-8");
+      const snapshotDir = join(bookDir, "story", "snapshots", "4");
+      const snapshotStateDir = join(snapshotDir, "state");
+      await mkdir(snapshotStateDir, { recursive: true });
+      const markdownState = [
+        ["current_state.md", "# Current State\n\nSTATE_B"],
+        ["pending_hooks.md", "# Pending Hooks\n\nSTATE_B"],
+        ["chapter_summaries.md", "# Chapter Summaries\n\nSTATE_B"],
+        ["particle_ledger.md", "# Particle Ledger\n\nSTATE_B"],
+        ["subplot_board.md", "# Subplot Board\n\nSTATE_B"],
+        ["emotional_arcs.md", "# Emotional Arcs\n\nSTATE_B"],
+        ["character_matrix.md", "# Character Matrix\n\nSTATE_B"],
+      ] as const;
+      const structuredState = [
+        ["manifest.json", JSON.stringify({ schemaVersion: 2, language: "en", lastAppliedChapter: 4, projectionVersion: 1, migrationWarnings: [] })],
+        ["current_state.json", JSON.stringify({ chapter: 4, facts: [{ subject: "chapter", predicate: "state", object: "STATE_B", validFromChapter: 4, validUntilChapter: null, sourceChapter: 4 }] })],
+        ["hooks.json", JSON.stringify({ hooks: [] })],
+        ["chapter_summaries.json", JSON.stringify({ rows: [{ chapter: 4, title: "Pending", characters: "", events: "STATE_B", stateChanges: "STATE_B", hookActivity: "", mood: "", chapterType: "" }] })],
+      ] as const;
+      await Promise.all([
+        ...markdownState.map(([name, content]) => writeFile(join(snapshotDir, name), content, "utf-8")),
+        ...structuredState.map(([name, content]) => writeFile(join(snapshotStateDir, name), content, "utf-8")),
+      ]);
+      const settlementProof = Buffer.from(`${JSON.stringify({
+        schema_version: "1.0",
+        evidence_type: "OFFLINE_FINALIZATION_STATE_SETTLEMENT_PROOF",
+        book_id: "book",
+        job_id: jobId,
+        chapter_number: 4,
+        snapshot_id: "chapter-4-state-b",
+        rescue_candidate_body_sha256: createHash("sha256").update(rescueBody).digest("hex"),
+        artifacts: [
+          ...markdownState.map(([name, content]) => ({ source_relative_path: `story/snapshots/4/${name}`, target_relative_path: `story/${name}`, sha256: createHash("sha256").update(content).digest("hex") })),
+          ...structuredState.map(([name, content]) => ({ source_relative_path: `story/snapshots/4/state/${name}`, target_relative_path: `story/state/${name}`, sha256: createHash("sha256").update(content).digest("hex") })),
+        ],
+      }, null, 2)}\n`);
+      await writeFile(join(evidenceDir, "state-settlement-proof.json"), settlementProof);
+      const stateSettlementProof = { relativePath: "state-settlement-proof.json", sha256: createHash("sha256").update(settlementProof).digest("hex") };
       await writeFile(join(chaptersDir, "index.json"), JSON.stringify([{
         number: 4, title: "Pending", status: "audit-failed", wordCount: oldBody.length,
         createdAt: "2026-08-23T00:00:00.000Z", updatedAt: "2026-08-23T00:00:00.000Z", auditIssues: [], lengthWarnings: [],
@@ -753,6 +790,10 @@ describe("bounded autonomous production controller", () => {
       expect(historicalOutcomeIds).toHaveLength(16);
       const originalEvidence = `${JSON.stringify({
         schema_version: "1.0", chapter_number: 4, status: "REVIEW_EXHAUSTED",
+        revisionCount: 2, logicReviewCount: 2, commercialReviewCount: 0,
+        baselineRoleUsage: { writer: { promptTokens: 10, completionTokens: 20, totalTokens: 30 } },
+        roleUsage: { reviser: { promptTokens: 3, completionTokens: 4, totalTokens: 7 } },
+        stateSettlementProof,
         modelOutcomes: historicalOutcomeIds.map((modelCallId) => ({ modelCallId })),
       }, null, 2)}\n`;
       await writeFile(join(evidenceDir, "resume-review.json"), originalEvidence, "utf-8");
@@ -787,6 +828,10 @@ describe("bounded autonomous production controller", () => {
       expect(failedIds).toHaveLength(4);
       const currentEvidence = `${JSON.stringify({
         schema_version: "1.0", chapter_number: 4, status: "BLOCKED_CRITICAL_FINDINGS",
+        revisionCount: 2, logicReviewCount: 3, commercialReviewCount: 0,
+        baselineRoleUsage: { writer: { promptTokens: 10, completionTokens: 20, totalTokens: 30 } },
+        roleUsage: { reviser: { promptTokens: 3, completionTokens: 4, totalTokens: 7 }, "logic-canon-auditor": { promptTokens: 5, completionTokens: 6, totalTokens: 11 } },
+        stateSettlementProof,
         modelOutcomes: [...historicalOutcomeIds, failedIds.at(-1)!].map((modelCallId) => ({ modelCallId })),
       }, null, 2)}\n`;
       await writeFile(join(evidenceDir, "resume-review.json"), currentEvidence, "utf-8");
@@ -825,7 +870,14 @@ describe("bounded autonomous production controller", () => {
       await rm(supersessionPath);
       const result = await finalizePendingChapterOfflinePlan({ projectRoot: root, plan: plan! });
       expect(result.status).toBe("accepted-with-findings");
+      expect(result).toMatchObject({ revisionCount: 2, logicReviewCount: 3, commercialReviewCount: 0 });
+      expect(result.roleUsage).toEqual({
+        writer: { promptTokens: 10, completionTokens: 20, totalTokens: 30 },
+        reviser: { promptTokens: 3, completionTokens: 4, totalTokens: 7 },
+        "logic-canon-auditor": { promptTokens: 5, completionTokens: 6, totalTokens: 11 },
+      });
       expect(await readFile(join(chaptersDir, "0004_Pending.md"), "utf-8")).toBe(`# Chapter 4\n\n${rescueBody}`);
+      expect(await readFile(join(bookDir, "story", "current_state.md"), "utf-8")).toBe(markdownState[0][1]);
       expect(await readFile(join(evidenceDir, "resume-review.json"), "utf-8")).toBe(currentEvidence);
       for (const [index, id] of preservedIds.entries()) expect(await readFile(join(responseDir, `${id}.json`))).toEqual(preserved[index]);
       const supersession = JSON.parse(await readFile(supersessionPath, "utf-8"));
