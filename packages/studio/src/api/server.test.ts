@@ -20,6 +20,7 @@ const reviseDraftMock = vi.fn();
 const resyncChapterArtifactsMock = vi.fn();
 const writeNextChapterMock = vi.fn();
 const resumeAuditFailedChapterBoundedMock = vi.fn();
+const reviewExistingChapterBoundedMock = vi.fn();
 const writeChaptersMock = vi.fn();
 const rollbackToChapterMock = vi.fn();
 const deleteLatestChapterMock = vi.fn();
@@ -293,6 +294,7 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
     resyncChapterArtifacts = resyncChapterArtifactsMock;
     writeNextChapter = writeNextChapterMock;
     resumeAuditFailedChapterBounded = resumeAuditFailedChapterBoundedMock;
+    reviewExistingChapterBounded = reviewExistingChapterBoundedMock;
     writeChapters = writeChaptersMock;
   }
 
@@ -539,6 +541,7 @@ describe("createStudioServer daemon lifecycle", () => {
     resyncChapterArtifactsMock.mockReset();
     writeNextChapterMock.mockReset();
     resumeAuditFailedChapterBoundedMock.mockReset();
+    reviewExistingChapterBoundedMock.mockReset();
     writeChaptersMock.mockReset();
     rollbackToChapterMock.mockReset();
     deleteLatestChapterMock.mockReset();
@@ -7182,6 +7185,34 @@ describe("createStudioServer daemon lifecycle", () => {
         },
       ],
     });
+  });
+
+  it("delegates chapter review-resolve to the single Core product operation", async () => {
+    const result = { chapterNumber: 3, status: "APPROVED", revisionCount: 0, findings: [], bodyChanged: false };
+    reviewExistingChapterBoundedMock.mockResolvedValue(result);
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/books/demo-book/chapters/3/review-resolve", { method: "POST" });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual(result);
+    expect(reviewExistingChapterBoundedMock).toHaveBeenCalledTimes(1);
+    expect(reviewExistingChapterBoundedMock).toHaveBeenCalledWith("demo-book", 3);
+    expect(saveChapterIndexMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["RUNNING", "APPROVED", "HISTORICAL_ONLY"])("does not project %s resume evidence as formal recovery without verified Core authority", async (status) => {
+    const evidenceDir = join(root, "books", "demo-book", "story", "runtime", "bounded-autonomous", "chapter-0003");
+    await mkdir(evidenceDir, { recursive: true });
+    await writeFile(join(evidenceDir, "resume-review.json"), JSON.stringify(status === "HISTORICAL_ONLY" ? { modelOutcomes: [] } : { status }), "utf-8");
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/books/demo-book/chapters/3");
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ formalOfflineRecoveryRequired: false });
   });
 
 });

@@ -5990,4 +5990,217 @@ describe("PipelineRunner", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  describe("reviewExistingChapterBounded", () => {
+    const seed = async (state: StateManager, bookId: string, numbers: number[]) => {
+      const now = "2026-08-26T00:00:00.000Z";
+      await state.saveChapterIndex(bookId, numbers.map((number) => ({
+        number, title: `Chapter ${number}`, status: "drafted" as const, wordCount: 12,
+        createdAt: now, updatedAt: now, auditIssues: [], lengthWarnings: [],
+      })));
+      await Promise.all(numbers.map((number) => writeFile(
+        join(state.bookDir(bookId), "chapters", `${String(number).padStart(4, "0")}_Chapter_${number}.md`),
+        `# Chapter ${number}\n\nOriginal body ${number}.`, "utf-8",
+      )));
+    };
+
+    it("terminalizes a direct pass in Core without Writer generation or body mutation", async () => {
+      const { root, runner, state, bookId } = await createRunnerFixture();
+      await seed(state, bookId, [1]);
+      const path = join(state.bookDir(bookId), "chapters", "0001_Chapter_1.md");
+      const before = await readFile(path, "utf-8");
+      vi.spyOn(runner, "auditDraft").mockResolvedValue({ chapterNumber: 1, passed: true, issues: [], summary: "clean" });
+      const writer = vi.spyOn(WriterAgent.prototype, "writeChapter");
+      try {
+        await expect(runner.reviewExistingChapterBounded(bookId, 1)).resolves.toMatchObject({ status: "APPROVED", revisionCount: 0, bodyChanged: false });
+        expect((await state.loadChapterIndex(bookId))[0]?.status).toBe("approved");
+        expect(await readFile(path, "utf-8")).toBe(before);
+        expect(writer).not.toHaveBeenCalled();
+      } finally { await rm(root, { recursive: true, force: true }); }
+    });
+
+    it.each([
+      {
+        label: "critical finding",
+        audit: createAuditResult({ passed: true, issues: [CRITICAL_ISSUE] }),
+      },
+      {
+        label: "explicit MAJOR finding",
+        audit: createAuditResult({ passed: true, issues: [{
+          severity: "warning", explicitSeverity: "MAJOR", category: "causal_logic",
+          description: "Major causal gap.", suggestion: "Repair the causal bridge.",
+        }] }),
+      },
+      {
+        label: "hard dimension below threshold",
+        audit: createAuditResult({
+          passed: true,
+          dimensionScores: {
+            blueprint_transition: 90, causal_logic: 79, canon_continuity: 90,
+            character_motivation: 90, state_inheritance: 90, hooks_disclosure: 90,
+            narrative_clarity: 90,
+          },
+        }),
+      },
+    ])("does not terminalize contradictory passed=true with $label", async ({ audit }) => {
+      const { root, runner, state, bookId } = await createRunnerFixture({ writingReviewRetries: 0 });
+      await seed(state, bookId, [1]);
+      vi.spyOn(runner, "auditDraft").mockResolvedValue({ ...audit, chapterNumber: 1 });
+      const revise = vi.spyOn(runner, "reviseDraft");
+      try {
+        const result = await runner.reviewExistingChapterBounded(bookId, 1);
+        expect(result.status).toBe("BLOCKED_CRITICAL_FINDINGS");
+        expect((await state.loadChapterIndex(bookId))[0]?.status).not.toMatch(/approved|accepted-with-findings/u);
+        expect(revise).not.toHaveBeenCalled();
+      } finally { await rm(root, { recursive: true, force: true }); }
+    });
+
+    it("uses the final-audit classifier after revision before terminalizing", async () => {
+      const { root, runner, state, bookId } = await createRunnerFixture({ writingReviewRetries: 1 });
+      await seed(state, bookId, [1]);
+      vi.spyOn(runner, "auditDraft").mockResolvedValue({
+        ...createAuditResult({ passed: false, issues: [{ severity: "warning", category: "pacing", description: "Revise.", suggestion: "Tighten." }] }),
+        chapterNumber: 1,
+      });
+      vi.spyOn(runner, "reviseDraft").mockResolvedValue({
+        chapterNumber: 1, wordCount: 13, fixedIssues: [], applied: true,
+        status: "ready-for-review", auditPassed: true, auditIssues: [CRITICAL_ISSUE],
+      });
+      try {
+        const result = await runner.reviewExistingChapterBounded(bookId, 1);
+        expect(result.status).toBe("BLOCKED_CRITICAL_FINDINGS");
+        expect((await state.loadChapterIndex(bookId))[0]?.status).not.toMatch(/approved|accepted-with-findings/u);
+      } finally { await rm(root, { recursive: true, force: true }); }
+    });
+
+    it("honors writingReviewRetries=0 without invoking revision", async () => {
+      const { root, runner, state, bookId } = await createRunnerFixture({ writingReviewRetries: 0 });
+      await seed(state, bookId, [1]);
+      vi.spyOn(runner, "auditDraft").mockResolvedValue({
+        ...createAuditResult({ passed: false, issues: [{ severity: "warning", category: "pacing", description: "Revise.", suggestion: "Tighten." }] }),
+        chapterNumber: 1,
+      });
+      const revise = vi.spyOn(runner, "reviseDraft").mockResolvedValue({
+        chapterNumber: 1, wordCount: 12, fixedIssues: [], applied: false,
+        status: "unchanged", auditPassed: false, auditIssues: [],
+      });
+      try {
+        await expect(runner.reviewExistingChapterBounded(bookId, 1)).resolves.toMatchObject({
+          status: "HELD_AFTER_TWO_REVISIONS", revisionCount: 0, bodyChanged: false,
+        });
+        expect(revise).not.toHaveBeenCalled();
+      } finally { await rm(root, { recursive: true, force: true }); }
+    });
+
+    it("allows only the latest chapter to revise and terminalizes the passing result", async () => {
+      const { root, runner, state, bookId } = await createRunnerFixture({ writingReviewRetries: 1 });
+      await seed(state, bookId, [1]);
+      const path = join(state.bookDir(bookId), "chapters", "0001_Chapter_1.md");
+      vi.spyOn(runner, "auditDraft").mockResolvedValue({ chapterNumber: 1, passed: false, issues: [CRITICAL_ISSUE], summary: "revise" });
+      vi.spyOn(runner, "reviseDraft").mockImplementation(async () => {
+        await writeFile(path, "# Chapter 1\n\nRevised body.", "utf-8");
+        return { chapterNumber: 1, wordCount: 13, fixedIssues: ["fixed"], applied: true, status: "ready-for-review", auditPassed: true, auditIssues: [] };
+      });
+      const writer = vi.spyOn(WriterAgent.prototype, "writeChapter");
+      try {
+        await expect(runner.reviewExistingChapterBounded(bookId, 1)).resolves.toMatchObject({ status: "APPROVED", revisionCount: 1, bodyChanged: true });
+        expect(await readFile(path, "utf-8")).toContain("Revised body");
+        expect((await state.loadChapterIndex(bookId))[0]?.status).toBe("approved");
+        expect(writer).not.toHaveBeenCalled();
+      } finally { await rm(root, { recursive: true, force: true }); }
+    });
+
+    it("requires downstream revalidation before revising an earlier chapter", async () => {
+      const { root, runner, state, bookId } = await createRunnerFixture();
+      await seed(state, bookId, [1, 2]);
+      const paths = [1, 2].map((number) => join(state.bookDir(bookId), "chapters", `${String(number).padStart(4, "0")}_Chapter_${number}.md`));
+      const before = await Promise.all(paths.map((path) => readFile(path, "utf-8")));
+      vi.spyOn(runner, "auditDraft").mockResolvedValue({ chapterNumber: 1, passed: false, issues: [CRITICAL_ISSUE], summary: "revise" });
+      const revise = vi.spyOn(runner, "reviseDraft");
+      try {
+        await expect(runner.reviewExistingChapterBounded(bookId, 1)).resolves.toMatchObject({ status: "DOWNSTREAM_REVALIDATION_REQUIRED", bodyChanged: false });
+        expect(revise).not.toHaveBeenCalled();
+        expect(await Promise.all(paths.map((path) => readFile(path, "utf-8")))).toEqual(before);
+      } finally { await rm(root, { recursive: true, force: true }); }
+    });
+
+    it("fails closed when review execution throws and does not fake approval", async () => {
+      const { root, runner, state, bookId } = await createRunnerFixture();
+      await seed(state, bookId, [1]);
+      vi.spyOn(runner, "auditDraft").mockRejectedValue(new Error("review unavailable"));
+      try {
+        await expect(runner.reviewExistingChapterBounded(bookId, 1)).resolves.toMatchObject({ status: "FAILED", bodyChanged: false, error: "review unavailable" });
+        expect((await state.loadChapterIndex(bookId))[0]?.status).toBe("drafted");
+      } finally { await rm(root, { recursive: true, force: true }); }
+    });
+
+    it.each(["RUNNING", "APPROVED"] as const)("does not treat %s resume evidence as formal offline recovery", async (status) => {
+      const { root, runner, state, bookId } = await createRunnerFixture({ writingReviewRetries: 0 });
+      await seed(state, bookId, [1]);
+      const evidenceDir = join(state.bookDir(bookId), "story", "runtime", "bounded-autonomous", "chapter-0001");
+      await mkdir(evidenceDir, { recursive: true });
+      await writeFile(join(evidenceDir, "resume-review.json"), JSON.stringify({ status }), "utf-8");
+      vi.spyOn(runner, "auditDraft").mockResolvedValue({ chapterNumber: 1, passed: true, issues: [], summary: "clean" });
+      try {
+        await expect(runner.reviewExistingChapterBounded(bookId, 1)).resolves.toMatchObject({ status: "APPROVED" });
+      } finally { await rm(root, { recursive: true, force: true }); }
+    });
+
+    it("routes formal offline evidence away before any ordinary review", async () => {
+      const { root, runner, state, bookId } = await createRunnerFixture();
+      await seed(state, bookId, [4]);
+      const runtimeDir = join(state.bookDir(bookId), "story", "runtime", "bounded-autonomous");
+      const evidenceDir = join(runtimeDir, "chapter-0004");
+      const responseDir = join(runtimeDir, "provider-responses");
+      await Promise.all([mkdir(evidenceDir, { recursive: true }), mkdir(responseDir, { recursive: true })]);
+      const jobId = "formal-review-entrypoint-test";
+      const execution = createAutonomousProviderExecution({
+        projectRoot: root,
+        bookId,
+        jobId,
+        getActiveStage: () => ({ stage: "RESCUE_REVISING_2", role: "reviser", provider: "custom", model: "test-model" }),
+      });
+      const artifacts = [
+        { fingerprint: "a".repeat(64), content: "=== REVISED_CONTENT ===\nFaithful rescue candidate." },
+        { fingerprint: "b".repeat(64), content: JSON.stringify({
+          passed: true, overall_score: 92,
+          dimension_scores: {
+            blueprint_transition: 90, causal_logic: 90, canon_continuity: 90,
+            character_motivation: 90, state_inheritance: 90, hooks_disclosure: 90,
+            narrative_clarity: 90,
+          },
+          issues: [{ severity: "warning", category: "causal_logic", description: "Track later.", suggestion: "Track.", repair_scope: "structural" }],
+          summary: "Passed with findings.",
+        }) },
+      ].map((artifact) => ({
+        ...artifact,
+        id: execution.responseArtifactPath(artifact.fingerprint, "custom", "test-model", 5).split(/[\\/]/u).at(-1)!.replace(/\.json$/u, ""),
+      }));
+      for (const artifact of artifacts) {
+        await writeFile(join(responseDir, `${artifact.id}.json`), JSON.stringify({
+          schema_version: "1.0", job_id: jobId, logical_step_id: artifact.id, usage_identity: artifact.id,
+          chapter_number: 5, role: "reviser", stage: "RESCUE_REVISING_2", provider: "custom", requested_model: "test-model",
+          input_fingerprint: artifact.fingerprint, response_artifact_status: "COMPLETE",
+          content_sha256: createHash("sha256").update(artifact.content).digest("hex"),
+          response: { content: artifact.content }, completed_at: "2026-08-23T00:00:00.000Z",
+        }), "utf-8");
+      }
+      await Promise.all([
+        writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+          jobId, status: "REVIEW_EXHAUSTED", nextChapter: 5, chapterNumber: 5, responseArtifactStatus: "COMPLETE",
+        }), "utf-8"),
+        writeFile(join(evidenceDir, "resume-review.json"), JSON.stringify({
+          chapter_number: 4, status: "REVIEW_EXHAUSTED",
+          modelOutcomes: artifacts.map((artifact) => ({ modelCallId: artifact.id, provider: "custom", model: "test-model" })),
+        }), "utf-8"),
+      ]);
+      const audit = vi.spyOn(runner, "auditDraft");
+      const revise = vi.spyOn(runner, "reviseDraft");
+      try {
+        await expect(runner.reviewExistingChapterBounded(bookId, 4)).resolves.toMatchObject({ status: "FORMAL_OFFLINE_RECOVERY_REQUIRED", bodyChanged: false });
+        expect(audit).not.toHaveBeenCalled();
+        expect(revise).not.toHaveBeenCalled();
+      } finally { await rm(root, { recursive: true, force: true }); }
+    });
+  });
 });

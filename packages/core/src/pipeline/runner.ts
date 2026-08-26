@@ -76,6 +76,11 @@ import {
   createRangeObservation,
   writeProductionRunSnapshot,
 } from "../production/harness.js";
+import {
+  loadAutonomousProductionState,
+  verifyFormalPendingChapterRecoveryEvidence,
+  type AutonomousRunProgress,
+} from "../production/bounded-autonomous-controller.js";
 
 const SEQUENCE_LEVEL_CATEGORIES = new Set([
   "Pacing Monotony", "节奏单调",
@@ -396,6 +401,24 @@ export interface ReviseResult {
   readonly lengthWarnings?: ReadonlyArray<string>;
   readonly lengthTelemetry?: LengthTelemetry;
   readonly roleUsage?: Readonly<Record<string, RoleTokenUsage>>;
+}
+
+export type ExistingChapterReviewStatus =
+  | "APPROVED"
+  | "ACCEPTED_WITH_FINDINGS"
+  | "DOWNSTREAM_REVALIDATION_REQUIRED"
+  | "FORMAL_OFFLINE_RECOVERY_REQUIRED"
+  | "BLOCKED_CRITICAL_FINDINGS"
+  | "HELD_AFTER_TWO_REVISIONS"
+  | "FAILED";
+
+export interface ExistingChapterReviewResult {
+  readonly chapterNumber: number;
+  readonly status: ExistingChapterReviewStatus;
+  readonly revisionCount: number;
+  readonly findings: ReadonlyArray<AuditIssue>;
+  readonly bodyChanged: boolean;
+  readonly error?: string;
 }
 
 export interface ResumeAuditFailedChapterResult {
@@ -1420,6 +1443,133 @@ export class PipelineRunner {
     );
 
     return { ...result, chapterNumber: targetChapter };
+  }
+
+  /** Review an already-persisted chapter without entering the Writer generation path. */
+  async reviewExistingChapterBounded(bookId: string, chapterNumber: number): Promise<ExistingChapterReviewResult> {
+    if (!Number.isInteger(chapterNumber) || chapterNumber < 1) {
+      return { chapterNumber, status: "FAILED", revisionCount: 0, findings: [], bodyChanged: false, error: "Invalid chapter number" };
+    }
+
+    const bookDir = this.state.bookDir(bookId);
+    let originalContent = "";
+    try {
+      const index = await this.state.loadChapterIndex(bookId);
+      const chapter = index.find((item) => item.number === chapterNumber);
+      if (!chapter) {
+        return { chapterNumber, status: "FAILED", revisionCount: 0, findings: [], bodyChanged: false, error: `Chapter ${chapterNumber} not found in index` };
+      }
+      originalContent = await this.readChapterContent(bookDir, chapterNumber);
+
+      const autonomousRuntime = await loadAutonomousProductionState<AutonomousRunProgress>(this.config.projectRoot, bookId);
+      const formalOfflineRecoveryRequired = autonomousRuntime?.jobId
+        ? await verifyFormalPendingChapterRecoveryEvidence({
+            projectRoot: this.config.projectRoot,
+            bookId,
+            jobId: autonomousRuntime.jobId,
+            pendingChapterNumber: chapterNumber,
+          })
+        : false;
+      if (formalOfflineRecoveryRequired) {
+        return { chapterNumber, status: "FORMAL_OFFLINE_RECOVERY_REQUIRED", revisionCount: 0, findings: [], bodyChanged: false };
+      }
+      if (chapter.status === "approved" || chapter.status === "accepted-with-findings") {
+        return {
+          chapterNumber,
+          status: chapter.status === "approved" ? "APPROVED" : "ACCEPTED_WITH_FINDINGS",
+          revisionCount: 0,
+          findings: [],
+          bodyChanged: false,
+        };
+      }
+
+      const terminalize = async (status: "approved" | "accepted-with-findings", findings: ReadonlyArray<AuditIssue>) => {
+        const latest = await this.state.loadChapterIndex(bookId);
+        await this.state.saveChapterIndex(bookId, latest.map((item) => item.number === chapterNumber
+          ? {
+              ...item,
+              status,
+              updatedAt: new Date().toISOString(),
+              auditIssues: findings.map((finding) => `[${finding.severity}] ${finding.description}`),
+            }
+          : item));
+      };
+      const resolveTerminalDecision = async (audit: AuditResult, revisionCount: number): Promise<ExistingChapterReviewResult | null> => {
+        const decision = classifyFinalAuditDecision(audit);
+        if (decision !== "APPROVED" && decision !== "ACCEPTED_WITH_FINDINGS") return null;
+        const status = decision;
+        const findings = audit.issues;
+        await terminalize(status === "APPROVED" ? "approved" : "accepted-with-findings", findings);
+        const currentContent = await this.readChapterContent(bookDir, chapterNumber);
+        return { chapterNumber, status, revisionCount, findings, bodyChanged: currentContent !== originalContent };
+      };
+
+      const audit = await this.auditDraft(bookId, chapterNumber);
+      const initialTerminal = await resolveTerminalDecision(audit, 0);
+      if (initialTerminal) return initialTerminal;
+      let contradictoryDecision = classifyFinalAuditDecision(audit) === "REVIEW_DECISION_CONTRADICTORY";
+
+      const latestChapter = Math.max(...index.map((item) => item.number));
+      if (chapterNumber !== latestChapter) {
+        return {
+          chapterNumber,
+          status: "DOWNSTREAM_REVALIDATION_REQUIRED",
+          revisionCount: 0,
+          findings: audit.issues,
+          bodyChanged: false,
+        };
+      }
+
+      const maximumRevisions = Math.min(2, Math.max(0, this.config.writingReviewRetries ?? 1));
+      let findings = audit.issues;
+      let attemptedRevisions = 0;
+      for (let revisionCount = 1; revisionCount <= maximumRevisions; revisionCount++) {
+        attemptedRevisions = revisionCount;
+        const revised = await this.reviseDraft(bookId, chapterNumber, "auto", undefined, { persistedFindings: findings });
+        findings = revised.auditIssues?.map((finding) => ({
+          ...finding,
+          suggestion: finding.suggestion ?? "",
+        })) ?? findings;
+        if (revised.applied) {
+          const postRevisionAudit: AuditResult = {
+            passed: revised.auditPassed === true,
+            issues: findings,
+            summary: "Post-revision audit decision.",
+            overallScore: revised.auditOverallScore,
+            dimensionScores: revised.auditDimensionScores,
+          };
+          const terminal = await resolveTerminalDecision(postRevisionAudit, revisionCount);
+          if (terminal) return terminal;
+          contradictoryDecision ||= classifyFinalAuditDecision(postRevisionAudit) === "REVIEW_DECISION_CONTRADICTORY";
+        }
+        if (!revised.applied) break;
+      }
+
+      const currentContent = await this.readChapterContent(bookDir, chapterNumber);
+      return {
+        chapterNumber,
+        status: contradictoryDecision || findings.some((finding) => finding.severity === "critical"
+          || finding.blocking === true || finding.explicitSeverity === "CRITICAL" || finding.explicitSeverity === "MAJOR")
+          ? "BLOCKED_CRITICAL_FINDINGS"
+          : "HELD_AFTER_TWO_REVISIONS",
+        revisionCount: attemptedRevisions,
+        findings,
+        bodyChanged: currentContent !== originalContent,
+      };
+    } catch (error) {
+      let bodyChanged = false;
+      if (originalContent) {
+        bodyChanged = await this.readChapterContent(bookDir, chapterNumber).then((content) => content !== originalContent).catch(() => false);
+      }
+      return {
+        chapterNumber,
+        status: "FAILED",
+        revisionCount: 0,
+        findings: [],
+        bodyChanged,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
   }
 
   /** Revise the latest (or specified) chapter based on audit issues. */
