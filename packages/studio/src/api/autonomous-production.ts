@@ -239,36 +239,35 @@ export function projectAutonomousProductionView(params: {
   if (repairNeedsReconciliation) blockers.push("STATE_REPAIR_RECONCILIATION_REQUIRED");
   const auditFailed = params.chapters.find((chapter) => chapter.status === "audit-failed");
   const recoveryOwnership = params.runtime?.recoveryOwnership;
-  const ownedFormalRecovery = auditFailed !== undefined
-    && recoveryOwnership?.bookId === params.map.bookId
-    && recoveryOwnership.jobId === params.runtime?.jobId
-    && recoveryOwnership.pendingChapterNumber === auditFailed.number;
-  const finalReviewRecovery = auditFailed
-    && ((params.runtime?.status === "REVIEW_EXHAUSTED" || params.runtime?.status === "BLOCKED_CRITICAL_FINDINGS")
-      ? params.runtime.responseArtifactStatus === "COMPLETE" && (params.runtime.revisionRound === 2 || params.runtime.phase === "RESCUE_REVISING_2")
-      : ownedFormalRecovery)
-    && params.offlineFinalizationPlan !== undefined && params.offlineFinalizationPlan !== null
+  const formalRecoveryPlan = auditFailed
+    && params.offlineFinalizationPlan
+    && params.offlineFinalizationPlan.bookId === params.map.bookId
+    && params.offlineFinalizationPlan.jobId === params.runtime?.jobId
+    && params.offlineFinalizationPlan.pendingChapterNumber === auditFailed.number
+      ? params.offlineFinalizationPlan
+      : undefined;
+  const finalReviewRecovery = auditFailed && formalRecoveryPlan
       ? {
-          recoveryMode: params.offlineFinalizationPlan.kind,
+          recoveryMode: formalRecoveryPlan.kind,
           chapter: auditFailed.number,
           rescueCandidate: "PRESERVED" as const,
           rescueGeneration: "REUSED" as const,
           rescueArtifactIdentity: `VERIFIED_CHAPTER_${String(auditFailed.number).padStart(3, "0")}` as const,
           finalReview: "PRESERVED" as const,
-          finalReviewDecision: params.offlineFinalizationPlan.finalReview.decision,
+          finalReviewDecision: formalRecoveryPlan.finalReview.decision,
           writerRegeneration: false as const,
           normalRevisionRegeneration: false as const,
           rescueRevisionRegeneration: false as const,
-          nextAction: params.offlineFinalizationPlan.kind === "FORMAL_OFFLINE_FINALIZATION"
+          nextAction: formalRecoveryPlan.kind === "FORMAL_OFFLINE_FINALIZATION"
             ? `FINALIZE_CHAPTER_${String(auditFailed.number).padStart(3, "0")}_AND_CONTINUE` as const
             : `REBASELINE_CHAPTER_${String(auditFailed.number).padStart(3, "0")}_STATE_AND_CONTINUE` as const,
-          additionalWriterCalls: params.offlineFinalizationPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : 2 as const,
+          additionalWriterCalls: formalRecoveryPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : 2 as const,
           additionalReviserCalls: 0 as const,
-          additionalReviewerCalls: params.offlineFinalizationPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : 1 as const,
-          normalProviderCalls: params.offlineFinalizationPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : 3 as const,
-          maximumProviderCalls: params.offlineFinalizationPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : 6 as const,
+          additionalReviewerCalls: formalRecoveryPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : 1 as const,
+          normalProviderCalls: formalRecoveryPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : 3 as const,
+          maximumProviderCalls: formalRecoveryPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : 6 as const,
           additionalRevisionAllowed: false as const,
-          recoveryClass: params.offlineFinalizationPlan?.recoveryClass ?? "ORIGINAL_REVIEW_EXHAUSTED" as const,
+          recoveryClass: formalRecoveryPlan.recoveryClass,
         }
       : undefined;
   if (!roles.writer) blockers.push("WRITER_MODEL_NOT_CONFIGURED");

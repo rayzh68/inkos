@@ -240,12 +240,86 @@ describe("autonomous production Studio projection", () => {
       map, targetChapters: 156, nextChapter: 5,
       chapters: [1, 2, 3, 4].map((number) => ({ number, status: number === 4 ? "audit-failed" as const : "approved" as const })),
       config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini", reviser: "gpt", "observer-reflector": "flash" } },
-      catalog, runtime, offlineFinalizationPlan: { kind: "FORMAL_OFFLINE_FINALIZATION", recoveryClass: "FAILED_REENTRY", finalReview: { decision: "ACCEPTED_WITH_FINDINGS" } } as never,
+      catalog, runtime, offlineFinalizationPlan: {
+        kind: "FORMAL_OFFLINE_FINALIZATION", recoveryClass: "FAILED_REENTRY", bookId: "book", jobId: "job",
+        pendingChapterNumber: 4, finalReview: { decision: "ACCEPTED_WITH_FINDINGS" },
+      } as never,
       active: false, budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
     });
     expect(view.runtimeStatus).toBe("RECOVERY_READY_OFFLINE_FINALIZATION_AFTER_FAILED_REENTRY");
     expect(view.runtimeBlockers).not.toContain("BLOCKED_CRITICAL_FINDINGS");
     expect(view.finalReviewRecovery).toMatchObject({ recoveryClass: "FAILED_REENTRY", finalReviewDecision: "ACCEPTED_WITH_FINDINGS", additionalWriterCalls: 0, additionalReviserCalls: 0, additionalReviewerCalls: 0 });
+  });
+
+  it("projects a matching Core rebaseline plan without legacy runtime phase telemetry", () => {
+    const recoveryMap = {
+      schemaVersion: "1.0" as const, bookId: "projection-book", authorityBookId: "authority", title: "Generic Book", totalChapters: 8,
+      volumes: [{ volumeId: "volume-001", volumeNumber: 1, title: "One", startChapter: 1, endChapter: 8, chapterCount: 8 }],
+    };
+    for (const runtime of [
+      {
+        jobId: "projection-job", status: "BLOCKED_CRITICAL_FINDINGS", mode: "current-volume", nextChapter: 7,
+        updatedAt: "now", phase: "LOGIC_REVIEW", responseArtifactStatus: "COMPLETE",
+      },
+      {
+        jobId: "projection-job", status: "PAUSED_DETERMINISTIC_PROVIDER_ERROR", mode: "current-volume", nextChapter: 7,
+        updatedAt: "now",
+      },
+    ] as const) {
+      const view = projectAutonomousProductionView({
+        map: recoveryMap, targetChapters: 8, nextChapter: 7,
+        chapters: [1, 2, 3, 4, 5, 6].map((number) => ({ number, status: number === 6 ? "audit-failed" as const : "approved" as const })),
+        config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini", reviser: "gpt", "observer-reflector": "flash" } },
+        catalog, runtime,
+        offlineFinalizationPlan: {
+          kind: "FORMAL_BOUNDED_STATE_REBASELINE", recoveryClass: "FAILED_REENTRY", bookId: "projection-book",
+          jobId: "projection-job", pendingChapterNumber: 6, finalReview: { decision: "ACCEPTED_WITH_FINDINGS" },
+        } as never,
+        active: false, budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
+      });
+      expect(view.runtimeStatus).toBe("RECOVERY_READY_BOUNDED_STATE_REBASELINE");
+      expect(view.runtimeBlockers).not.toContain("BLOCKED_CRITICAL_FINDINGS");
+      expect(view.startEnabled).toBe(true);
+      expect(view.finalReviewRecovery).toMatchObject({ chapter: 6, normalProviderCalls: 3, maximumProviderCalls: 6 });
+    }
+  });
+
+  it("keeps critical findings blocked when Core supplies no recovery plan", () => {
+    const view = projectAutonomousProductionView({
+      map, targetChapters: 156, nextChapter: 5,
+      chapters: [1, 2, 3, 4].map((number) => ({ number, status: number === 4 ? "audit-failed" as const : "approved" as const })),
+      config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini", reviser: "gpt", "observer-reflector": "flash" } },
+      catalog,
+      runtime: { jobId: "job", status: "BLOCKED_CRITICAL_FINDINGS", mode: "current-volume", nextChapter: 5, updatedAt: "now", phase: "LOGIC_REVIEW", responseArtifactStatus: "COMPLETE" },
+      offlineFinalizationPlan: null, active: false, budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
+    });
+    expect(view.runtimeBlockers).toContain("BLOCKED_CRITICAL_FINDINGS");
+    expect(view.startEnabled).toBe(false);
+    expect(view.finalReviewRecovery).toBeUndefined();
+  });
+
+  it("fails closed when a Core recovery plan does not match the projected identity", () => {
+    for (const mismatch of [
+      { bookId: "other-book", jobId: "job", pendingChapterNumber: 4 },
+      { bookId: "book", jobId: "other-job", pendingChapterNumber: 4 },
+      { bookId: "book", jobId: "job", pendingChapterNumber: 3 },
+    ]) {
+      const view = projectAutonomousProductionView({
+        map, targetChapters: 156, nextChapter: 5,
+        chapters: [1, 2, 3, 4].map((number) => ({ number, status: number === 4 ? "audit-failed" as const : "approved" as const })),
+        config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini", reviser: "gpt", "observer-reflector": "flash" } },
+        catalog,
+        runtime: { jobId: "job", status: "BLOCKED_CRITICAL_FINDINGS", mode: "current-volume", nextChapter: 5, updatedAt: "now", phase: "LOGIC_REVIEW", responseArtifactStatus: "COMPLETE" },
+        offlineFinalizationPlan: {
+          kind: "FORMAL_BOUNDED_STATE_REBASELINE", recoveryClass: "FAILED_REENTRY", ...mismatch,
+          finalReview: { decision: "ACCEPTED_WITH_FINDINGS" },
+        } as never,
+        active: false, budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
+      });
+      expect(view.runtimeBlockers).toContain("BLOCKED_CRITICAL_FINDINGS");
+      expect(view.startEnabled).toBe(false);
+      expect(view.finalReviewRecovery).toBeUndefined();
+    }
   });
 
   it("derives current volume and budget without hard-coded chapter boundaries", () => {
@@ -478,7 +552,10 @@ describe("autonomous production Studio projection", () => {
       config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini", reviser: "gpt", "observer-reflector": "flash" } },
       catalog,
       runtime: { jobId: "autonomous-deadbeef", status: "REVIEW_EXHAUSTED", mode: "current-volume", nextChapter: 5, updatedAt: "2026-08-21T00:00:00.000Z", phase: "RESCUE_REVISING_2", responseArtifactStatus: "COMPLETE" },
-      offlineFinalizationPlan: { kind: "FORMAL_OFFLINE_FINALIZATION", recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED", finalReview: { decision: "APPROVED" } } as never,
+      offlineFinalizationPlan: {
+        kind: "FORMAL_OFFLINE_FINALIZATION", recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED", bookId: "book",
+        jobId: "autonomous-deadbeef", pendingChapterNumber: 4, finalReview: { decision: "APPROVED" },
+      } as never,
       active: false,
       budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
     });
