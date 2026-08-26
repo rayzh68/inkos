@@ -664,45 +664,6 @@ describe("bounded autonomous production controller", () => {
         source_artifact_sha256: createHash("sha256").update(original).digest("hex"),
       });
       expect(binding).not.toHaveProperty("response");
-      let chapterIndex: ChapterMeta[] = [{
-        number: 4, title: "Pending", status: "audit-failed", wordCount: 100,
-        createdAt: "2026-08-23T00:00:00.000Z", updatedAt: "2026-08-23T00:00:00.000Z",
-        auditIssues: [], lengthWarnings: [],
-      }];
-      let chapterFiveCalls = 0;
-      let stopAfterSettlement = false;
-      const actions = await createAutonomousPipelineActions({
-        bookId: "book",
-        state: {
-          loadChapterIndex: async () => chapterIndex,
-          saveChapterIndex: async (_bookId, chapters) => { chapterIndex = [...chapters]; },
-        },
-        pipeline: {
-          writeNextChapter: async () => { chapterFiveCalls += 1; return { chapterNumber: 5, status: "ready-for-review" }; },
-          resumeAuditFailedChapterBounded: async () => {
-            await execution.runProviderCall(4, async () => { throw new Error("transport must not run"); }, { provider: "openrouter", model: "provider/model", inputFingerprint: fingerprint });
-            await finalExecution.runProviderCall(4, async () => { throw new Error("transport must not run"); }, { provider: "openrouter", model: "provider/model", inputFingerprint: finalFingerprint });
-            chapterIndex = [{ ...chapterIndex[0]!, status: "accepted-with-findings" as const }];
-            stopAfterSettlement = true;
-            return { chapterNumber: 4, status: "accepted-with-findings" };
-          },
-        },
-      });
-      const settled = await runBoundedAutonomousScope({
-        map,
-        mode: "current-volume",
-        getNextChapter: async () => 5,
-        pendingChapterNumber: actions.pendingChapterNumber,
-        resumePendingChapter: actions.resumePendingChapter,
-        runChapter: () => actions.runChapter(),
-        shouldStop: () => stopAfterSettlement,
-        persistProgress: async () => undefined,
-      });
-      expect(settled).toMatchObject({ status: "PAUSED_BY_USER", nextChapter: 5 });
-      expect(chapterIndex[0]?.status).toBe("accepted-with-findings");
-      expect(chapterFiveCalls).toBe(0);
-      expect(transportCalls).toBe(0);
-      expect(modelCalls).toBe(0);
       const bindingPath = execution.responseArtifactBindingPath(fingerprint, "openrouter", "provider/model", 4);
       const bindingBytes = await readFile(bindingPath);
       await writeFile(bindingPath, JSON.stringify({ ...binding, source_artifact_sha256: "0".repeat(64) }));

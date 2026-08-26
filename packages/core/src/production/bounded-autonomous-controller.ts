@@ -851,14 +851,23 @@ export function createAutonomousProviderExecution(params: {
     }
     const evidencePath = join(dirname(providerResponseArtifactDir(params.projectRoot, params.bookId)), `chapter-${String(activeChapter).padStart(4, "0")}`, "resume-review.json");
     let evidenceBytes: Buffer;
-    let evidence: { readonly modelOutcomes?: ReadonlyArray<{ readonly modelCallId?: string }> };
+    let evidence: {
+      readonly schema_version?: string;
+      readonly chapter_number?: number;
+      readonly status?: string;
+      readonly modelOutcomes?: ReadonlyArray<{ readonly modelCallId?: string }>;
+    };
     try {
       evidenceBytes = await readFile(evidencePath);
       evidence = JSON.parse(evidenceBytes.toString("utf-8")) as typeof evidence;
     } catch (error) {
       throw new Error("AUTONOMOUS_PROVIDER_RESPONSE_BINDING_AUTHORITY_MISMATCH", { cause: error });
     }
-    if (createHash("sha256").update(evidenceBytes).digest("hex") !== binding.resume_evidence_sha256
+    const evidenceSha = createHash("sha256").update(evidenceBytes).digest("hex");
+    const evidenceTransitionValid = evidence.status === "REVIEW_EXHAUSTED"
+      ? evidenceSha === binding.resume_evidence_sha256
+      : evidence.status === "RUNNING";
+    if (evidence.schema_version !== "1.0" || evidence.chapter_number !== activeChapter || !evidenceTransitionValid
       || !(evidence.modelOutcomes ?? []).some((outcome) => outcome.modelCallId === binding.source_logical_step_id)) {
       throw new Error("AUTONOMOUS_PROVIDER_RESPONSE_BINDING_AUTHORITY_MISMATCH");
     }
