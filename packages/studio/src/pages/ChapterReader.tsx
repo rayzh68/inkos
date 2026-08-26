@@ -25,6 +25,54 @@ interface ChapterData {
   readonly chapterNumber: number;
   readonly filename: string;
   readonly content: string;
+  readonly status: string | null;
+  readonly formalOfflineRecoveryRequired: boolean;
+}
+
+type ChapterReviewStatus = "APPROVED" | "ACCEPTED_WITH_FINDINGS" | "DOWNSTREAM_REVALIDATION_REQUIRED" | "FORMAL_OFFLINE_RECOVERY_REQUIRED" | "BLOCKED_CRITICAL_FINDINGS" | "HELD_AFTER_TWO_REVISIONS" | "FAILED";
+
+interface ChapterReviewResult {
+  readonly chapterNumber: number;
+  readonly status: ChapterReviewStatus;
+  readonly revisionCount: number;
+  readonly findings: ReadonlyArray<{ readonly severity: string; readonly description: string }>;
+  readonly bodyChanged: boolean;
+  readonly error?: string;
+}
+
+export function ChapterReviewActions({ status, formalOfflineRecoveryRequired, reviewing, onReview, onManualApprove, t }: {
+  status: string | null;
+  formalOfflineRecoveryRequired: boolean;
+  reviewing: boolean;
+  onReview: () => void;
+  onManualApprove: () => void;
+  t: TFunction;
+}) {
+  const unresolved = status !== "approved" && status !== "accepted-with-findings";
+  if (formalOfflineRecoveryRequired) {
+    return <div className="px-4 py-2 text-xs font-bold text-amber-700 bg-amber-500/10 rounded-xl border border-amber-500/20">{t("reader.formalRecoveryRequired")}</div>;
+  }
+  if (!unresolved) {
+    return <div className="px-4 py-2 text-xs font-bold text-emerald-700 bg-emerald-500/10 rounded-xl border border-emerald-500/20">{t("reader.reviewResolved")}</div>;
+  }
+  return <>
+    <button
+      onClick={onReview}
+      disabled={reviewing}
+      className="flex items-center gap-2 px-4 py-2 text-xs font-bold bg-primary text-primary-foreground rounded-xl hover:scale-105 active:scale-95 transition-all shadow-sm disabled:opacity-50"
+    >
+      {reviewing ? <div className="w-3.5 h-3.5 border-2 border-primary-foreground/20 border-t-primary-foreground rounded-full animate-spin" /> : <CheckCircle2 size={14} />}
+      {reviewing ? t("reader.reviewing") : t("reader.aiReviewResolve")}
+    </button>
+    <button
+      onClick={onManualApprove}
+      title={t("reader.manualApproveHint")}
+      className="flex items-center gap-2 px-3 py-2 text-xs text-muted-foreground rounded-xl hover:text-foreground transition-all border border-border/50"
+    >
+      <CheckCircle2 size={13} />
+      {t("reader.manualApproveOverride")}
+    </button>
+  </>;
 }
 
 interface Nav {
@@ -47,6 +95,8 @@ export function ChapterReader({ bookId, chapterNumber, nav, theme, t }: {
   const [editContent, setEditContent] = useState("");
   const [saving, setSaving] = useState(false);
   const [workspaceRevision, setWorkspaceRevision] = useState(0);
+  const [reviewing, setReviewing] = useState(false);
+  const [reviewResult, setReviewResult] = useState<ChapterReviewResult | null>(null);
 
   const handleStartEdit = () => {
     if (!data) return;
@@ -102,6 +152,21 @@ export function ChapterReader({ bookId, chapterNumber, nav, theme, t }: {
       nav.toBook(bookId);
     } catch (e) {
       alert(e instanceof Error ? e.message : "Approve failed");
+    }
+  };
+
+  const handleReviewResolve = async () => {
+    setReviewing(true);
+    setReviewResult(null);
+    try {
+      const result = await postApi<ChapterReviewResult>(`/books/${bookId}/chapters/${chapterNumber}/review-resolve`);
+      setReviewResult(result);
+      await refetch();
+      if (result.bodyChanged) setWorkspaceRevision((revision) => revision + 1);
+    } catch (e) {
+      setReviewResult({ chapterNumber, status: "FAILED", revisionCount: 0, findings: [], bodyChanged: false, error: e instanceof Error ? e.message : "Review failed" });
+    } finally {
+      setReviewing(false);
     }
   };
 
@@ -179,13 +244,14 @@ export function ChapterReader({ bookId, chapterNumber, nav, theme, t }: {
             </button>
           )}
 
-          <button
-            onClick={handleApprove}
-            className="flex items-center gap-2 px-4 py-2 text-xs font-bold bg-emerald-500/10 text-emerald-600 rounded-xl hover:bg-emerald-500 hover:text-white transition-all border border-emerald-500/20 shadow-sm"
-          >
-            <CheckCircle2 size={14} />
-            {t("reader.approve")}
-          </button>
+          <ChapterReviewActions
+            status={data.status}
+            formalOfflineRecoveryRequired={data.formalOfflineRecoveryRequired}
+            reviewing={reviewing}
+            onReview={handleReviewResolve}
+            onManualApprove={handleApprove}
+            t={t}
+          />
           <button
             onClick={handleReject}
             className="flex items-center gap-2 px-4 py-2 text-xs font-bold bg-destructive/10 text-destructive rounded-xl hover:bg-destructive hover:text-white transition-all border border-destructive/20 shadow-sm"
@@ -195,6 +261,14 @@ export function ChapterReader({ bookId, chapterNumber, nav, theme, t }: {
           </button>
         </div>
       </div>
+
+      {reviewResult && (
+        <div className={`rounded-xl border p-4 text-sm ${reviewResult.status === "FAILED" ? "border-destructive/30 bg-destructive/5 text-destructive" : "border-primary/20 bg-primary/5 text-foreground"}`}>
+          <div className="font-bold">{reviewResult.status}</div>
+          {reviewResult.error && <div className="mt-1">{reviewResult.error}</div>}
+          {reviewResult.findings.length > 0 && <ul className="mt-2 list-disc pl-5">{reviewResult.findings.map((finding, index) => <li key={index}>[{finding.severity}] {finding.description}</li>)}</ul>}
+        </div>
+      )}
 
       <ChapterWorkspacePanel
         key={`${chapterNumber}-${workspaceRevision}`}

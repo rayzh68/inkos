@@ -50,6 +50,12 @@ const strings = {
   // Chapter Reader
   "reader.backToList": { zh: "返回列表", en: "Back to List" },
   "reader.approve": { zh: "通过", en: "Approve" },
+  "reader.aiReviewResolve": { zh: "AI 审核并解决", en: "AI Review & Resolve" },
+  "reader.reviewing": { zh: "AI 审核中...", en: "AI Reviewing..." },
+  "reader.manualApproveOverride": { zh: "人工覆盖通过", en: "Manual approve override" },
+  "reader.manualApproveHint": { zh: "仅人工覆盖状态，不运行 AI 审核", en: "Manual status override only; does not run AI review" },
+  "reader.formalRecoveryRequired": { zh: "本章已有正式离线恢复证据，请从 Autonomous Production 执行 Resume。", en: "Formal offline recovery evidence owns this chapter. Use Resume in Autonomous Production." },
+  "reader.reviewResolved": { zh: "审核已终结", en: "Review resolved" },
   "reader.reject": { zh: "驳回", en: "Reject" },
   "reader.chapterList": { zh: "章节列表", en: "Chapter List" },
   "reader.characters": { zh: "字符", en: "characters" },

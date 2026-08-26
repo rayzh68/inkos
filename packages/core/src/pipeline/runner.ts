@@ -398,6 +398,24 @@ export interface ReviseResult {
   readonly roleUsage?: Readonly<Record<string, RoleTokenUsage>>;
 }
 
+export type ExistingChapterReviewStatus =
+  | "APPROVED"
+  | "ACCEPTED_WITH_FINDINGS"
+  | "DOWNSTREAM_REVALIDATION_REQUIRED"
+  | "FORMAL_OFFLINE_RECOVERY_REQUIRED"
+  | "BLOCKED_CRITICAL_FINDINGS"
+  | "HELD_AFTER_TWO_REVISIONS"
+  | "FAILED";
+
+export interface ExistingChapterReviewResult {
+  readonly chapterNumber: number;
+  readonly status: ExistingChapterReviewStatus;
+  readonly revisionCount: number;
+  readonly findings: ReadonlyArray<AuditIssue>;
+  readonly bodyChanged: boolean;
+  readonly error?: string;
+}
+
 export interface ResumeAuditFailedChapterResult {
   readonly chapterNumber: number;
   readonly status: "approved" | "accepted-with-findings" | "blocked-critical-findings" | "review-decision-contradictory" | "held-after-two-revisions";
@@ -1420,6 +1438,107 @@ export class PipelineRunner {
     );
 
     return { ...result, chapterNumber: targetChapter };
+  }
+
+  /** Review an already-persisted chapter without entering the Writer generation path. */
+  async reviewExistingChapterBounded(bookId: string, chapterNumber: number): Promise<ExistingChapterReviewResult> {
+    if (!Number.isInteger(chapterNumber) || chapterNumber < 1) {
+      return { chapterNumber, status: "FAILED", revisionCount: 0, findings: [], bodyChanged: false, error: "Invalid chapter number" };
+    }
+
+    const bookDir = this.state.bookDir(bookId);
+    let originalContent = "";
+    try {
+      const index = await this.state.loadChapterIndex(bookId);
+      const chapter = index.find((item) => item.number === chapterNumber);
+      if (!chapter) {
+        return { chapterNumber, status: "FAILED", revisionCount: 0, findings: [], bodyChanged: false, error: `Chapter ${chapterNumber} not found in index` };
+      }
+      originalContent = await this.readChapterContent(bookDir, chapterNumber);
+
+      if (await this.loadAutonomousResumeEvidence(bookDir, chapterNumber)) {
+        return { chapterNumber, status: "FORMAL_OFFLINE_RECOVERY_REQUIRED", revisionCount: 0, findings: [], bodyChanged: false };
+      }
+      if (chapter.status === "approved" || chapter.status === "accepted-with-findings") {
+        return {
+          chapterNumber,
+          status: chapter.status === "approved" ? "APPROVED" : "ACCEPTED_WITH_FINDINGS",
+          revisionCount: 0,
+          findings: [],
+          bodyChanged: false,
+        };
+      }
+
+      const terminalize = async (status: "approved" | "accepted-with-findings", findings: ReadonlyArray<AuditIssue>) => {
+        const latest = await this.state.loadChapterIndex(bookId);
+        await this.state.saveChapterIndex(bookId, latest.map((item) => item.number === chapterNumber
+          ? {
+              ...item,
+              status,
+              updatedAt: new Date().toISOString(),
+              auditIssues: findings.map((finding) => `[${finding.severity}] ${finding.description}`),
+            }
+          : item));
+      };
+      const resolvePassing = async (findings: ReadonlyArray<AuditIssue>, revisionCount: number): Promise<ExistingChapterReviewResult> => {
+        const status = findings.length === 0 ? "APPROVED" : "ACCEPTED_WITH_FINDINGS";
+        await terminalize(status === "APPROVED" ? "approved" : "accepted-with-findings", findings);
+        const currentContent = await this.readChapterContent(bookDir, chapterNumber);
+        return { chapterNumber, status, revisionCount, findings, bodyChanged: currentContent !== originalContent };
+      };
+
+      const audit = await this.auditDraft(bookId, chapterNumber);
+      if (audit.passed) return await resolvePassing(audit.issues, 0);
+
+      const latestChapter = Math.max(...index.map((item) => item.number));
+      if (chapterNumber !== latestChapter) {
+        return {
+          chapterNumber,
+          status: "DOWNSTREAM_REVALIDATION_REQUIRED",
+          revisionCount: 0,
+          findings: audit.issues,
+          bodyChanged: false,
+        };
+      }
+
+      const maximumRevisions = Math.min(2, Math.max(1, this.config.writingReviewRetries ?? 1));
+      let findings = audit.issues;
+      let attemptedRevisions = 0;
+      for (let revisionCount = 1; revisionCount <= maximumRevisions; revisionCount++) {
+        attemptedRevisions = revisionCount;
+        const revised = await this.reviseDraft(bookId, chapterNumber, "auto", undefined, { persistedFindings: findings });
+        findings = revised.auditIssues?.map((finding) => ({
+          ...finding,
+          suggestion: finding.suggestion ?? "",
+        })) ?? findings;
+        if (revised.applied && revised.auditPassed) return await resolvePassing(findings, revisionCount);
+        if (!revised.applied) break;
+      }
+
+      const currentContent = await this.readChapterContent(bookDir, chapterNumber);
+      return {
+        chapterNumber,
+        status: findings.some((finding) => finding.severity === "critical")
+          ? "BLOCKED_CRITICAL_FINDINGS"
+          : "HELD_AFTER_TWO_REVISIONS",
+        revisionCount: attemptedRevisions,
+        findings,
+        bodyChanged: currentContent !== originalContent,
+      };
+    } catch (error) {
+      let bodyChanged = false;
+      if (originalContent) {
+        bodyChanged = await this.readChapterContent(bookDir, chapterNumber).then((content) => content !== originalContent).catch(() => false);
+      }
+      return {
+        chapterNumber,
+        status: "FAILED",
+        revisionCount: 0,
+        findings: [],
+        bodyChanged,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
   }
 
   /** Revise the latest (or specified) chapter based on audit issues. */

@@ -3242,8 +3242,19 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       const paddedNum = String(num).padStart(4, "0");
       const match = files.find((f) => f.startsWith(paddedNum) && f.endsWith(".md"));
       if (!match) return c.json({ error: "Chapter not found" }, 404);
-      const content = await readFile(join(chaptersDir, match), "utf-8");
-      return c.json({ chapterNumber: num, filename: match, content });
+      const [content, index] = await Promise.all([
+        readFile(join(chaptersDir, match), "utf-8"),
+        state.loadChapterIndex(id),
+      ]);
+      const evidencePath = join(bookDir, "story", "runtime", "bounded-autonomous", `chapter-${paddedNum}`, "resume-review.json");
+      const formalOfflineRecoveryRequired = await access(evidencePath).then(() => true).catch(() => false);
+      return c.json({
+        chapterNumber: num,
+        filename: match,
+        content,
+        status: index.find((chapter) => chapter.number === num)?.status ?? null,
+        formalOfflineRecoveryRequired,
+      });
     } catch {
       return c.json({ error: "Chapter not found" }, 404);
     }
@@ -3750,6 +3761,31 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     } catch (e) {
       broadcast("foundation:error", { bookId: id, error: String(e) });
       return c.json({ error: String(e) }, 500);
+    }
+  });
+
+  app.post("/api/v1/books/:id/chapters/:num/review-resolve", async (c) => {
+    const id = c.req.param("id");
+    const num = parseInt(c.req.param("num"), 10);
+    if (!Number.isInteger(num) || num < 1) {
+      return c.json({ error: "Invalid chapter number" }, 400);
+    }
+    if (!autonomousJobs.reserve(id)) {
+      return c.json({ error: "Production or chapter review is already active for this book." }, 409);
+    }
+    try {
+      const pipeline = new PipelineRunner(await buildPipelineConfig({ bookIdForSettings: id })) as PipelineRunner & {
+        reviewExistingChapterBounded(bookId: string, chapterNumber: number): Promise<{ readonly status: string }>;
+      };
+      broadcast("chapter-review:start", { bookId: id, chapter: num });
+      const result = await pipeline.reviewExistingChapterBounded(id, num);
+      broadcast("chapter-review:complete", { bookId: id, chapter: num, status: result.status });
+      return c.json(result);
+    } catch (error) {
+      broadcast("chapter-review:error", { bookId: id, chapter: num, error: String(error) });
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 500);
+    } finally {
+      autonomousJobs.release(id);
     }
   });
 
