@@ -2894,10 +2894,21 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const mode = body.mode === "full-book" ? "full-book" : body.mode === "current-volume" ? "current-volume" : null;
     if (!mode) throw new ApiError(400, "AUTONOMOUS_MODE_INVALID", "mode must be current-volume or full-book");
     const persistedRuntime = await loadAutonomousRuntime(root, bookId);
+    const persistedRecoveryOwnership = persistedRuntime?.recoveryOwnership;
+    const recoveringOwnedFormalRecovery = persistedRuntime !== null
+      && persistedRecoveryOwnership?.bookId === bookId
+      && persistedRecoveryOwnership.jobId === persistedRuntime.jobId
+      && persistedRuntime.mode === mode
+      && ["RUNNING", "WAITING_PROVIDER_RETRY", "PAUSED_PROVIDER_UNAVAILABLE", "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", "PAUSED_DETERMINISTIC_PROVIDER_ERROR"].includes(persistedRuntime.status)
+      && persistedRuntime.lastError !== "STATE_REBASELINE_VALIDATION_FAILED"
+      && persistedRuntime.reason !== "STATE_REBASELINE_VALIDATION_FAILED";
     const recoveringProviderWait = persistedRuntime?.status === "WAITING_PROVIDER_RETRY"
       && persistedRuntime.mode === mode;
     const { view: admission, offlineFinalizationPlan: admittedOfflineFinalizationPlan } = await loadAutonomousProjection(bookId);
-    if (!admission.startEnabled && !recoveringProviderWait) {
+    if (persistedRecoveryOwnership && !admittedOfflineFinalizationPlan) {
+      throw new ApiError(409, "FORMAL_RECOVERY_AUTHORITY_INVALID", "Persisted recovery ownership no longer has valid formal authority.");
+    }
+    if (!admission.startEnabled && !recoveringProviderWait && !recoveringOwnedFormalRecovery) {
       throw new ApiError(409, "AUTONOMOUS_ADMISSION_BLOCKED", admission.runtimeBlockers.join(", "));
     }
     // Synchronous reservation closes the double-click window before any more awaits.
@@ -2947,15 +2958,47 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       });
       productionMap = await requireBookProductionMap(root, bookId);
       jobId = deriveAutonomousJobIdentity({ map: productionMap, mode, nextChapter: startedNextChapter });
-      if (recoveringProviderWait && persistedRuntime?.jobId !== jobId) {
+      if ((recoveringProviderWait || recoveringOwnedFormalRecovery) && persistedRuntime?.jobId !== jobId) {
         throw new Error("AUTONOMOUS_WAITING_JOB_IDENTITY_MISMATCH");
       }
       durableClaim = await claimAutonomousJob({ projectRoot: root, bookId, jobId });
       stopDurableHeartbeat = startAutonomousJobHeartbeat(root, bookId, durableClaim, (error) => { durableClaimFailure = error; });
       if (admittedOfflineFinalizationPlan) {
         if (admittedOfflineFinalizationPlan.jobId !== jobId) throw new Error("OFFLINE_FINALIZATION_ADMISSION_JOB_IDENTITY_MISMATCH");
+        const recoveryOwnership = {
+          kind: admittedOfflineFinalizationPlan.kind,
+          recoveryClass: admittedOfflineFinalizationPlan.recoveryClass,
+          bookId,
+          jobId,
+          pendingChapterNumber: admittedOfflineFinalizationPlan.pendingChapterNumber,
+        } as const;
+        if (persistedRecoveryOwnership && (
+          persistedRecoveryOwnership.kind !== recoveryOwnership.kind
+          || persistedRecoveryOwnership.recoveryClass !== recoveryOwnership.recoveryClass
+          || persistedRecoveryOwnership.bookId !== recoveryOwnership.bookId
+          || persistedRecoveryOwnership.jobId !== recoveryOwnership.jobId
+          || persistedRecoveryOwnership.pendingChapterNumber !== recoveryOwnership.pendingChapterNumber
+        )) {
+          throw new Error("FORMAL_RECOVERY_OWNERSHIP_IDENTITY_MISMATCH");
+        }
+        await saveAutonomousRuntime(root, bookId, {
+          jobId,
+          status: persistedRuntime?.status ?? "RUNNING",
+          mode,
+          nextChapter: startedNextChapter,
+          updatedAt: new Date().toISOString(),
+          recoveryOwnership,
+        });
         if (admittedOfflineFinalizationPlan.kind === "FORMAL_OFFLINE_FINALIZATION") {
           await pipeline.finalizePendingChapterOffline(admittedOfflineFinalizationPlan);
+          await saveAutonomousRuntime(root, bookId, {
+            jobId,
+            status: "RUNNING",
+            mode,
+            nextChapter: startedNextChapter,
+            updatedAt: new Date().toISOString(),
+            recoveryOwnership: null,
+          });
         }
       }
       actions = await createAutonomousPipelineActions({ bookId, state, pipeline });
@@ -2995,6 +3038,14 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           if (durableClaimFailure) throw durableClaimFailure;
           const result = await pipeline.rebaselinePendingChapterState(admittedOfflineFinalizationPlan);
           if (durableClaimFailure) throw durableClaimFailure;
+          await saveAutonomousRuntime(root, bookId, {
+            jobId,
+            status: "RUNNING",
+            mode,
+            nextChapter: startedNextChapter,
+            updatedAt: new Date().toISOString(),
+            recoveryOwnership: null,
+          });
           return result;
         } }
         : actions.resumePendingChapter ? { resumePendingChapter: async (options?: { readonly safeReplayStage?: string }) => {

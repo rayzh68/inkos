@@ -137,6 +137,23 @@ describe("autonomous production Studio projection", () => {
       expect(await verifyOfflineFinalizationEvidence({
         projectRoot: root, bookId: "book", pendingChapter: 4, nextChapter: 5, runtime,
       })).toBe(true);
+      for (const status of ["RUNNING", "WAITING_PROVIDER_RETRY", "PAUSED_PROVIDER_UNAVAILABLE", "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", "PAUSED_DETERMINISTIC_PROVIDER_ERROR"] as const) {
+        const ownedRuntime = {
+          ...runtime,
+          status,
+          recoveryOwnership: {
+            kind: "FORMAL_BOUNDED_STATE_REBASELINE" as const,
+            recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED" as const,
+            bookId: "book",
+            jobId,
+            pendingChapterNumber: 4,
+          },
+        };
+        await writeFile(join(bookDir, "story", "runtime", "bounded-autonomous", "production-state.json"), JSON.stringify(ownedRuntime));
+        await expect(resolveOfflineFinalizationPlan({
+          projectRoot: root, bookId: "book", pendingChapter: 4, nextChapter: 5, runtime: ownedRuntime,
+        })).resolves.toMatchObject({ kind: "FORMAL_BOUNDED_STATE_REBASELINE", jobId, pendingChapterNumber: 4 });
+      }
       const rebaselineReady = projectAutonomousProductionView({
         map, targetChapters: 156, nextChapter: 5,
         chapters: [1, 2, 3, 4].map((number) => ({ number, status: number === 4 ? "audit-failed" as const : "approved" as const })),
@@ -417,6 +434,39 @@ describe("autonomous production Studio projection", () => {
     expect(view.runtimeStatus).toBe("WAITING_PROVIDER_RETRY");
     expect(view.startEnabled).toBe(false);
     expect(view.runtimeBlockers).not.toContain("COST_GUARD_UNAVAILABLE");
+  });
+
+  it("blocks Start after bounded state rebaseline fails both state validations", () => {
+    const view = projectAutonomousProductionView({
+      map,
+      targetChapters: 156,
+      nextChapter: 8,
+      chapters: [1, 2, 3, 4, 5, 6, 7].map((number) => ({
+        number,
+        status: number === 7 ? "audit-failed" : "approved",
+      })),
+      config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini", reviser: "gpt", "observer-reflector": "flash" } },
+      catalog,
+      runtime: {
+        jobId: "autonomous-rebaseline-seven",
+        status: "PAUSED_DETERMINISTIC_PROVIDER_ERROR",
+        mode: "current-volume",
+        nextChapter: 8,
+        updatedAt: "2026-08-27T00:00:00.000Z",
+        lastError: "STATE_REBASELINE_VALIDATION_FAILED",
+        recoveryOwnership: {
+          kind: "FORMAL_BOUNDED_STATE_REBASELINE",
+          recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED",
+          bookId: "book",
+          jobId: "autonomous-rebaseline-seven",
+          pendingChapterNumber: 7,
+        },
+      },
+      active: false,
+      budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
+    });
+    expect(view.runtimeBlockers).toContain("STATE_REBASELINE_VALIDATION_FAILED");
+    expect(view.startEnabled).toBe(false);
   });
 
   it("projects legacy two-revision exhaustion with a complete rescue artifact as final-review recovery", () => {

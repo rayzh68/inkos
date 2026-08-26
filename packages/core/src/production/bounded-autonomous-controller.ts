@@ -30,6 +30,14 @@ export type AutonomousRunStatus =
   | "REVIEW_EXHAUSTED"
   | "HELD_AFTER_TWO_REVISIONS";
 
+export interface AutonomousRecoveryOwnership {
+  readonly kind: "FORMAL_OFFLINE_FINALIZATION" | "FORMAL_BOUNDED_STATE_REBASELINE";
+  readonly recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED" | "FAILED_REENTRY";
+  readonly bookId: string;
+  readonly jobId: string;
+  readonly pendingChapterNumber: number;
+}
+
 export interface AutonomousRunProgress {
   readonly jobId: string;
   readonly status: AutonomousRunStatus;
@@ -73,6 +81,7 @@ export interface AutonomousRunProgress {
   readonly responseArtifactStatus?: "NONE" | "COMPLETE";
   readonly revisionRound?: number;
   readonly reviewRound?: number;
+  readonly recoveryOwnership?: AutonomousRecoveryOwnership | null;
 }
 
 export interface AutonomousStageMetadata {
@@ -568,9 +577,16 @@ async function resolveFormalPendingChapterRecoveryEvidence(params: {
 }): Promise<FormalPendingChapterRecoveryEvidence | null> {
   const runtime = await loadAutonomousProductionState<AutonomousRunProgress>(params.projectRoot, params.bookId);
   const sourceChapter = params.pendingChapterNumber + 1;
-  if (runtime?.jobId !== params.jobId || runtime.status !== "REVIEW_EXHAUSTED"
-    || runtime.nextChapter !== sourceChapter || runtime.chapterNumber !== sourceChapter
-    || runtime.responseArtifactStatus !== "COMPLETE") return null;
+  const ownership = runtime?.recoveryOwnership;
+  const ownedOriginalRecovery = ownership?.bookId === params.bookId
+    && ownership.jobId === params.jobId
+    && ownership.pendingChapterNumber === params.pendingChapterNumber
+    && ownership.recoveryClass === "ORIGINAL_REVIEW_EXHAUSTED"
+    && ["RUNNING", "WAITING_PROVIDER_RETRY", "PAUSED_PROVIDER_UNAVAILABLE", "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", "PAUSED_DETERMINISTIC_PROVIDER_ERROR"].includes(runtime?.status ?? "");
+  const originalRuntime = runtime?.status === "REVIEW_EXHAUSTED"
+    && runtime.chapterNumber === sourceChapter
+    && runtime.responseArtifactStatus === "COMPLETE";
+  if (runtime?.jobId !== params.jobId || runtime.nextChapter !== sourceChapter || (!originalRuntime && !ownedOriginalRecovery)) return null;
   const dir = providerResponseArtifactDir(params.projectRoot, params.bookId);
   const chapter = String(params.pendingChapterNumber).padStart(4, "0");
   let evidenceBytes: Buffer;
@@ -1035,14 +1051,27 @@ async function resolveFormalPendingChapterRecoveryPlanUnsafe(params: {
   readonly pendingChapterNumber: number;
 }): Promise<FormalPendingChapterRecoveryPlan | null> {
   const runtime = await loadAutonomousProductionState<AutonomousRunProgress>(params.projectRoot, params.bookId);
+  const ownership = runtime?.recoveryOwnership;
+  const ownedReentry = ownership?.bookId === params.bookId
+    && ownership.jobId === params.jobId
+    && ownership.pendingChapterNumber === params.pendingChapterNumber
+    && [
+      "RUNNING",
+      "WAITING_PROVIDER_RETRY",
+      "PAUSED_PROVIDER_UNAVAILABLE",
+      "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME",
+      "PAUSED_DETERMINISTIC_PROVIDER_ERROR",
+    ].includes(runtime?.status ?? "");
   const recoveryClass = runtime?.status === "REVIEW_EXHAUSTED"
     ? "ORIGINAL_REVIEW_EXHAUSTED" as const
-    : runtime?.status === "BLOCKED_CRITICAL_FINDINGS" ? "FAILED_REENTRY" as const : null;
+    : runtime?.status === "BLOCKED_CRITICAL_FINDINGS"
+      ? "FAILED_REENTRY" as const
+      : ownedReentry ? ownership.recoveryClass : null;
   if (!runtime || !recoveryClass) return null;
   const sourceChapterNumber = params.pendingChapterNumber + 1;
   const expectedRuntimeChapter = recoveryClass === "FAILED_REENTRY" ? params.pendingChapterNumber : sourceChapterNumber;
   if (runtime.jobId !== params.jobId || runtime.nextChapter !== sourceChapterNumber
-    || runtime.chapterNumber !== expectedRuntimeChapter || runtime.responseArtifactStatus !== "COMPLETE") {
+    || (!ownedReentry && (runtime.chapterNumber !== expectedRuntimeChapter || runtime.responseArtifactStatus !== "COMPLETE"))) {
     throw new Error("OFFLINE_FINALIZATION_RUNTIME_IDENTITY_MISMATCH");
   }
 
@@ -1825,6 +1854,7 @@ export async function runBoundedAutonomousScope(params: {
   };
 
   const executeRecoverably = async <T>(chapterNumber: number, action: (safeReplayStage?: string) => Promise<T>): Promise<T | AutonomousRunProgress> => {
+    const durableNextChapter = params.pendingChapterNumber === chapterNumber ? initialNext : chapterNumber;
     let previous = retryState;
     if (previous?.nextRetryAt && params.providerRecovery) {
       const remaining = Math.max(0, Date.parse(previous.nextRetryAt) - params.providerRecovery.now());
@@ -1842,7 +1872,7 @@ export async function runBoundedAutonomousScope(params: {
         if (!(error instanceof LLMCallExecutionError)) {
           const paused = project(
             "PAUSED_DETERMINISTIC_PROVIDER_ERROR",
-            chapterNumber,
+            durableNextChapter,
             error instanceof Error ? error.message : String(error),
             {
               chapterNumber,
@@ -1858,7 +1888,7 @@ export async function runBoundedAutonomousScope(params: {
         const base = await retryDetails(error, attempt, { chapterNumber });
         if (error.metadata.classification === "RETRYABLE_PROVIDER_HTTP" || error.metadata.classification === "RETRYABLE_PRE_TRANSPORT") {
           if (attempt >= 3) {
-            const paused = project("PAUSED_PROVIDER_UNAVAILABLE", chapterNumber, "PROVIDER_RETRY_EXHAUSTED", {
+            const paused = project("PAUSED_PROVIDER_UNAVAILABLE", durableNextChapter, "PROVIDER_RETRY_EXHAUSTED", {
               ...base,
               checkpoint: "PROVIDER_RETRY_EXHAUSTED",
             });
@@ -1867,7 +1897,7 @@ export async function runBoundedAutonomousScope(params: {
           }
           const minimum = attempt === 1 ? 300_000 : 900_000;
           const delayMs = Math.max(minimum, error.metadata.retryAfterMs ?? 0);
-          const waiting = project("WAITING_PROVIDER_RETRY", chapterNumber, "PROVIDER_TEMPORARY_INTERRUPTION", {
+          const waiting = project("WAITING_PROVIDER_RETRY", durableNextChapter, "PROVIDER_TEMPORARY_INTERRUPTION", {
             ...base,
             nextRetryAt: new Date(params.providerRecovery.now() + delayMs).toISOString(),
             checkpoint: "RETRY_SCHEDULED",
@@ -1879,14 +1909,14 @@ export async function runBoundedAutonomousScope(params: {
           continue;
         }
         if (error.metadata.classification === "AMBIGUOUS_PROVIDER_OUTCOME") {
-          const paused = project("PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", chapterNumber, "PROVIDER_OUTCOME_MAY_HAVE_EXECUTED", {
+          const paused = project("PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", durableNextChapter, "PROVIDER_OUTCOME_MAY_HAVE_EXECUTED", {
             ...base,
             checkpoint: "AMBIGUOUS_PROVIDER_OUTCOME",
           });
           await params.persistProgress(paused);
           return paused;
         }
-        const paused = project("PAUSED_DETERMINISTIC_PROVIDER_ERROR", chapterNumber, error.message, {
+        const paused = project("PAUSED_DETERMINISTIC_PROVIDER_ERROR", durableNextChapter, error.message, {
           ...base,
           checkpoint: "DETERMINISTIC_PROVIDER_ERROR",
         });

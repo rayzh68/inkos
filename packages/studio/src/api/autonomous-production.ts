@@ -22,6 +22,14 @@ import {
 
 export const AUTONOMOUS_BUDGET_NOT_CONFIGURED = { status: "BUDGET_NOT_CONFIGURED" } as const;
 
+interface AutonomousRecoveryOwnershipProjection {
+  readonly kind: "FORMAL_OFFLINE_FINALIZATION" | "FORMAL_BOUNDED_STATE_REBASELINE";
+  readonly recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED" | "FAILED_REENTRY";
+  readonly bookId: string;
+  readonly jobId: string;
+  readonly pendingChapterNumber: number;
+}
+
 export async function resolveOfflineFinalizationPlan(params: {
   readonly projectRoot: string;
   readonly bookId: string;
@@ -29,7 +37,12 @@ export async function resolveOfflineFinalizationPlan(params: {
   readonly nextChapter: number;
   readonly runtime: AutonomousRuntimeProjection | null;
 }): Promise<FormalPendingChapterRecoveryPlan | null> {
-  if (!params.runtime?.jobId || !["REVIEW_EXHAUSTED", "BLOCKED_CRITICAL_FINDINGS"].includes(params.runtime.status)
+  const ownership = params.runtime?.recoveryOwnership;
+  const ownedReentry = ownership?.bookId === params.bookId
+    && ownership.jobId === params.runtime?.jobId
+    && ownership.pendingChapterNumber === params.pendingChapter
+    && ["RUNNING", "WAITING_PROVIDER_RETRY", "PAUSED_PROVIDER_UNAVAILABLE", "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", "PAUSED_DETERMINISTIC_PROVIDER_ERROR"].includes(params.runtime?.status ?? "");
+  if (!params.runtime?.jobId || (!ownedReentry && !["REVIEW_EXHAUSTED", "BLOCKED_CRITICAL_FINDINGS"].includes(params.runtime.status))
     || params.nextChapter !== params.pendingChapter + 1 || params.runtime.nextChapter !== params.nextChapter) return null;
   return resolveFormalPendingChapterRecoveryPlan({
     projectRoot: params.projectRoot,
@@ -54,6 +67,8 @@ export interface AutonomousRuntimeProjection {
   readonly nextChapter: number;
   readonly updatedAt: string;
   readonly lastError?: string | null;
+  readonly reason?: string;
+  readonly recoveryOwnership?: AutonomousRecoveryOwnershipProjection | null;
   readonly phase?: string;
   readonly activeRole?: string;
   readonly activeProvider?: string | null;
@@ -223,10 +238,15 @@ export function projectAutonomousProductionView(params: {
   const repairNeedsReconciliation = !params.active && params.runtime?.status === "REPAIRING";
   if (repairNeedsReconciliation) blockers.push("STATE_REPAIR_RECONCILIATION_REQUIRED");
   const auditFailed = params.chapters.find((chapter) => chapter.status === "audit-failed");
+  const recoveryOwnership = params.runtime?.recoveryOwnership;
+  const ownedFormalRecovery = auditFailed !== undefined
+    && recoveryOwnership?.bookId === params.map.bookId
+    && recoveryOwnership.jobId === params.runtime?.jobId
+    && recoveryOwnership.pendingChapterNumber === auditFailed.number;
   const finalReviewRecovery = auditFailed
-    && (params.runtime?.status === "REVIEW_EXHAUSTED" || params.runtime?.status === "BLOCKED_CRITICAL_FINDINGS")
-    && params.runtime.responseArtifactStatus === "COMPLETE"
-    && (params.runtime.revisionRound === 2 || params.runtime.phase === "RESCUE_REVISING_2")
+    && ((params.runtime?.status === "REVIEW_EXHAUSTED" || params.runtime?.status === "BLOCKED_CRITICAL_FINDINGS")
+      ? params.runtime.responseArtifactStatus === "COMPLETE" && (params.runtime.revisionRound === 2 || params.runtime.phase === "RESCUE_REVISING_2")
+      : ownedFormalRecovery)
     && params.offlineFinalizationPlan !== undefined && params.offlineFinalizationPlan !== null
       ? {
           recoveryMode: params.offlineFinalizationPlan.kind,
@@ -262,6 +282,10 @@ export function projectAutonomousProductionView(params: {
   }
   if (params.runtime?.status === "REVIEW_DECISION_CONTRADICTORY") blockers.push("REVIEW_DECISION_CONTRADICTORY");
   if (params.runtime?.status === "BLOCKED_CRITICAL_FINDINGS" && !finalReviewRecovery) blockers.push("BLOCKED_CRITICAL_FINDINGS");
+  if (recoveryOwnership?.kind === "FORMAL_BOUNDED_STATE_REBASELINE"
+    && (params.runtime?.lastError === "STATE_REBASELINE_VALIDATION_FAILED" || params.runtime?.reason === "STATE_REBASELINE_VALIDATION_FAILED")) {
+    blockers.push("STATE_REBASELINE_VALIDATION_FAILED");
+  }
   const orderedChapterNumbers = params.chapters.map((chapter) => chapter.number).sort((left, right) => left - right);
   if (orderedChapterNumbers.some((number, index) => number !== index + 1) || params.nextChapter !== orderedChapterNumbers.length + 1) {
     blockers.push("CHAPTER_CURSOR_INTEGRITY_MISMATCH");

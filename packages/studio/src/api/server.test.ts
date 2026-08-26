@@ -6656,7 +6656,7 @@ describe("createStudioServer daemon lifecycle", () => {
     expect(chapters.find((chapter) => chapter.number === 4)?.status).toBe("approved");
   });
 
-  it("routes an admitted bounded state rebaseline through Core before Chapter N+1", async () => {
+  it("preserves rebaseline ownership and blocks a third attempt after double state validation failure", async () => {
     const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
     raw.llm = { ...raw.llm, service: "openrouter", defaultModel: "openai/gpt", model: "openai/gpt", services: [{ service: "openrouter" }] };
     raw.modelOverrides = { auditor: "deepseek/chat", "commercial-reader": "google/gemini", reviser: "openai/gpt", "observer-reflector": "deepseek/flash" };
@@ -6681,10 +6681,6 @@ describe("createStudioServer daemon lifecycle", () => {
     }));
     loadChapterIndexMock.mockImplementation(async () => chapters);
     saveChapterIndexMock.mockImplementation(async (_bookId, updated) => { chapters = updated; });
-    writeNextChapterMock.mockImplementationOnce(async () => {
-      nextChapter = 6;
-      return { chapterNumber: 5, status: "ready-for-review" };
-    });
     const { deriveAutonomousJobIdentity, loadBookProductionMap } = await import("@actalk/inkos-core");
     const normalizedMap = await loadBookProductionMap(root, "demo-book");
     const jobId = deriveAutonomousJobIdentity({ map: normalizedMap!, mode: "current-volume", nextChapter: 5 });
@@ -6700,8 +6696,7 @@ describe("createStudioServer daemon lifecycle", () => {
     resolveFormalPendingChapterRecoveryPlanMock.mockResolvedValue(admittedPlan);
     rebaselinePendingChapterStateMock.mockImplementationOnce(async (plan) => {
       expect(plan).toBe(admittedPlan);
-      chapters = chapters.map((chapter) => chapter.number === 4 ? { ...chapter, status: "accepted-with-findings" } : chapter);
-      return { chapterNumber: 4, status: "accepted-with-findings", revisionCount: 2, logicReviewCount: 2, commercialReviewCount: 0, roleUsage: {} };
+      throw new Error("STATE_REBASELINE_VALIDATION_FAILED");
     });
     const runtimeDir = join(root, "books", "demo-book", "story", "runtime", "bounded-autonomous");
     await mkdir(runtimeDir, { recursive: true });
@@ -6720,14 +6715,36 @@ describe("createStudioServer daemon lifecycle", () => {
     await vi.waitFor(() => expect(rebaselinePendingChapterStateMock).toHaveBeenCalledTimes(1));
     expect(finalizePendingChapterOfflineMock).not.toHaveBeenCalled();
     expect(resumeAuditFailedChapterBoundedMock).not.toHaveBeenCalled();
-    await vi.waitFor(() => expect(writeNextChapterMock).toHaveBeenCalledTimes(1));
     await vi.waitFor(async () => {
+      const runtime = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
+      expect(runtime).toMatchObject({
+        status: "PAUSED_DETERMINISTIC_PROVIDER_ERROR",
+        nextChapter: 5,
+        reason: "STATE_REBASELINE_VALIDATION_FAILED",
+        recoveryOwnership: {
+          kind: "FORMAL_BOUNDED_STATE_REBASELINE",
+          bookId: "demo-book",
+          jobId,
+          pendingChapterNumber: 4,
+        },
+      });
       await expect(access(join(runtimeDir, "active-job.json"))).rejects.toMatchObject({ code: "ENOENT" });
       await expect(readdir(join(runtimeDir, "active-job.json.reclaim-contenders"))).resolves.toEqual([]);
     });
+    const viewResponse = await app.request("http://localhost/api/v1/books/demo-book/autonomous-production");
+    const view = await viewResponse.json() as { startEnabled: boolean; runtimeBlockers: string[] };
+    expect(view.startEnabled).toBe(false);
+    expect(view.runtimeBlockers).toContain("STATE_REBASELINE_VALIDATION_FAILED");
+    const resumeResponse = await app.request("http://localhost/api/v1/books/demo-book/autonomous-production/start", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "current-volume" }),
+    });
+    expect(resumeResponse.status).toBe(409);
+    expect(rebaselinePendingChapterStateMock).toHaveBeenCalledTimes(1);
+    expect(resumeAuditFailedChapterBoundedMock).not.toHaveBeenCalled();
+    expect(writeNextChapterMock).not.toHaveBeenCalled();
   });
 
-  it("recovers the same durable Provider wait on Studio restart without a second user start", async () => {
+  it("re-enters non-Chapter-004 bounded state rebaseline ownership after a durable Provider wait and Studio restart", async () => {
     const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
     raw.llm = { ...raw.llm, service: "openrouter", defaultModel: "openai/gpt", model: "openai/gpt", services: [{ service: "openrouter" }] };
     raw.modelOverrides = { auditor: "deepseek/chat", "commercial-reader": "google/gemini", reviser: "openai/gpt", "observer-reflector": "deepseek/flash" };
@@ -6747,37 +6764,72 @@ describe("createStudioServer daemon lifecycle", () => {
       inputPrice: "0.000001", outputPrice: "0.000004", inputModalities: ["text"], outputModalities: ["text"],
     })));
     loadBookConfigMock.mockResolvedValue({ id: "demo-book", title: "Demo", genre: "urban", targetChapters: 7 });
-    let nextChapter = 5;
+    let nextChapter = 7;
     getNextChapterNumberMock.mockImplementation(async () => nextChapter);
-    let chapters = [1, 2, 3, 4].map((number) => ({
-      number, title: `Chapter ${number}`, status: number === 4 ? "audit-failed" : "approved", wordCount: 1,
-      auditIssues: number === 4 ? ["[warning] persisted finding"] : [], lengthWarnings: [],
+    let chapters = [1, 2, 3, 4, 5, 6].map((number) => ({
+      number, title: `Chapter ${number}`, status: number === 6 ? "audit-failed" : "approved", wordCount: 1,
+      auditIssues: number === 6 ? ["[warning] persisted finding"] : [], lengthWarnings: [],
       tokenUsage: { promptTokens: 10, completionTokens: 20, totalTokens: 30 },
     }));
     loadChapterIndexMock.mockImplementation(async () => chapters);
     saveChapterIndexMock.mockImplementation(async (_bookId, updated) => { chapters = updated; });
-    resumeAuditFailedChapterBoundedMock.mockResolvedValue({ chapterNumber: 4, status: "approved", revisionCount: 1, logicReviewCount: 1, commercialReviewCount: 1, roleUsage: {} });
     writeNextChapterMock.mockImplementationOnce(async () => {
-      nextChapter = 6;
-      return { chapterNumber: 5, status: "ready-for-review" };
+      nextChapter = 8;
+      return { chapterNumber: 7, status: "ready-for-review" };
     });
-    const { deriveAutonomousJobIdentity, loadBookProductionMap } = await import("@actalk/inkos-core");
+    const { createAutonomousProviderExecution, deriveAutonomousJobIdentity, loadBookProductionMap } = await import("@actalk/inkos-core");
     const normalizedMap = await loadBookProductionMap(root, "demo-book");
-    const jobId = deriveAutonomousJobIdentity({ map: normalizedMap!, mode: "current-volume", nextChapter: 5 });
+    const jobId = deriveAutonomousJobIdentity({ map: normalizedMap!, mode: "current-volume", nextChapter: 7 });
+    const admittedPlan = {
+      kind: "FORMAL_BOUNDED_STATE_REBASELINE",
+      recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED",
+      bookId: "demo-book",
+      jobId,
+      pendingChapterNumber: 6,
+      baselineChapterNumber: 5,
+      finalReview: { decision: "APPROVED" },
+    };
+    resolveFormalPendingChapterRecoveryPlanMock.mockResolvedValue(admittedPlan);
+    const replayStage = { stage: "STATE_REBASELINE_VALIDATE", role: "state-validator", provider: "openrouter", model: "deepseek/flash" } as const;
+    const replayExecution = createAutonomousProviderExecution({
+      projectRoot: root, bookId: "demo-book", jobId, getActiveStage: () => replayStage,
+    });
+    const replayFingerprint = "7".repeat(64);
+    const replayPath = replayExecution.responseArtifactPath(replayFingerprint, "openrouter", "deepseek/flash", 6);
+    const replayLogicalStepId = replayPath.split(/[\\/]/).at(-1)!.replace(/\.json$/u, "");
+    const replayResponse = { content: "persisted state validation", usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 } };
+    const { createHash } = await import("node:crypto");
     const runtimeDir = join(root, "books", "demo-book", "story", "runtime", "bounded-autonomous");
+    await mkdir(join(runtimeDir, "provider-responses"), { recursive: true });
+    await writeFile(replayPath, `${JSON.stringify({
+      schema_version: "1.0", job_id: jobId, logical_step_id: replayLogicalStepId, usage_identity: replayLogicalStepId,
+      chapter_number: 6, role: replayStage.role, stage: replayStage.stage, provider: "openrouter", requested_model: "deepseek/flash",
+      input_fingerprint: replayFingerprint, response_artifact_status: "COMPLETE",
+      content_sha256: createHash("sha256").update(replayResponse.content).digest("hex"), response: replayResponse,
+      completed_at: "2026-08-27T00:00:00.000Z",
+    }, null, 2)}\n`, "utf-8");
+    let paidTransportCalls = 0;
+    rebaselinePendingChapterStateMock.mockImplementation(async () => {
+      await replayExecution.runProviderCall(6, async () => {
+        paidTransportCalls += 1;
+        return { content: "must not run", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "openrouter", model: "deepseek/flash", inputFingerprint: replayFingerprint });
+      chapters = chapters.map((chapter) => chapter.number === 6 ? { ...chapter, status: "approved" } : chapter);
+      return { chapterNumber: 6, status: "approved", revisionCount: 2, logicReviewCount: 2, commercialReviewCount: 0, roleUsage: {} };
+    });
     await mkdir(runtimeDir, { recursive: true });
     await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
       jobId,
       status: "WAITING_PROVIDER_RETRY",
       mode: "current-volume",
       volumeId: "volume-001",
-      startChapter: 5,
-      targetChapter: 5,
-      nextChapter: 5,
+      startChapter: 6,
+      targetChapter: 7,
+      nextChapter: 7,
       completedThisRun: 0,
       updatedAt: "2026-08-21T00:00:00.000Z",
       logicalStepId: "provider-step-restart-test",
-      chapterNumber: 4,
+      chapterNumber: 6,
       role: "logicAuditor",
       stage: "REVISION_AND_LOGIC",
       provider: "openrouter",
@@ -6788,6 +6840,13 @@ describe("createStudioServer daemon lifecycle", () => {
       nextRetryAt: "2020-01-01T00:00:00.000Z",
       checkpoint: "RETRY_SCHEDULED",
       responseArtifactStatus: "NONE",
+      recoveryOwnership: {
+        kind: "FORMAL_BOUNDED_STATE_REBASELINE",
+        recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED",
+        bookId: "demo-book",
+        jobId,
+        pendingChapterNumber: 6,
+      },
       budget: { status: "BUDGET_NOT_CONFIGURED" },
     }), "utf-8");
     listBooksMock.mockResolvedValue(["demo-book"]);
@@ -6795,17 +6854,17 @@ describe("createStudioServer daemon lifecycle", () => {
     const { createStudioServer } = await import("./server.js");
     createStudioServer(cloneProjectConfig() as never, root);
 
-    await vi.waitFor(() => expect(resumeAuditFailedChapterBoundedMock).toHaveBeenCalledWith(
-      "demo-book",
-      4,
-      { safeReplayStage: "REVISION_AND_LOGIC" },
-    ));
+    await vi.waitFor(() => expect(rebaselinePendingChapterStateMock).toHaveBeenCalledWith(admittedPlan));
+    expect(resumeAuditFailedChapterBoundedMock).not.toHaveBeenCalled();
     await vi.waitFor(() => expect(writeNextChapterMock).toHaveBeenCalledTimes(1));
     await vi.waitFor(async () => {
       const runtime = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
-      expect(runtime).toMatchObject({ jobId, status: "VOLUME_COMPLETE", nextChapter: 6 });
+      expect(runtime).toMatchObject({ jobId, status: "BOOK_COMPLETE", nextChapter: 8, recoveryOwnership: null });
+      await expect(access(join(runtimeDir, "active-job.json"))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(readdir(join(runtimeDir, "active-job.json.reclaim-contenders"))).resolves.toEqual([]);
     });
-    expect(resumeAuditFailedChapterBoundedMock).toHaveBeenCalledTimes(1);
+    expect(rebaselinePendingChapterStateMock).toHaveBeenCalledTimes(1);
+    expect(paidTransportCalls).toBe(0);
   });
 
   it("uses the existing catalog for autonomous economics and persists a truthful repair outcome", async () => {
