@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { dirname, join } from "node:path";
-import { resolveProductionScope, type BookProductionMap, type ProductionMode } from "./book-production-map.js";
+import { parseBookProductionMap, resolveProductionScope, type BookProductionMap, type ProductionMode } from "./book-production-map.js";
 import type { ChapterMeta } from "../models/chapter.js";
 import {
   LLMCallExecutionError,
@@ -13,6 +13,8 @@ import {
   type LLMResponse,
 } from "../llm/provider.js";
 import { classifyFinalAuditDecision } from "../pipeline/bounded-review.js";
+import { commitAtomicFileSet } from "../utils/atomic-file-set.js";
+import { countChapterLength, resolveLengthCountingMode } from "../utils/length-metrics.js";
 
 export type AutonomousRunStatus =
   | "RUNNING"
@@ -27,6 +29,14 @@ export type AutonomousRunStatus =
   | "REVIEW_DECISION_CONTRADICTORY"
   | "REVIEW_EXHAUSTED"
   | "HELD_AFTER_TWO_REVISIONS";
+
+export interface AutonomousRecoveryOwnership {
+  readonly kind: "FORMAL_OFFLINE_FINALIZATION" | "FORMAL_BOUNDED_STATE_REBASELINE";
+  readonly recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED" | "FAILED_REENTRY";
+  readonly bookId: string;
+  readonly jobId: string;
+  readonly pendingChapterNumber: number;
+}
 
 export interface AutonomousRunProgress {
   readonly jobId: string;
@@ -71,6 +81,7 @@ export interface AutonomousRunProgress {
   readonly responseArtifactStatus?: "NONE" | "COMPLETE";
   readonly revisionRound?: number;
   readonly reviewRound?: number;
+  readonly recoveryOwnership?: AutonomousRecoveryOwnership | null;
 }
 
 export interface AutonomousStageMetadata {
@@ -470,7 +481,21 @@ const FINAL_REVIEW_DIMENSIONS = [
   "narrative_clarity",
 ] as const;
 
-function parseAcceptedFinalReview(content: string): boolean {
+interface AcceptedFinalReview {
+  readonly decision: "APPROVED" | "ACCEPTED_WITH_FINDINGS";
+  readonly overallScore: number;
+  readonly issues: ReadonlyArray<{
+    readonly severity: "critical" | "warning" | "info";
+    readonly explicitSeverity?: "MAJOR";
+    readonly category: string;
+    readonly description: string;
+    readonly suggestion: string;
+    readonly repairScope?: "local" | "structural" | "unknown";
+    readonly blocking?: boolean;
+  }>;
+}
+
+function parseAcceptedFinalReview(content: string): AcceptedFinalReview | null {
   try {
     const parsed = JSON.parse(content) as {
       readonly passed?: unknown;
@@ -485,30 +510,34 @@ function parseAcceptedFinalReview(content: string): boolean {
       && FINAL_REVIEW_DIMENSIONS.every((dimension) => typeof parsed.dimension_scores?.[dimension] === "number"
         && Number.isFinite(parsed.dimension_scores[dimension]))
       && Array.isArray(parsed.issues)
-      && typeof parsed.summary === "string")) return false;
+      && typeof parsed.summary === "string")) return null;
     const issues = parsed.issues as ReadonlyArray<{
       readonly severity?: unknown; readonly category?: unknown; readonly description?: unknown;
       readonly suggestion?: unknown; readonly repair_scope?: unknown; readonly blocking?: unknown;
     }>;
     if (!issues.every((issue) => typeof issue.category === "string" && typeof issue.description === "string"
-      && typeof issue.suggestion === "string" && ["critical", "major", "warning", "info"].includes(String(issue.severity)))) return false;
-    return ["APPROVED", "ACCEPTED_WITH_FINDINGS"].includes(classifyFinalAuditDecision({
+      && typeof issue.suggestion === "string" && ["critical", "major", "warning", "info"].includes(String(issue.severity)))) return null;
+    const normalizedIssues = issues.map((issue) => ({
+      severity: issue.severity === "major" ? "warning" as const : issue.severity as "critical" | "warning" | "info",
+      ...(issue.severity === "major" ? { explicitSeverity: "MAJOR" as const } : {}),
+      category: issue.category as string,
+      description: issue.description as string,
+      suggestion: issue.suggestion as string,
+      repairScope: issue.repair_scope as "local" | "structural" | "unknown" | undefined,
+      blocking: issue.blocking as boolean | undefined,
+    }));
+    const decision = classifyFinalAuditDecision({
       passed: parsed.passed,
       overallScore: parsed.overall_score,
       dimensionScores: parsed.dimension_scores as Readonly<Record<string, number>>,
-      issues: issues.map((issue) => ({
-        severity: issue.severity === "major" ? "warning" as const : issue.severity as "critical" | "warning" | "info",
-        ...(issue.severity === "major" ? { explicitSeverity: "MAJOR" as const } : {}),
-        category: issue.category as string,
-        description: issue.description as string,
-        suggestion: issue.suggestion as string,
-        repairScope: issue.repair_scope as "local" | "structural" | "unknown" | undefined,
-        blocking: issue.blocking as boolean | undefined,
-      })),
+      issues: normalizedIssues,
       summary: parsed.summary,
-    }));
+    });
+    return decision === "APPROVED" || decision === "ACCEPTED_WITH_FINDINGS"
+      ? { decision, overallScore: parsed.overall_score, issues: normalizedIssues }
+      : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -521,7 +550,7 @@ function isRescueCandidateResponse(artifact: PersistedProviderResponseArtifact):
 function isFinalReviewArtifact(artifact: PersistedProviderResponseArtifact): boolean {
   const legacyIdentity = artifact.role === "reviser" && artifact.stage === "RESCUE_REVISING_2";
   const normalizedIdentity = artifact.role === "logicAuditor" && artifact.stage === "LOGIC_REVIEW";
-  return (legacyIdentity || normalizedIdentity) && parseAcceptedFinalReview(artifact.response?.content ?? "");
+  return (legacyIdentity || normalizedIdentity) && parseAcceptedFinalReview(artifact.response?.content ?? "") !== null;
 }
 
 function providerResponseArtifactDir(projectRoot: string, bookId: string): string {
@@ -548,9 +577,16 @@ async function resolveFormalPendingChapterRecoveryEvidence(params: {
 }): Promise<FormalPendingChapterRecoveryEvidence | null> {
   const runtime = await loadAutonomousProductionState<AutonomousRunProgress>(params.projectRoot, params.bookId);
   const sourceChapter = params.pendingChapterNumber + 1;
-  if (runtime?.jobId !== params.jobId || runtime.status !== "REVIEW_EXHAUSTED"
-    || runtime.nextChapter !== sourceChapter || runtime.chapterNumber !== sourceChapter
-    || runtime.responseArtifactStatus !== "COMPLETE") return null;
+  const ownership = runtime?.recoveryOwnership;
+  const ownedOriginalRecovery = ownership?.bookId === params.bookId
+    && ownership.jobId === params.jobId
+    && ownership.pendingChapterNumber === params.pendingChapterNumber
+    && ownership.recoveryClass === "ORIGINAL_REVIEW_EXHAUSTED"
+    && ["RUNNING", "WAITING_PROVIDER_RETRY", "PAUSED_PROVIDER_UNAVAILABLE", "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", "PAUSED_DETERMINISTIC_PROVIDER_ERROR"].includes(runtime?.status ?? "");
+  const originalRuntime = runtime?.status === "REVIEW_EXHAUSTED"
+    && runtime.chapterNumber === sourceChapter
+    && runtime.responseArtifactStatus === "COMPLETE";
+  if (runtime?.jobId !== params.jobId || runtime.nextChapter !== sourceChapter || (!originalRuntime && !ownedOriginalRecovery)) return null;
   const dir = providerResponseArtifactDir(params.projectRoot, params.bookId);
   const chapter = String(params.pendingChapterNumber).padStart(4, "0");
   let evidenceBytes: Buffer;
@@ -684,6 +720,716 @@ export async function correctLegacyPendingChapterArtifactBindings(params: {
     bindings.push(binding);
   }
   return bindings;
+}
+
+interface FormalPendingChapterRecoveryAuthority {
+  readonly recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED" | "FAILED_REENTRY";
+  readonly bookId: string;
+  readonly jobId: string;
+  readonly pendingChapterNumber: number;
+  readonly expectedLogicalChapter: number;
+  readonly sourceChapterNumber: number;
+  readonly productionMapSha256: string;
+  readonly chapterFile: string;
+  readonly currentChapterSha256: string;
+  readonly evidence: {
+    readonly historicalSha256: string;
+    readonly currentSha256: string;
+  };
+  readonly rescue: {
+    readonly sourceLogicalStepId: string;
+    readonly sourceArtifactSha256: string;
+    readonly sourceContentSha256: string;
+    readonly candidateBody: string;
+    readonly candidateBodySha256: string;
+  };
+  readonly finalReview: {
+    readonly sourceLogicalStepId: string;
+    readonly sourceArtifactSha256: string;
+    readonly sourceContentSha256: string;
+    readonly decision: "APPROVED" | "ACCEPTED_WITH_FINDINGS";
+    readonly overallScore: number;
+    readonly issues: AcceptedFinalReview["issues"];
+  };
+  readonly provenance: {
+    readonly revisionCount: number;
+    readonly logicReviewCount: number;
+    readonly commercialReviewCount: number;
+    readonly roleUsage: Readonly<Record<string, {
+      readonly promptTokens: number;
+      readonly completionTokens: number;
+      readonly totalTokens: number;
+      readonly actualCostUsd?: number;
+    }>>;
+  };
+  readonly bindings: ReadonlyArray<{
+    readonly logicalStepId: string;
+    readonly sourceLogicalStepId: string;
+    readonly sourceArtifactSha256: string;
+    readonly sourceContentSha256: string;
+    readonly resumeEvidenceSha256: string;
+    readonly authoritySha256: string;
+    readonly fileSha256?: string;
+  }>;
+  readonly failedReentryArtifacts: ReadonlyArray<{
+    readonly logicalStepId: string;
+    readonly artifactSha256: string;
+    readonly contentSha256: string;
+  }>;
+}
+
+export interface FormalOfflineFinalizationPlan extends FormalPendingChapterRecoveryAuthority {
+  readonly kind: "FORMAL_OFFLINE_FINALIZATION";
+  readonly stateSettlement: {
+    readonly proofRelativePath: "state-settlement-proof.json";
+    readonly proofSha256: string;
+    readonly snapshotId: string;
+    readonly candidateBodySha256: string;
+    readonly artifacts: ReadonlyArray<{
+      readonly sourceRelativePath: string;
+      readonly targetRelativePath: string;
+      readonly sha256: string;
+      readonly content: string;
+    }>;
+  };
+}
+
+export interface FormalBoundedStateRebaselinePlan extends FormalPendingChapterRecoveryAuthority {
+  readonly kind: "FORMAL_BOUNDED_STATE_REBASELINE";
+  readonly baselineChapterNumber: number;
+}
+
+export type FormalPendingChapterRecoveryPlan = FormalOfflineFinalizationPlan | FormalBoundedStateRebaselinePlan;
+
+interface RecoveryBindingAuthority {
+  readonly schema_version: "1.0";
+  readonly binding_type: "CORRECTED_PENDING_CHAPTER_REFERENCE";
+  readonly job_id: string;
+  readonly logical_step_id: string;
+  readonly chapter_number: number;
+  readonly source_chapter_number: number;
+  readonly source_logical_step_id: string;
+  readonly source_artifact_sha256: string;
+  readonly source_content_sha256: string;
+  readonly resume_evidence_sha256: string;
+}
+
+function sha256(value: string | Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function recoveryBindingAuthority(binding: CorrectedProviderArtifactBinding | RecoveryBindingAuthority): RecoveryBindingAuthority {
+  return {
+    schema_version: binding.schema_version,
+    binding_type: binding.binding_type,
+    job_id: binding.job_id,
+    logical_step_id: binding.logical_step_id,
+    chapter_number: binding.chapter_number,
+    source_chapter_number: binding.source_chapter_number,
+    source_logical_step_id: binding.source_logical_step_id,
+    source_artifact_sha256: binding.source_artifact_sha256,
+    source_content_sha256: binding.source_content_sha256,
+    resume_evidence_sha256: binding.resume_evidence_sha256,
+  };
+}
+
+function bindingAuthoritySha256(binding: CorrectedProviderArtifactBinding | RecoveryBindingAuthority): string {
+  return sha256(JSON.stringify(recoveryBindingAuthority(binding)));
+}
+
+async function readRecoveryArtifact(
+  dir: string,
+  logicalStepId: string,
+  params: { readonly jobId: string; readonly chapterNumber: number },
+): Promise<{ readonly artifact: PersistedProviderResponseArtifact; readonly bytes: Buffer }> {
+  const bytes = await readFile(join(dir, `${logicalStepId}.json`));
+  const artifact = JSON.parse(bytes.toString("utf-8")) as PersistedProviderResponseArtifact;
+  const contentSha = sha256(artifact.response?.content ?? "");
+  const derived = logicalProviderStepId({
+    jobId: artifact.job_id,
+    chapterNumber: artifact.chapter_number,
+    stage: { stage: artifact.stage, role: artifact.role, provider: artifact.provider, model: artifact.requested_model },
+    provider: artifact.provider,
+    model: artifact.requested_model,
+    inputFingerprint: artifact.input_fingerprint,
+  });
+  if (artifact.schema_version !== "1.0" || artifact.job_id !== params.jobId
+    || artifact.chapter_number !== params.chapterNumber || artifact.response_artifact_status !== "COMPLETE"
+    || artifact.logical_step_id !== logicalStepId || artifact.usage_identity !== logicalStepId
+    || artifact.content_sha256 !== contentSha || derived !== logicalStepId) {
+    throw new Error("OFFLINE_FINALIZATION_ARTIFACT_IDENTITY_MISMATCH");
+  }
+  return { artifact, bytes };
+}
+
+async function readRelevantRecoveryBindings(params: {
+  readonly dir: string;
+  readonly jobId: string;
+  readonly pendingChapterNumber: number;
+  readonly sourceChapterNumber: number;
+}): Promise<ReadonlyArray<{ readonly binding: CorrectedProviderArtifactBinding; readonly bytes: Buffer }>> {
+  const names = await readdir(params.dir);
+  const found: Array<{ readonly binding: CorrectedProviderArtifactBinding; readonly bytes: Buffer }> = [];
+  for (const name of names.filter((entry) => entry.endsWith(".binding.json"))) {
+    const bytes = await readFile(join(params.dir, name));
+    const binding = JSON.parse(bytes.toString("utf-8")) as CorrectedProviderArtifactBinding;
+    if (binding.job_id !== params.jobId || binding.chapter_number !== params.pendingChapterNumber) continue;
+    if (binding.schema_version !== "1.0" || binding.binding_type !== "CORRECTED_PENDING_CHAPTER_REFERENCE"
+      || binding.source_chapter_number !== params.sourceChapterNumber || `${binding.logical_step_id}.binding.json` !== name) {
+      throw new Error("OFFLINE_FINALIZATION_BINDING_IDENTITY_MISMATCH");
+    }
+    found.push({ binding, bytes });
+  }
+  return found;
+}
+
+function extractRescueCandidate(content: string): string {
+  const match = content.match(/=== REVISED_CONTENT ===\s*([\s\S]+)$/u);
+  if (!match?.[1]?.trim()) throw new Error("OFFLINE_FINALIZATION_RESCUE_CONTENT_INVALID");
+  return match[1].trim();
+}
+
+const SETTLEMENT_MARKDOWN_FILES = [
+  "current_state.md",
+  "pending_hooks.md",
+  "chapter_summaries.md",
+  "particle_ledger.md",
+  "subplot_board.md",
+  "emotional_arcs.md",
+  "character_matrix.md",
+] as const;
+
+const SETTLEMENT_STRUCTURED_FILES = [
+  "manifest.json",
+  "current_state.json",
+  "hooks.json",
+  "chapter_summaries.json",
+] as const;
+
+interface RecoveryUsage {
+  readonly promptTokens: number;
+  readonly completionTokens: number;
+  readonly totalTokens: number;
+  readonly actualCostUsd?: number;
+}
+
+function parseRecoveryUsage(value: unknown, label: string): Record<string, RecoveryUsage> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`OFFLINE_FINALIZATION_PROVENANCE_INVALID:${label}`);
+  }
+  const result: Record<string, RecoveryUsage> = {};
+  for (const [role, raw] of Object.entries(value)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new Error(`OFFLINE_FINALIZATION_PROVENANCE_INVALID:${label}:${role}`);
+    }
+    const usage = raw as Partial<RecoveryUsage>;
+    if (![usage.promptTokens, usage.completionTokens, usage.totalTokens].every((token) => Number.isInteger(token) && token! >= 0)
+      || usage.totalTokens !== usage.promptTokens! + usage.completionTokens!
+      || (usage.actualCostUsd !== undefined && (!Number.isFinite(usage.actualCostUsd) || usage.actualCostUsd < 0))) {
+      throw new Error(`OFFLINE_FINALIZATION_PROVENANCE_INVALID:${label}:${role}`);
+    }
+    result[role] = {
+      promptTokens: usage.promptTokens!,
+      completionTokens: usage.completionTokens!,
+      totalTokens: usage.totalTokens!,
+      ...(usage.actualCostUsd !== undefined ? { actualCostUsd: usage.actualCostUsd } : {}),
+    };
+  }
+  return result;
+}
+
+function resolveRecoveryProvenance(evidence: Record<string, unknown>): FormalPendingChapterRecoveryPlan["provenance"] {
+  const revisionCount = evidence.revisionCount;
+  const logicReviewCount = evidence.logicReviewCount;
+  const commercialReviewCount = evidence.commercialReviewCount;
+  if (!Number.isInteger(revisionCount) || (revisionCount as number) < 0 || (revisionCount as number) > 2
+    || !Number.isInteger(logicReviewCount) || (logicReviewCount as number) < 0
+    || !Number.isInteger(commercialReviewCount) || (commercialReviewCount as number) < 0) {
+    throw new Error("OFFLINE_FINALIZATION_PROVENANCE_INVALID");
+  }
+  const baseline = parseRecoveryUsage(evidence.baselineRoleUsage ?? {}, "baselineRoleUsage");
+  const current = parseRecoveryUsage(evidence.roleUsage ?? {}, "roleUsage");
+  const roleUsage: Record<string, RecoveryUsage> = { ...baseline };
+  for (const [role, usage] of Object.entries(current)) {
+    const prior = roleUsage[role];
+    roleUsage[role] = prior ? {
+      promptTokens: prior.promptTokens + usage.promptTokens,
+      completionTokens: prior.completionTokens + usage.completionTokens,
+      totalTokens: prior.totalTokens + usage.totalTokens,
+      ...(prior.actualCostUsd !== undefined || usage.actualCostUsd !== undefined
+        ? { actualCostUsd: (prior.actualCostUsd ?? 0) + (usage.actualCostUsd ?? 0) }
+        : {}),
+    } : usage;
+  }
+  return {
+    revisionCount: revisionCount as number,
+    logicReviewCount: logicReviewCount as number,
+    commercialReviewCount: commercialReviewCount as number,
+    roleUsage,
+  };
+}
+
+async function resolveStateSettlementProof(params: {
+  readonly bookDir: string;
+  readonly evidenceDir: string;
+  readonly evidence: Record<string, unknown>;
+  readonly bookId: string;
+  readonly jobId: string;
+  readonly chapterNumber: number;
+  readonly candidateBodySha256: string;
+}): Promise<FormalOfflineFinalizationPlan["stateSettlement"]> {
+  const reference = params.evidence.stateSettlementProof as { readonly relativePath?: unknown; readonly sha256?: unknown } | undefined;
+  if (reference?.relativePath !== "state-settlement-proof.json" || !/^[a-f0-9]{64}$/u.test(String(reference.sha256 ?? ""))) {
+    throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE");
+  }
+  const proofBytes = await readFile(join(params.evidenceDir, reference.relativePath));
+  if (sha256(proofBytes) !== reference.sha256) throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE");
+  const proof = JSON.parse(proofBytes.toString("utf-8")) as {
+    readonly schema_version?: unknown;
+    readonly evidence_type?: unknown;
+    readonly book_id?: unknown;
+    readonly job_id?: unknown;
+    readonly chapter_number?: unknown;
+    readonly snapshot_id?: unknown;
+    readonly rescue_candidate_body_sha256?: unknown;
+    readonly artifacts?: ReadonlyArray<{
+      readonly source_relative_path?: unknown;
+      readonly target_relative_path?: unknown;
+      readonly sha256?: unknown;
+    }>;
+  };
+  if (proof.schema_version !== "1.0" || proof.evidence_type !== "OFFLINE_FINALIZATION_STATE_SETTLEMENT_PROOF"
+    || proof.book_id !== params.bookId || proof.job_id !== params.jobId || proof.chapter_number !== params.chapterNumber
+    || typeof proof.snapshot_id !== "string" || !proof.snapshot_id.trim()
+    || proof.rescue_candidate_body_sha256 !== params.candidateBodySha256 || !Array.isArray(proof.artifacts)) {
+    throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE");
+  }
+  const expected = [
+    ...SETTLEMENT_MARKDOWN_FILES.map((name) => ({
+      sourceRelativePath: `story/snapshots/${params.chapterNumber}/${name}`,
+      targetRelativePath: `story/${name}`,
+    })),
+    ...SETTLEMENT_STRUCTURED_FILES.map((name) => ({
+      sourceRelativePath: `story/snapshots/${params.chapterNumber}/state/${name}`,
+      targetRelativePath: `story/state/${name}`,
+    })),
+  ];
+  if (proof.artifacts.length !== expected.length) throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE");
+  const artifacts = await Promise.all(expected.map(async (required) => {
+    const matches = proof.artifacts!.filter((artifact) => artifact.source_relative_path === required.sourceRelativePath
+      && artifact.target_relative_path === required.targetRelativePath);
+    if (matches.length !== 1 || !/^[a-f0-9]{64}$/u.test(String(matches[0]!.sha256 ?? ""))) {
+      throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE");
+    }
+    const bytes = await readFile(join(params.bookDir, required.sourceRelativePath));
+    if (sha256(bytes) !== matches[0]!.sha256) throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE");
+    const content = bytes.toString("utf-8");
+    if (!Buffer.from(content, "utf-8").equals(bytes)) throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE");
+    return { ...required, sha256: matches[0]!.sha256 as string, content };
+  }));
+  const manifest = JSON.parse(artifacts.find((artifact) => artifact.sourceRelativePath.endsWith("/state/manifest.json"))!.content) as { readonly schemaVersion?: unknown; readonly lastAppliedChapter?: unknown };
+  const currentState = JSON.parse(artifacts.find((artifact) => artifact.sourceRelativePath.endsWith("/state/current_state.json"))!.content) as { readonly chapter?: unknown };
+  const summaries = JSON.parse(artifacts.find((artifact) => artifact.sourceRelativePath.endsWith("/state/chapter_summaries.json"))!.content) as { readonly rows?: ReadonlyArray<{ readonly chapter?: unknown }> };
+  if (manifest.schemaVersion !== 2 || manifest.lastAppliedChapter !== params.chapterNumber
+    || currentState.chapter !== params.chapterNumber
+    || !Array.isArray(summaries.rows) || !summaries.rows.some((row) => row.chapter === params.chapterNumber)) {
+    throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE");
+  }
+  return {
+    proofRelativePath: "state-settlement-proof.json",
+    proofSha256: reference.sha256 as string,
+    snapshotId: proof.snapshot_id,
+    candidateBodySha256: params.candidateBodySha256,
+    artifacts,
+  };
+}
+
+async function resolveFormalPendingChapterRecoveryPlanUnsafe(params: {
+  readonly projectRoot: string;
+  readonly bookId: string;
+  readonly jobId: string;
+  readonly pendingChapterNumber: number;
+}): Promise<FormalPendingChapterRecoveryPlan | null> {
+  const runtime = await loadAutonomousProductionState<AutonomousRunProgress>(params.projectRoot, params.bookId);
+  const ownership = runtime?.recoveryOwnership;
+  const ownedReentry = ownership?.bookId === params.bookId
+    && ownership.jobId === params.jobId
+    && ownership.pendingChapterNumber === params.pendingChapterNumber
+    && [
+      "RUNNING",
+      "WAITING_PROVIDER_RETRY",
+      "PAUSED_PROVIDER_UNAVAILABLE",
+      "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME",
+      "PAUSED_DETERMINISTIC_PROVIDER_ERROR",
+    ].includes(runtime?.status ?? "");
+  const recoveryClass = runtime?.status === "REVIEW_EXHAUSTED"
+    ? "ORIGINAL_REVIEW_EXHAUSTED" as const
+    : runtime?.status === "BLOCKED_CRITICAL_FINDINGS"
+      ? "FAILED_REENTRY" as const
+      : ownedReentry ? ownership.recoveryClass : null;
+  if (!runtime || !recoveryClass) return null;
+  const sourceChapterNumber = params.pendingChapterNumber + 1;
+  const expectedRuntimeChapter = recoveryClass === "FAILED_REENTRY" ? params.pendingChapterNumber : sourceChapterNumber;
+  if (runtime.jobId !== params.jobId || runtime.nextChapter !== sourceChapterNumber
+    || (!ownedReentry && (runtime.chapterNumber !== expectedRuntimeChapter || runtime.responseArtifactStatus !== "COMPLETE"))) {
+    throw new Error("OFFLINE_FINALIZATION_RUNTIME_IDENTITY_MISMATCH");
+  }
+
+  const bookDir = join(params.projectRoot, "books", params.bookId);
+  const mapBytes = await readFile(join(bookDir, "story", "outline", "book-production-map.json"));
+  const productionMap = parseBookProductionMap(JSON.parse(mapBytes.toString("utf-8")), params.bookId);
+  if (sourceChapterNumber > productionMap.totalChapters) throw new Error("OFFLINE_FINALIZATION_PRODUCTION_MAP_MISMATCH");
+  if ((runtime.mode !== "current-volume" && runtime.mode !== "full-book")
+    || deriveAutonomousJobIdentity({ map: productionMap, mode: runtime.mode, nextChapter: sourceChapterNumber }) !== params.jobId) {
+    throw new Error("OFFLINE_FINALIZATION_PRODUCTION_JOB_IDENTITY_MISMATCH");
+  }
+  const chapterNames = (await readdir(join(bookDir, "chapters"))).filter((name) =>
+    new RegExp(`^${String(params.pendingChapterNumber).padStart(4, "0")}[_-].*\\.md$`, "u").test(name));
+  if (chapterNames.length !== 1) throw new Error("OFFLINE_FINALIZATION_CHAPTER_SOURCE_INVALID");
+  const chapterFile = chapterNames[0]!;
+  const currentChapterBytes = await readFile(join(bookDir, "chapters", chapterFile));
+  const index = JSON.parse(await readFile(join(bookDir, "chapters", "index.json"), "utf-8")) as ChapterMeta[];
+  const pending = index.filter((entry) => entry.number === params.pendingChapterNumber);
+  if (pending.length !== 1 || pending[0]!.status !== "audit-failed") throw new Error("OFFLINE_FINALIZATION_CHAPTER_STATE_INVALID");
+
+  const chapter = String(params.pendingChapterNumber).padStart(4, "0");
+  const evidenceDir = join(bookDir, "story", "runtime", "bounded-autonomous", `chapter-${chapter}`);
+  const evidenceBytes = await readFile(join(evidenceDir, "resume-review.json"));
+  const evidence = JSON.parse(evidenceBytes.toString("utf-8")) as Record<string, unknown> & {
+    readonly chapter_number?: number;
+    readonly status?: string;
+    readonly modelOutcomes?: ReadonlyArray<{ readonly modelCallId?: string }>;
+  };
+  if (evidence.chapter_number !== params.pendingChapterNumber) throw new Error("OFFLINE_FINALIZATION_EVIDENCE_CHAPTER_MISMATCH");
+  const currentEvidenceSha256 = sha256(evidenceBytes);
+  const responseDir = providerResponseArtifactDir(params.projectRoot, params.bookId);
+  const existingBindings = await readRelevantRecoveryBindings({
+    dir: responseDir,
+    jobId: params.jobId,
+    pendingChapterNumber: params.pendingChapterNumber,
+    sourceChapterNumber,
+  });
+
+  let historicalEvidenceSha256: string;
+  let failedEvidenceSuffixIds: readonly string[] = [];
+  let sourceArtifacts: readonly [
+    { readonly artifact: PersistedProviderResponseArtifact; readonly bytes: Buffer },
+    { readonly artifact: PersistedProviderResponseArtifact; readonly bytes: Buffer },
+  ];
+  if (recoveryClass === "ORIGINAL_REVIEW_EXHAUSTED") {
+    if (evidence.status !== "REVIEW_EXHAUSTED") throw new Error("OFFLINE_FINALIZATION_EVIDENCE_STATUS_MISMATCH");
+    const original = await resolveFormalPendingChapterRecoveryEvidence(params);
+    if (!original) throw new Error("OFFLINE_FINALIZATION_ORIGINAL_EVIDENCE_MISSING");
+    historicalEvidenceSha256 = original.evidenceSha256;
+    sourceArtifacts = [original.artifacts[0], original.artifacts[1]];
+    if (existingBindings.length !== 0 && existingBindings.length !== 2) {
+      throw new Error("OFFLINE_FINALIZATION_BINDING_SET_INCOMPLETE");
+    }
+  } else {
+    if (evidence.status !== "BLOCKED_CRITICAL_FINDINGS" || existingBindings.length !== 2) {
+      throw new Error("OFFLINE_FINALIZATION_FAILED_REENTRY_AUTHORITY_MISSING");
+    }
+    const evidenceAnchors = new Set(existingBindings.map(({ binding }) => binding.resume_evidence_sha256));
+    if (evidenceAnchors.size !== 1) throw new Error("OFFLINE_FINALIZATION_EVIDENCE_ANCHOR_MISMATCH");
+    historicalEvidenceSha256 = existingBindings[0]!.binding.resume_evidence_sha256;
+    if (historicalEvidenceSha256 === currentEvidenceSha256) throw new Error("OFFLINE_FINALIZATION_FAILED_REENTRY_NOT_SUPERSEDED");
+    const ordered = await Promise.all(existingBindings.map(({ binding }) => readRecoveryArtifact(responseDir, binding.source_logical_step_id, {
+      jobId: params.jobId, chapterNumber: sourceChapterNumber,
+    })));
+    const rescue = ordered.filter(({ artifact }) => isRescueCandidateResponse(artifact));
+    const final = ordered.filter(({ artifact }) => isFinalReviewArtifact(artifact));
+    if (rescue.length !== 1 || final.length !== 1) throw new Error("OFFLINE_FINALIZATION_SOURCE_SEMANTICS_INVALID");
+    sourceArtifacts = [rescue[0]!, final[0]!];
+    const outcomeIds = (evidence.modelOutcomes ?? []).map((outcome) => outcome.modelCallId ?? "");
+    if (outcomeIds.some((id) => !/^provider-step-[a-f0-9]{64}$/u.test(id)) || new Set(outcomeIds).size !== outcomeIds.length) {
+      throw new Error("OFFLINE_FINALIZATION_HISTORICAL_PREFIX_INVALID");
+    }
+    const rescueIndex = outcomeIds.indexOf(rescue[0]!.artifact.logical_step_id);
+    const finalIndex = outcomeIds.indexOf(final[0]!.artifact.logical_step_id);
+    if (rescueIndex < 0 || finalIndex <= rescueIndex || finalIndex >= outcomeIds.length - 1) {
+      throw new Error("OFFLINE_FINALIZATION_HISTORICAL_PREFIX_MISMATCH");
+    }
+    await Promise.all(outcomeIds.map((logicalStepId, index) => readRecoveryArtifact(responseDir, logicalStepId, {
+      jobId: params.jobId,
+      chapterNumber: index <= finalIndex ? sourceChapterNumber : params.pendingChapterNumber,
+    })));
+    failedEvidenceSuffixIds = outcomeIds.slice(finalIndex + 1);
+  }
+
+  const [rescueSource, finalSource] = sourceArtifacts;
+  const accepted = parseAcceptedFinalReview(finalSource.artifact.response.content);
+  if (!accepted) throw new Error("OFFLINE_FINALIZATION_FINAL_REVIEW_NOT_ACCEPTED");
+  const candidateBody = extractRescueCandidate(rescueSource.artifact.response.content);
+  const candidateBodySha256 = sha256(candidateBody);
+  let stateSettlement: FormalOfflineFinalizationPlan["stateSettlement"] | undefined;
+  if (Object.prototype.hasOwnProperty.call(evidence, "stateSettlementProof")) {
+    try {
+      stateSettlement = await resolveStateSettlementProof({
+        bookDir,
+        evidenceDir,
+        evidence,
+        bookId: params.bookId,
+        jobId: params.jobId,
+        chapterNumber: params.pendingChapterNumber,
+        candidateBodySha256,
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE") throw error;
+      throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE", { cause: error });
+    }
+  }
+  const provenance = resolveRecoveryProvenance(evidence);
+  const expectedBindings = [
+    { source: rescueSource, targetRole: "reviser", targetStage: "RESCUE_REVISING_2" },
+    { source: finalSource, targetRole: "logicAuditor", targetStage: "LOGIC_REVIEW" },
+  ] as const;
+  const bindings = expectedBindings.map(({ source, targetRole, targetStage }) => {
+    const logicalStepId = logicalProviderStepId({
+      jobId: params.jobId,
+      chapterNumber: params.pendingChapterNumber,
+      stage: { stage: targetStage, role: targetRole, provider: source.artifact.provider, model: source.artifact.requested_model },
+      provider: source.artifact.provider,
+      model: source.artifact.requested_model,
+      inputFingerprint: source.artifact.input_fingerprint,
+    });
+    const authority: RecoveryBindingAuthority = {
+      schema_version: "1.0",
+      binding_type: "CORRECTED_PENDING_CHAPTER_REFERENCE",
+      job_id: params.jobId,
+      logical_step_id: logicalStepId,
+      chapter_number: params.pendingChapterNumber,
+      source_chapter_number: sourceChapterNumber,
+      source_logical_step_id: source.artifact.logical_step_id,
+      source_artifact_sha256: sha256(source.bytes),
+      source_content_sha256: source.artifact.content_sha256,
+      resume_evidence_sha256: historicalEvidenceSha256,
+    };
+    const existing = existingBindings.find(({ binding }) => binding.logical_step_id === logicalStepId);
+    if (existing && bindingAuthoritySha256(existing.binding) !== bindingAuthoritySha256(authority)) {
+      throw new Error("OFFLINE_FINALIZATION_BINDING_AUTHORITY_MISMATCH");
+    }
+    return {
+      logicalStepId,
+      sourceLogicalStepId: authority.source_logical_step_id,
+      sourceArtifactSha256: authority.source_artifact_sha256,
+      sourceContentSha256: authority.source_content_sha256,
+      resumeEvidenceSha256: authority.resume_evidence_sha256,
+      authoritySha256: bindingAuthoritySha256(authority),
+      ...(existing ? { fileSha256: sha256(existing.bytes) } : {}),
+    };
+  });
+  if (existingBindings.some(({ binding }) => !bindings.some((expected) => expected.logicalStepId === binding.logical_step_id))) {
+    throw new Error("OFFLINE_FINALIZATION_BINDING_SET_MISMATCH");
+  }
+
+  const failedReentryArtifacts = recoveryClass === "FAILED_REENTRY"
+    ? await Promise.all([...new Set((runtime.providerAttemptHistory ?? [])
+      .filter((attempt) => attempt.chapterNumber === params.pendingChapterNumber && attempt.transportStarted)
+      .map((attempt) => attempt.logicalStepId))].map(async (logicalStepId) => {
+        const source = await readRecoveryArtifact(responseDir, logicalStepId, {
+          jobId: params.jobId, chapterNumber: params.pendingChapterNumber,
+        });
+        return { logicalStepId, artifactSha256: sha256(source.bytes), contentSha256: source.artifact.content_sha256 };
+      }))
+    : [];
+  if (recoveryClass === "FAILED_REENTRY" && failedReentryArtifacts.length === 0) {
+    throw new Error("OFFLINE_FINALIZATION_FAILED_REENTRY_ARTIFACTS_MISSING");
+  }
+  if (recoveryClass === "FAILED_REENTRY") {
+    const failedArtifactIds = new Set(failedReentryArtifacts.map((artifact) => artifact.logicalStepId));
+    if (failedEvidenceSuffixIds.length === 0 || failedEvidenceSuffixIds.some((id) => !failedArtifactIds.has(id))) {
+      throw new Error("OFFLINE_FINALIZATION_FAILED_REENTRY_HISTORY_MISMATCH");
+    }
+  }
+
+  const authority = {
+    recoveryClass,
+    bookId: params.bookId,
+    jobId: params.jobId,
+    pendingChapterNumber: params.pendingChapterNumber,
+    expectedLogicalChapter: params.pendingChapterNumber,
+    sourceChapterNumber,
+    productionMapSha256: sha256(mapBytes),
+    chapterFile,
+    currentChapterSha256: sha256(currentChapterBytes),
+    evidence: { historicalSha256: historicalEvidenceSha256, currentSha256: currentEvidenceSha256 },
+    rescue: {
+      sourceLogicalStepId: rescueSource.artifact.logical_step_id,
+      sourceArtifactSha256: sha256(rescueSource.bytes),
+      sourceContentSha256: rescueSource.artifact.content_sha256,
+      candidateBody,
+      candidateBodySha256,
+    },
+    finalReview: {
+      sourceLogicalStepId: finalSource.artifact.logical_step_id,
+      sourceArtifactSha256: sha256(finalSource.bytes),
+      sourceContentSha256: finalSource.artifact.content_sha256,
+      decision: accepted.decision,
+      overallScore: accepted.overallScore,
+      issues: accepted.issues,
+    },
+    provenance,
+    bindings,
+    failedReentryArtifacts,
+  };
+  return stateSettlement
+    ? { ...authority, kind: "FORMAL_OFFLINE_FINALIZATION", stateSettlement }
+    : {
+        ...authority,
+        kind: "FORMAL_BOUNDED_STATE_REBASELINE",
+        baselineChapterNumber: params.pendingChapterNumber - 1,
+      };
+}
+
+export async function resolveFormalPendingChapterRecoveryPlan(params: {
+  readonly projectRoot: string;
+  readonly bookId: string;
+  readonly jobId: string;
+  readonly pendingChapterNumber: number;
+}): Promise<FormalPendingChapterRecoveryPlan | null> {
+  try {
+    return await resolveFormalPendingChapterRecoveryPlanUnsafe(params);
+  } catch (error) {
+    if (error instanceof Error && error.message === "OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE") {
+      throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE", { cause: error });
+    }
+    throw new Error("OFFLINE_FINALIZATION_EVIDENCE_NOT_PROVABLE", { cause: error });
+  }
+}
+
+export async function finalizePendingChapterOfflinePlan(params: {
+  readonly projectRoot: string;
+  readonly plan: FormalPendingChapterRecoveryPlan;
+}): Promise<{
+  readonly chapterNumber: number;
+  readonly status: "approved" | "accepted-with-findings";
+  readonly revisionCount: number;
+  readonly logicReviewCount: number;
+  readonly commercialReviewCount: number;
+  readonly roleUsage: FormalPendingChapterRecoveryPlan["provenance"]["roleUsage"];
+}> {
+  const plan = params.plan;
+  if (plan.kind !== "FORMAL_OFFLINE_FINALIZATION") throw new Error("OFFLINE_FINALIZATION_MODE_MISMATCH");
+  const verified = await resolveFormalPendingChapterRecoveryPlan({
+    projectRoot: params.projectRoot,
+    bookId: plan.bookId,
+    jobId: plan.jobId,
+    pendingChapterNumber: plan.pendingChapterNumber,
+  });
+  if (!verified || JSON.stringify(verified) !== JSON.stringify(plan)) {
+    throw new Error("OFFLINE_FINALIZATION_PLAN_CHANGED");
+  }
+  const bookDir = join(params.projectRoot, "books", plan.bookId);
+  const responseDirRelative = join("story", "runtime", "bounded-autonomous", "provider-responses");
+  const index = JSON.parse(await readFile(join(bookDir, "chapters", "index.json"), "utf-8")) as ChapterMeta[];
+  const chapter = index.find((entry) => entry.number === plan.pendingChapterNumber)!;
+  const currentBody = await readFile(join(bookDir, "chapters", plan.chapterFile), "utf-8");
+  const bookLanguage = await readFile(join(bookDir, "book.json"), "utf-8")
+    .then((bytes) => (JSON.parse(bytes) as { readonly language?: unknown }).language === "en" ? "en" as const : "zh" as const)
+    .catch(() => "zh" as const);
+  const heading = currentBody.match(/^# .+$/mu)?.[0] ?? `# ${chapter.title}`;
+  const finalBody = `${heading}\n\n${plan.rescue.candidateBody}`;
+  const status = plan.finalReview.decision === "APPROVED" ? "approved" as const : "accepted-with-findings" as const;
+  const updatedAt = new Date().toISOString();
+  const tokenUsage = Object.values(plan.provenance.roleUsage).reduce((total, usage) => ({
+    promptTokens: total.promptTokens + usage.promptTokens,
+    completionTokens: total.completionTokens + usage.completionTokens,
+    totalTokens: total.totalTokens + usage.totalTokens,
+    ...(total.actualCostUsd !== undefined || usage.actualCostUsd !== undefined
+      ? { actualCostUsd: (total.actualCostUsd ?? 0) + (usage.actualCostUsd ?? 0) }
+      : {}),
+  }), { promptTokens: 0, completionTokens: 0, totalTokens: 0 } as RecoveryUsage);
+  const updatedIndex = index.map((entry) => entry.number === plan.pendingChapterNumber ? {
+    ...entry,
+    status,
+    wordCount: countChapterLength(plan.rescue.candidateBody, resolveLengthCountingMode(bookLanguage)),
+    updatedAt,
+    auditIssues: plan.finalReview.issues.map((issue) => `[${issue.severity}] ${issue.description}`),
+    tokenUsage,
+    roleUsage: plan.provenance.roleUsage,
+    autonomousReview: {
+      status: plan.finalReview.decision,
+      grade: plan.finalReview.overallScore >= 90 ? "A" as const : plan.finalReview.overallScore >= 80 ? "B" as const : "C" as const,
+      revisionCount: plan.provenance.revisionCount,
+    },
+  } : entry);
+  const runtimePath = join(bookDir, "story", "runtime", "bounded-autonomous", "production-state.json");
+  const runtime = JSON.parse(await readFile(runtimePath, "utf-8")) as Record<string, unknown>;
+  const writes: Array<{ readonly relativePath: string; readonly content: string }> = [
+    { relativePath: join("chapters", plan.chapterFile), content: finalBody },
+    ...plan.stateSettlement.artifacts.map((artifact) => ({
+      relativePath: artifact.targetRelativePath,
+      content: artifact.content,
+    })),
+    { relativePath: join("chapters", "index.json"), content: `${JSON.stringify(updatedIndex, null, 2)}\n` },
+    { relativePath: join("story", "runtime", "bounded-autonomous", "production-state.json"), content: `${JSON.stringify({
+      ...runtime,
+      status: "RUNNING",
+      nextChapter: plan.sourceChapterNumber,
+      chapterNumber: plan.sourceChapterNumber,
+      checkpoint: "OFFLINE_FINALIZATION_COMPLETE",
+      responseArtifactStatus: "COMPLETE",
+      updatedAt,
+    }, null, 2)}\n` },
+  ];
+  for (const binding of plan.bindings.filter((entry) => entry.fileSha256 === undefined)) {
+    const authority: RecoveryBindingAuthority = {
+      schema_version: "1.0",
+      binding_type: "CORRECTED_PENDING_CHAPTER_REFERENCE",
+      job_id: plan.jobId,
+      logical_step_id: binding.logicalStepId,
+      chapter_number: plan.pendingChapterNumber,
+      source_chapter_number: plan.sourceChapterNumber,
+      source_logical_step_id: binding.sourceLogicalStepId,
+      source_artifact_sha256: binding.sourceArtifactSha256,
+      source_content_sha256: binding.sourceContentSha256,
+      resume_evidence_sha256: binding.resumeEvidenceSha256,
+    };
+    writes.push({
+      relativePath: join(responseDirRelative, `${binding.logicalStepId}.binding.json`),
+      content: `${JSON.stringify({ ...authority, created_at: updatedAt }, null, 2)}\n`,
+    });
+  }
+  if (plan.recoveryClass === "FAILED_REENTRY") {
+    const supersessionRelativePath = join("story", "runtime", "bounded-autonomous", `chapter-${String(plan.pendingChapterNumber).padStart(4, "0")}`, "offline-finalization-supersession.json");
+    const authority = {
+      schema_version: "1.0",
+      evidence_type: "OFFLINE_FINALIZATION_SUPERSESSION",
+      reason_code: "OFFLINE_RECOVERY_REENTRY_SUPERSEDED",
+      book_id: plan.bookId,
+      job_id: plan.jobId,
+      pending_chapter_number: plan.pendingChapterNumber,
+      historical_resume_evidence_sha256: plan.evidence.historicalSha256,
+      current_resume_evidence_sha256: plan.evidence.currentSha256,
+      corrected_bindings: plan.bindings.map((binding) => ({ logical_step_id: binding.logicalStepId, authority_sha256: binding.authoritySha256, file_sha256: binding.fileSha256 })),
+      rescue_artifact: { logical_step_id: plan.rescue.sourceLogicalStepId, artifact_sha256: plan.rescue.sourceArtifactSha256, content_sha256: plan.rescue.sourceContentSha256 },
+      final_review_artifact: { logical_step_id: plan.finalReview.sourceLogicalStepId, artifact_sha256: plan.finalReview.sourceArtifactSha256, content_sha256: plan.finalReview.sourceContentSha256 },
+      state_settlement_proof: {
+        relative_path: plan.stateSettlement.proofRelativePath,
+        sha256: plan.stateSettlement.proofSha256,
+        snapshot_id: plan.stateSettlement.snapshotId,
+        rescue_candidate_body_sha256: plan.stateSettlement.candidateBodySha256,
+      },
+      failed_reentry_artifacts: plan.failedReentryArtifacts.map((artifact) => ({ logical_step_id: artifact.logicalStepId, artifact_sha256: artifact.artifactSha256, content_sha256: artifact.contentSha256 })),
+    };
+    try {
+      const existing = JSON.parse(await readFile(join(bookDir, supersessionRelativePath), "utf-8")) as Record<string, unknown>;
+      const { created_at: _createdAt, ...existingAuthority } = existing;
+      if (JSON.stringify(existingAuthority) !== JSON.stringify(authority)) throw new Error("OFFLINE_FINALIZATION_SUPERSESSION_CONFLICT");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      writes.push({ relativePath: supersessionRelativePath, content: `${JSON.stringify({ ...authority, created_at: updatedAt }, null, 2)}\n` });
+    }
+  }
+  await commitAtomicFileSet({ rootDir: bookDir, writes });
+  return {
+    chapterNumber: plan.pendingChapterNumber,
+    status,
+    revisionCount: plan.provenance.revisionCount,
+    logicReviewCount: plan.provenance.logicReviewCount,
+    commercialReviewCount: plan.provenance.commercialReviewCount,
+    roleUsage: plan.provenance.roleUsage,
+  };
 }
 
 function logicalProviderStepId(params: {
@@ -1108,6 +1854,7 @@ export async function runBoundedAutonomousScope(params: {
   };
 
   const executeRecoverably = async <T>(chapterNumber: number, action: (safeReplayStage?: string) => Promise<T>): Promise<T | AutonomousRunProgress> => {
+    const durableNextChapter = params.pendingChapterNumber === chapterNumber ? initialNext : chapterNumber;
     let previous = retryState;
     if (previous?.nextRetryAt && params.providerRecovery) {
       const remaining = Math.max(0, Date.parse(previous.nextRetryAt) - params.providerRecovery.now());
@@ -1125,7 +1872,7 @@ export async function runBoundedAutonomousScope(params: {
         if (!(error instanceof LLMCallExecutionError)) {
           const paused = project(
             "PAUSED_DETERMINISTIC_PROVIDER_ERROR",
-            chapterNumber,
+            durableNextChapter,
             error instanceof Error ? error.message : String(error),
             {
               chapterNumber,
@@ -1141,7 +1888,7 @@ export async function runBoundedAutonomousScope(params: {
         const base = await retryDetails(error, attempt, { chapterNumber });
         if (error.metadata.classification === "RETRYABLE_PROVIDER_HTTP" || error.metadata.classification === "RETRYABLE_PRE_TRANSPORT") {
           if (attempt >= 3) {
-            const paused = project("PAUSED_PROVIDER_UNAVAILABLE", chapterNumber, "PROVIDER_RETRY_EXHAUSTED", {
+            const paused = project("PAUSED_PROVIDER_UNAVAILABLE", durableNextChapter, "PROVIDER_RETRY_EXHAUSTED", {
               ...base,
               checkpoint: "PROVIDER_RETRY_EXHAUSTED",
             });
@@ -1150,7 +1897,7 @@ export async function runBoundedAutonomousScope(params: {
           }
           const minimum = attempt === 1 ? 300_000 : 900_000;
           const delayMs = Math.max(minimum, error.metadata.retryAfterMs ?? 0);
-          const waiting = project("WAITING_PROVIDER_RETRY", chapterNumber, "PROVIDER_TEMPORARY_INTERRUPTION", {
+          const waiting = project("WAITING_PROVIDER_RETRY", durableNextChapter, "PROVIDER_TEMPORARY_INTERRUPTION", {
             ...base,
             nextRetryAt: new Date(params.providerRecovery.now() + delayMs).toISOString(),
             checkpoint: "RETRY_SCHEDULED",
@@ -1162,14 +1909,14 @@ export async function runBoundedAutonomousScope(params: {
           continue;
         }
         if (error.metadata.classification === "AMBIGUOUS_PROVIDER_OUTCOME") {
-          const paused = project("PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", chapterNumber, "PROVIDER_OUTCOME_MAY_HAVE_EXECUTED", {
+          const paused = project("PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", durableNextChapter, "PROVIDER_OUTCOME_MAY_HAVE_EXECUTED", {
             ...base,
             checkpoint: "AMBIGUOUS_PROVIDER_OUTCOME",
           });
           await params.persistProgress(paused);
           return paused;
         }
-        const paused = project("PAUSED_DETERMINISTIC_PROVIDER_ERROR", chapterNumber, error.message, {
+        const paused = project("PAUSED_DETERMINISTIC_PROVIDER_ERROR", durableNextChapter, error.message, {
           ...base,
           checkpoint: "DETERMINISTIC_PROVIDER_ERROR",
         });

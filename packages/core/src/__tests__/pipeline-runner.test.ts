@@ -31,7 +31,7 @@ import {
   readChapterVersion,
   saveChapterUserBrief,
 } from "../state/chapter-workspace.js";
-import { correctLegacyPendingChapterArtifactBindings, createAutonomousProviderExecution } from "../production/bounded-autonomous-controller.js";
+import { correctLegacyPendingChapterArtifactBindings, createAutonomousProviderExecution, deriveAutonomousJobIdentity, resolveFormalPendingChapterRecoveryPlan } from "../production/bounded-autonomous-controller.js";
 
 const require = createRequire(import.meta.url);
 const hasNodeSqlite = (() => {
@@ -5169,7 +5169,7 @@ describe("PipelineRunner", () => {
     }
   }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
 
-  it("REAL_INKOS_OFFLINE_RECOVERY_INTEGRATION_TEST settles Chapter 004 through the real PipelineRunner with zero transport", async () => {
+  it("REAL_INKOS_FORMAL_RECOVERY_INTEGRATION_TEST routes offline finalization and bounded state rebaseline", async () => {
     const originalFetch = globalThis.fetch;
     const transport = vi.fn(async () => { throw new Error("PROVIDER_TRANSPORT_MUST_NOT_RUN"); });
     globalThis.fetch = transport as typeof fetch;
@@ -5180,7 +5180,13 @@ describe("PipelineRunner", () => {
       _apiKey: "test-only", _piModel: { id: "test-model", name: "test-model", api: "openai-completions", provider: "custom", baseUrl: "http://127.0.0.1:9/v1" },
       defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
     } as ConstructorParameters<typeof PipelineRunner>[0]["client"];
-    const candidateBody = "门被风顶开，林越停在门槛前，听见柜台后的灯轻轻晃动。";
+    const oldBody = "OLD_BODY_A：林越仍站在旧门外，尚未进入正式救援版本。";
+    const candidateBody = "RESCUE_BODY_B：门被风顶开，林越停在门槛前，听见柜台后的灯轻轻晃动。";
+    const oldState = "# Current State\n\nOLD_STATE_A";
+    const stateB = "# Current State\n\nSTATE_B";
+    const hooksB = "# Pending Hooks\n\nSTATE_B_HOOK";
+    const summariesB = "# Chapter Summaries\n\n| 4 | STATE_B_SUMMARY |";
+    expect(oldBody).not.toBe(candidateBody);
     const finding = {
       severity: "warning" as const, category: "causal_logic", description: "Synthetic structural warning.",
       suggestion: "Track this in the rolling review.", repair_scope: "structural" as const,
@@ -5202,18 +5208,24 @@ describe("PipelineRunner", () => {
       const storyDir = join(bookDir, "story");
       const evidenceDir = join(storyDir, "runtime", "bounded-autonomous", "chapter-0004");
       await mkdir(evidenceDir, { recursive: true });
+      await mkdir(join(storyDir, "outline"), { recursive: true });
       await Promise.all([
         ...[1, 2, 3].map((number) => writeFile(join(bookDir, "chapters", `${String(number).padStart(4, "0")}_Approved.md`), `# 第${number}章 Approved\n\nSettled chapter ${number}.`, "utf-8")),
-        writeFile(join(bookDir, "chapters", "0004_Pending.md"), `# 第4章 Pending\n\n${candidateBody}`, "utf-8"),
-        writeFile(join(storyDir, "current_state.md"), createStateCard({
-          chapter: 4, location: "Ashen ferry crossing", protagonistState: "Lin Yue holds the oath token.",
-          goal: "Find the vanished mentor.", conflict: "The mentor debt remains unresolved.",
+        writeFile(join(bookDir, "chapters", "0004_Pending.md"), `# 第4章 Pending\n\n${oldBody}`, "utf-8"),
+        writeFile(join(storyDir, "outline", "book-production-map.json"), JSON.stringify({
+          schema_version: "1.0", book_id: fixture.bookId, authority_book_id: "authority", title: "Test Book", total_chapters: 10,
+          volumes: [{ volume_id: "volume-001", volume_number: 1, title: "One", start_chapter: 1, end_chapter: 10, chapter_count: 10 }],
         }), "utf-8"),
-        writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n", "utf-8"),
+        writeFile(join(storyDir, "current_state.md"), oldState, "utf-8"),
+        writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n\nOLD_STATE_A_HOOK", "utf-8"),
         writeFile(join(evidenceDir, "resume-review.json"), `${JSON.stringify({
           schema_version: "1.0", chapter_number: 4, status: "REVIEW_EXHAUSTED", revisionCount: 2,
           logicReviewCount: 2, commercialReviewCount: 0, phase: "ROUND_COMPLETE",
-          baselineRoleUsage: {}, roleUsage: {},
+          baselineRoleUsage: { writer: { promptTokens: 10, completionTokens: 20, totalTokens: 30 } },
+          roleUsage: {
+            reviser: { promptTokens: 3, completionTokens: 4, totalTokens: 7 },
+            "logic-canon-auditor": { promptTokens: 5, completionTokens: 6, totalTokens: 11 },
+          },
           reviewRounds: [{ round: 1, logic: { passed: false, findings: [{ ...finding, repairScope: finding.repair_scope }] }, commercial: null }],
           currentFindings: [{ ...finding, repairScope: finding.repair_scope }], modelOutcomes,
         }, null, 2)}\n`, "utf-8"),
@@ -5225,7 +5237,7 @@ describe("PipelineRunner", () => {
           auditIssues: [], lengthWarnings: [],
         })),
         {
-          number: 4, title: "Pending", status: "audit-failed" as const, wordCount: candidateBody.length,
+          number: 4, title: "Pending", status: "audit-failed" as const, wordCount: oldBody.length,
           createdAt: "2026-03-19T00:00:00.000Z", updatedAt: "2026-03-19T00:00:00.000Z",
           auditIssues: ["[warning] Synthetic structural warning."], lengthWarnings: [],
         },
@@ -5241,35 +5253,87 @@ describe("PipelineRunner", () => {
       };
     };
 
-    let discoveryRoot: string | undefined;
     let targetRoot: string | undefined;
     let invalidRoot: string | undefined;
+    let retryRoot: string | undefined;
     try {
-      const discovery = await createFixture([]);
-      discoveryRoot = discovery.root;
-      let finalFingerprint: string | undefined;
-      const capture = new Error("CAPTURE_FINAL_REVIEW_FINGERPRINT");
-      await expect(llmProvider.runWithLLMCallExecutionPolicy({
-        prepare: async (request) => { finalFingerprint = request.inputFingerprint; throw capture; },
-        persistSuccess: async () => undefined,
-      }, () => discovery.runner.resumeAuditFailedChapterBounded(discovery.bookId, 4))).rejects.toBe(capture);
-      expect(finalFingerprint).toMatch(/^[a-f0-9]{64}$/u);
-      expect(transport).toHaveBeenCalledTimes(0);
-
-      const jobId = "autonomous-test-book-recovery";
+      const target = await createFixture([]);
+      targetRoot = target.root;
+      const jobId = deriveAutonomousJobIdentity({
+        map: {
+          schemaVersion: "1.0", bookId: target.bookId, authorityBookId: "authority", title: "Test Book", totalChapters: 10,
+          volumes: [{ volumeId: "volume-001", volumeNumber: 1, title: "One", startChapter: 1, endChapter: 10, chapterCount: 10 }],
+        },
+        mode: "current-volume",
+        nextChapter: 5,
+      });
       const rescueFingerprint = "a".repeat(64);
+      const finalFingerprint = "b".repeat(64);
       const sourceExecution = createAutonomousProviderExecution({
-        projectRoot: discovery.root, bookId: discovery.bookId, jobId,
+        projectRoot: target.root, bookId: target.bookId, jobId,
         getActiveStage: () => ({ stage: "RESCUE_REVISING_2", role: "reviser", provider: "custom", model: "test-model" }),
       });
       const rescueId = sourceExecution.responseArtifactPath(rescueFingerprint, "custom", "test-model", 5).split(/[\\/]/).at(-1)!.replace(/\.json$/u, "");
-      const finalId = sourceExecution.responseArtifactPath(finalFingerprint!, "custom", "test-model", 5).split(/[\\/]/).at(-1)!.replace(/\.json$/u, "");
+      const finalId = sourceExecution.responseArtifactPath(finalFingerprint, "custom", "test-model", 5).split(/[\\/]/).at(-1)!.replace(/\.json$/u, "");
       const outcomes = [rescueId, finalId].map((modelCallId) => ({
         modelCallId, provider: "custom", model: "test-model", usage: ZERO_USAGE,
         returnedAt: "2026-08-23T00:00:00.000Z", stage: "REVISION_AND_LOGIC",
       }));
-      const target = await createFixture(outcomes);
-      targetRoot = target.root;
+      const targetEvidence = JSON.parse(await readFile(join(target.evidenceDir, "resume-review.json"), "utf-8"));
+      targetEvidence.modelOutcomes = outcomes;
+      targetEvidence.commercialReviewCount = 1;
+      const snapshotDir = join(target.bookDir, "story", "snapshots", "4");
+      const snapshotStateDir = join(snapshotDir, "state");
+      await mkdir(snapshotStateDir, { recursive: true });
+      const settlementSources = [
+        ["current_state.md", stateB],
+        ["pending_hooks.md", hooksB],
+        ["chapter_summaries.md", summariesB],
+        ["particle_ledger.md", "# Particle Ledger\n\nSTATE_B_PARTICLE"],
+        ["subplot_board.md", "# Subplot Board\n\nSTATE_B_SUBPLOT"],
+        ["emotional_arcs.md", "# Emotional Arcs\n\nSTATE_B_EMOTION"],
+        ["character_matrix.md", "# Character Matrix\n\nSTATE_B_CHARACTER"],
+      ] as const;
+      const structuredSources = [
+        ["manifest.json", JSON.stringify({ schemaVersion: 2, language: "zh", lastAppliedChapter: 4, projectionVersion: 1, migrationWarnings: [] }, null, 2)],
+        ["current_state.json", JSON.stringify({ chapter: 4, facts: [{ subject: "Lin Yue", predicate: "state", object: "STATE_B", validFromChapter: 4, validUntilChapter: null, sourceChapter: 4 }] }, null, 2)],
+        ["hooks.json", JSON.stringify({ hooks: [] }, null, 2)],
+        ["chapter_summaries.json", JSON.stringify({ rows: [{ chapter: 4, title: "Pending", characters: "Lin Yue", events: "STATE_B", stateChanges: "STATE_B", hookActivity: "", mood: "tense", chapterType: "turn" }] }, null, 2)],
+      ] as const;
+      await Promise.all([
+        ...settlementSources.map(([name, content]) => writeFile(join(snapshotDir, name), content, "utf-8")),
+        ...structuredSources.map(([name, content]) => writeFile(join(snapshotStateDir, name), content, "utf-8")),
+      ]);
+      const stateArtifacts = [
+        ...settlementSources.map(([name, content]) => ({
+          source_relative_path: `story/snapshots/4/${name}`,
+          target_relative_path: `story/${name}`,
+          sha256: createHash("sha256").update(content).digest("hex"),
+        })),
+        ...structuredSources.map(([name, content]) => ({
+          source_relative_path: `story/snapshots/4/state/${name}`,
+          target_relative_path: `story/state/${name}`,
+          sha256: createHash("sha256").update(content).digest("hex"),
+        })),
+      ];
+      const settlementProofPath = join(target.evidenceDir, "state-settlement-proof.json");
+      const settlementProof = {
+        schema_version: "1.0",
+        evidence_type: "OFFLINE_FINALIZATION_STATE_SETTLEMENT_PROOF",
+        book_id: target.bookId,
+        job_id: jobId,
+        chapter_number: 4,
+        snapshot_id: "chapter-4-state-b",
+        rescue_candidate_body_sha256: createHash("sha256").update(candidateBody).digest("hex"),
+        artifacts: stateArtifacts,
+      };
+      const settlementProofBytes = Buffer.from(`${JSON.stringify(settlementProof, null, 2)}\n`);
+      await writeFile(settlementProofPath, settlementProofBytes);
+      targetEvidence.stateSettlementProof = {
+        relativePath: "state-settlement-proof.json",
+        sha256: createHash("sha256").update(settlementProofBytes).digest("hex"),
+      };
+      await writeFile(join(target.evidenceDir, "resume-review.json"), `${JSON.stringify(targetEvidence, null, 2)}\n`, "utf-8");
       const responseDir = join(target.bookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
       await mkdir(responseDir, { recursive: true });
       const writeArtifact = async (dir: string, id: string, fingerprint: string, content: string) => {
@@ -5284,7 +5348,7 @@ describe("PipelineRunner", () => {
         return bytes;
       };
       const rescueBytes = await writeArtifact(responseDir, rescueId, rescueFingerprint, `=== REVISED_CONTENT ===\n${candidateBody}`);
-      const finalBytes = await writeArtifact(responseDir, finalId, finalFingerprint!, finalContent);
+      const finalBytes = await writeArtifact(responseDir, finalId, finalFingerprint, finalContent);
       await writeFile(join(target.bookDir, "story", "runtime", "bounded-autonomous", "production-state.json"), JSON.stringify({
         jobId, status: "REVIEW_EXHAUSTED", mode: "current-volume", volumeId: "volume-001",
         startChapter: 4, targetChapter: 10, nextChapter: 5, chapterNumber: 5, completedThisRun: 0, responseArtifactStatus: "COMPLETE",
@@ -5292,18 +5356,139 @@ describe("PipelineRunner", () => {
       await expect(correctLegacyPendingChapterArtifactBindings({
         projectRoot: target.root, bookId: target.bookId, jobId, pendingChapterNumber: 4,
       })).resolves.toHaveLength(2);
-      const execution = createAutonomousProviderExecution({
-        projectRoot: target.root, bookId: target.bookId, jobId, getActiveStage: target.getActiveStage,
-      });
       const resume = vi.spyOn(target.runner, "resumeAuditFailedChapterBounded");
+      const plan = await resolveFormalPendingChapterRecoveryPlan({
+        projectRoot: target.root, bookId: target.bookId, jobId, pendingChapterNumber: 4,
+      });
+      expect(plan).toMatchObject({
+        kind: "FORMAL_OFFLINE_FINALIZATION",
+        bookId: target.bookId,
+        jobId,
+        pendingChapterNumber: 4,
+        rescue: { sourceLogicalStepId: rescueId },
+        finalReview: { sourceLogicalStepId: finalId, decision: "ACCEPTED_WITH_FINDINGS" },
+        stateSettlement: { snapshotId: "chapter-4-state-b" },
+        provenance: { revisionCount: 2, logicReviewCount: 2, commercialReviewCount: 1 },
+      });
+      expect(plan?.rescue.candidateBodySha256).toBe(createHash("sha256").update(candidateBody).digest("hex"));
+      const runtimePath = join(target.bookDir, "story", "runtime", "bounded-autonomous", "production-state.json");
+      const mapPath = join(target.bookDir, "story", "outline", "book-production-map.json");
+      const indexPath = join(target.bookDir, "chapters", "index.json");
+      const evidencePath = join(target.evidenceDir, "resume-review.json");
+      const bindingPath = join(responseDir, `${plan!.bindings[0]!.logicalStepId}.binding.json`);
+      const finalBindingPath = join(responseDir, `${plan!.bindings[1]!.logicalStepId}.binding.json`);
+      const [runtimeBytes, mapBytes, indexBytes, evidenceBytes, bindingBytes, finalBindingBytes] = await Promise.all([
+        readFile(runtimePath), readFile(mapPath), readFile(indexPath), readFile(evidencePath), readFile(bindingPath), readFile(finalBindingPath),
+      ]);
+      const expectEvidenceRejected = async (
+        mutate: () => Promise<void>,
+        restore: () => Promise<void>,
+        expectedCode = "OFFLINE_FINALIZATION_EVIDENCE_NOT_PROVABLE",
+      ) => {
+        await mutate();
+        await expect(resolveFormalPendingChapterRecoveryPlan({
+          projectRoot: target.root, bookId: target.bookId, jobId, pendingChapterNumber: 4,
+        })).rejects.toThrow(expectedCode);
+        await restore();
+        expect(transport).toHaveBeenCalledTimes(0);
+      };
+      await expectEvidenceRejected(
+        () => writeFile(join(responseDir, `${rescueId}.json`), Buffer.concat([rescueBytes, Buffer.from("tampered")])),
+        () => writeFile(join(responseDir, `${rescueId}.json`), rescueBytes),
+      );
+      await expectEvidenceRejected(
+        () => writeFile(join(responseDir, `${finalId}.json`), Buffer.concat([finalBytes, Buffer.from("tampered")])),
+        () => writeFile(join(responseDir, `${finalId}.json`), finalBytes),
+      );
+      await expectEvidenceRejected(async () => {
+        const artifact = JSON.parse(finalBytes.toString("utf-8"));
+        const rejectedContent = JSON.stringify({ ...JSON.parse(artifact.response.content), passed: false, overall_score: 40 });
+        const rejectedBytes = Buffer.from(`${JSON.stringify({
+          ...artifact, content_sha256: createHash("sha256").update(rejectedContent).digest("hex"),
+          response: { ...artifact.response, content: rejectedContent },
+        }, null, 2)}\n`);
+        const binding = JSON.parse(finalBindingBytes.toString("utf-8"));
+        await writeFile(join(responseDir, `${finalId}.json`), rejectedBytes);
+        await writeFile(finalBindingPath, JSON.stringify({
+          ...binding,
+          source_artifact_sha256: createHash("sha256").update(rejectedBytes).digest("hex"),
+          source_content_sha256: createHash("sha256").update(rejectedContent).digest("hex"),
+        }));
+      }, async () => {
+        await writeFile(join(responseDir, `${finalId}.json`), finalBytes);
+        await writeFile(finalBindingPath, finalBindingBytes);
+      });
+      await expectEvidenceRejected(async () => {
+        const binding = JSON.parse(bindingBytes.toString("utf-8"));
+        await writeFile(bindingPath, JSON.stringify({ ...binding, source_artifact_sha256: "0".repeat(64) }));
+      }, () => writeFile(bindingPath, bindingBytes));
+      await expectEvidenceRejected(async () => {
+        const runtime = JSON.parse(runtimeBytes.toString("utf-8"));
+        await writeFile(runtimePath, JSON.stringify({ ...runtime, jobId: "wrong-job" }));
+      }, () => writeFile(runtimePath, runtimeBytes));
+      await expectEvidenceRejected(async () => {
+        const evidence = JSON.parse(evidenceBytes.toString("utf-8"));
+        await writeFile(evidencePath, JSON.stringify({ ...evidence, chapter_number: 3 }));
+      }, () => writeFile(evidencePath, evidenceBytes));
+      await expectEvidenceRejected(async () => {
+        const productionMap = JSON.parse(mapBytes.toString("utf-8"));
+        await writeFile(mapPath, JSON.stringify({ ...productionMap, book_id: "wrong-book" }));
+      }, () => writeFile(mapPath, mapBytes));
+      await expectEvidenceRejected(async () => {
+        const chapters = JSON.parse(indexBytes.toString("utf-8"));
+        chapters[3].status = "approved";
+        await writeFile(indexPath, JSON.stringify(chapters));
+      }, () => writeFile(indexPath, indexBytes));
+      await expectEvidenceRejected(async () => {
+        const evidence = JSON.parse(evidenceBytes.toString("utf-8"));
+        evidence.modelOutcomes.reverse();
+        await writeFile(evidencePath, JSON.stringify(evidence));
+      }, () => writeFile(evidencePath, evidenceBytes));
+      await expectEvidenceRejected(
+        () => writeFile(join(snapshotDir, "current_state.md"), `${stateB}\nTAMPERED`, "utf-8"),
+        () => writeFile(join(snapshotDir, "current_state.md"), stateB, "utf-8"),
+        "OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE",
+      );
+      await expectEvidenceRejected(
+        () => writeFile(join(snapshotStateDir, "manifest.json"), JSON.stringify({ schemaVersion: 2, language: "zh", lastAppliedChapter: 3, projectionVersion: 1, migrationWarnings: [] }), "utf-8"),
+        () => writeFile(join(snapshotStateDir, "manifest.json"), structuredSources[0][1], "utf-8"),
+        "OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE",
+      );
+      await expectEvidenceRejected(async () => {
+        const mismatched = { ...settlementProof, rescue_candidate_body_sha256: "0".repeat(64) };
+        const bytes = Buffer.from(`${JSON.stringify(mismatched, null, 2)}\n`);
+        await writeFile(settlementProofPath, bytes);
+        const evidence = JSON.parse(evidenceBytes.toString("utf-8"));
+        evidence.stateSettlementProof.sha256 = createHash("sha256").update(bytes).digest("hex");
+        await writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`, "utf-8");
+      }, async () => {
+        await writeFile(settlementProofPath, settlementProofBytes);
+        await writeFile(evidencePath, evidenceBytes);
+      }, "OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE");
 
-      const result = await execution.execute(4, () => target.runner.resumeAuditFailedChapterBounded(target.bookId, 4));
+      const result = await target.runner.finalizePendingChapterOffline(plan!);
 
-      expect(resume).toHaveBeenCalledTimes(1);
-      expect(result).toMatchObject({ chapterNumber: 4, status: "accepted-with-findings", revisionCount: 2 });
-      expect((await target.state.loadChapterIndex(target.bookId))[3]).toMatchObject({ number: 4, status: "accepted-with-findings" });
+      expect(resume).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ chapterNumber: 4, status: "accepted-with-findings", revisionCount: 2, logicReviewCount: 2, commercialReviewCount: 1 });
+      expect(result.roleUsage).toEqual({
+        writer: { promptTokens: 10, completionTokens: 20, totalTokens: 30 },
+        reviser: { promptTokens: 3, completionTokens: 4, totalTokens: 7 },
+        "logic-canon-auditor": { promptTokens: 5, completionTokens: 6, totalTokens: 11 },
+      });
+      expect((await target.state.loadChapterIndex(target.bookId))[3]).toMatchObject({
+        number: 4,
+        status: "accepted-with-findings",
+        autonomousReview: { revisionCount: 2 },
+        roleUsage: result.roleUsage,
+      });
       expect(await target.state.getNextChapterNumber(target.bookId)).toBe(5);
       expect(await readFile(join(target.bookDir, "chapters", "0004_Pending.md"), "utf-8")).toBe(`# 第4章 Pending\n\n${candidateBody}`);
+      expect(await readFile(join(target.bookDir, "story", "current_state.md"), "utf-8")).toBe(stateB);
+      expect(await readFile(join(target.bookDir, "story", "pending_hooks.md"), "utf-8")).toBe(hooksB);
+      expect(await readFile(join(target.bookDir, "story", "chapter_summaries.md"), "utf-8")).toBe(summariesB);
+      expect(await readFile(join(target.bookDir, "story", "state", "manifest.json")))
+        .toEqual(await readFile(join(snapshotStateDir, "manifest.json")));
+      expect(await readFile(settlementProofPath)).toEqual(settlementProofBytes);
       expect(await readFile(join(responseDir, `${rescueId}.json`))).toEqual(rescueBytes);
       expect(await readFile(join(responseDir, `${finalId}.json`))).toEqual(finalBytes);
       expect(await readdir(join(target.bookDir, "chapters"))).not.toContain(expect.stringMatching(/^0005_/u));
@@ -5316,7 +5501,7 @@ describe("PipelineRunner", () => {
       const invalidResponseDir = join(invalid.bookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
       await mkdir(invalidResponseDir, { recursive: true });
       await writeArtifact(invalidResponseDir, rescueId, rescueFingerprint, `=== REVISED_CONTENT ===\n${candidateBody}`);
-      await writeArtifact(invalidResponseDir, finalId, finalFingerprint!, finalContent);
+      await writeArtifact(invalidResponseDir, finalId, finalFingerprint, finalContent);
       await writeFile(join(invalid.bookDir, "story", "runtime", "bounded-autonomous", "production-state.json"), JSON.stringify({
         jobId, status: "REVIEW_EXHAUSTED", mode: "current-volume", volumeId: "volume-001",
         startChapter: 4, targetChapter: 10, nextChapter: 5, chapterNumber: 5, completedThisRun: 0, responseArtifactStatus: "COMPLETE",
@@ -5324,28 +5509,102 @@ describe("PipelineRunner", () => {
       await correctLegacyPendingChapterArtifactBindings({
         projectRoot: invalid.root, bookId: invalid.bookId, jobId, pendingChapterNumber: 4,
       });
-      const invalidEvidence = JSON.parse(await readFile(join(invalid.evidenceDir, "resume-review.json"), "utf-8"));
-      invalidEvidence.modelOutcomes = invalidEvidence.modelOutcomes.filter((outcome: { modelCallId: string }) => outcome.modelCallId !== finalId);
-      await writeFile(join(invalid.evidenceDir, "resume-review.json"), `${JSON.stringify(invalidEvidence, null, 2)}\n`, "utf-8");
-      const invalidExecution = createAutonomousProviderExecution({
-        projectRoot: invalid.root, bookId: invalid.bookId, jobId, getActiveStage: invalid.getActiveStage,
-      });
       const invalidResume = vi.spyOn(invalid.runner, "resumeAuditFailedChapterBounded");
 
-      await expect(invalidExecution.execute(4, () => invalid.runner.resumeAuditFailedChapterBounded(invalid.bookId, 4)))
-        .rejects.toThrow("AUTONOMOUS_PROVIDER_RESPONSE_BINDING_AUTHORITY_MISMATCH");
-      expect(invalidResume).toHaveBeenCalledTimes(1);
-      expect((await invalid.state.loadChapterIndex(invalid.bookId))[3]).toMatchObject({ number: 4, status: "audit-failed" });
+      const rebaselinePlan = await resolveFormalPendingChapterRecoveryPlan({
+        projectRoot: invalid.root, bookId: invalid.bookId, jobId, pendingChapterNumber: 4,
+      });
+      expect(rebaselinePlan).toMatchObject({
+        kind: "FORMAL_BOUNDED_STATE_REBASELINE",
+        pendingChapterNumber: 4,
+        sourceChapterNumber: 5,
+        rescue: { candidateBodySha256: createHash("sha256").update(candidateBody).digest("hex") },
+        finalReview: { decision: "ACCEPTED_WITH_FINDINGS", overallScore: 92 },
+        baselineChapterNumber: 3,
+      });
+      if (rebaselinePlan?.kind !== "FORMAL_BOUNDED_STATE_REBASELINE") throw new Error("EXPECTED_REBASELINE_PLAN");
+      await snapshotRevisionBaseline(invalid.state, invalid.bookId, rebaselinePlan.baselineChapterNumber);
+      vi.mocked(StateValidatorAgent.prototype.validate).mockResolvedValue({
+        passed: false,
+        repairRequired: true,
+        warnings: [{ category: "contradiction", description: "Synthetic double-failure." }],
+      });
+      await expect(invalid.runner.rebaselinePendingChapterState(rebaselinePlan))
+        .rejects.toThrow("STATE_REBASELINE_VALIDATION_FAILED");
+      expect((await invalid.state.loadChapterIndex(invalid.bookId))[3]).toMatchObject({ status: "audit-failed" });
+      expect(await readFile(join(invalid.bookDir, "chapters", "0004_Pending.md"), "utf-8")).toBe(`# 第4章 Pending\n\n${oldBody}`);
+      expect(await readFile(join(invalid.bookDir, "story", "current_state.md"), "utf-8")).toBe(oldState);
+      await expect(stat(join(invalid.evidenceDir, "bounded-state-rebaseline-settlement.json"))).rejects.toMatchObject({ code: "ENOENT" });
+      vi.mocked(StateValidatorAgent.prototype.validate).mockResolvedValue({ warnings: [], passed: true });
+      const normalSettlementCallsBefore = vi.mocked(WriterAgent.prototype.settleChapterState).mock.calls.length;
+      const normalValidationCallsBefore = vi.mocked(StateValidatorAgent.prototype.validate).mock.calls.length;
+      const rebaselineResult = await invalid.runner.rebaselinePendingChapterState(rebaselinePlan);
+      expect(rebaselineResult).toMatchObject({
+        chapterNumber: rebaselinePlan.pendingChapterNumber,
+        status: "accepted-with-findings",
+        recoveryMode: "FORMAL_BOUNDED_STATE_REBASELINE",
+        providerCallCount: 3,
+      });
+      expect(vi.mocked(WriterAgent.prototype.settleChapterState).mock.calls.length - normalSettlementCallsBefore).toBe(1);
+      expect(vi.mocked(StateValidatorAgent.prototype.validate).mock.calls.length - normalValidationCallsBefore).toBe(1);
+      expect(invalidResume).not.toHaveBeenCalled();
+      expect((await invalid.state.loadChapterIndex(invalid.bookId))[3]).toMatchObject({ number: 4, status: "accepted-with-findings" });
       expect(await invalid.state.getNextChapterNumber(invalid.bookId)).toBe(5);
+      expect(await readFile(join(invalid.bookDir, "chapters", "0004_Pending.md"), "utf-8")).toBe(`# 第4章 Pending\n\n${candidateBody}`);
+      expect(await readFile(join(invalid.bookDir, "story", "current_state.md"), "utf-8")).not.toBe(oldState);
+      const rebaselineReceipt = JSON.parse(await readFile(join(invalid.evidenceDir, "bounded-state-rebaseline-settlement.json"), "utf-8"));
+      expect(rebaselineReceipt).toMatchObject({
+        evidence_type: "BOUNDED_STATE_REBASELINE_SETTLEMENT",
+        chapter_number: rebaselinePlan.pendingChapterNumber,
+        baseline_chapter_number: rebaselinePlan.baselineChapterNumber,
+        historical_rescue_artifact_id: rescueId,
+        historical_final_review_artifact_id: finalId,
+        final_review_decision: "ACCEPTED_WITH_FINDINGS",
+        state_validation: { passed: true },
+        provider_call_count: 3,
+      });
+      expect(rebaselineReceipt.baseline_snapshot.artifacts.length).toBeGreaterThan(0);
+      expect(rebaselineReceipt.committed_snapshot.artifacts.length).toBeGreaterThan(0);
       expect(await readdir(join(invalid.bookDir, "chapters"))).not.toContain(expect.stringMatching(/^0005_/u));
+
+      const retryFixture = await createFixture(outcomes);
+      retryRoot = retryFixture.root;
+      const retryResponseDir = join(retryFixture.bookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
+      await mkdir(retryResponseDir, { recursive: true });
+      await writeArtifact(retryResponseDir, rescueId, rescueFingerprint, `=== REVISED_CONTENT ===\n${candidateBody}`);
+      await writeArtifact(retryResponseDir, finalId, finalFingerprint, finalContent);
+      await writeFile(join(retryFixture.bookDir, "story", "runtime", "bounded-autonomous", "production-state.json"), JSON.stringify({
+        jobId, status: "REVIEW_EXHAUSTED", mode: "current-volume", volumeId: "volume-001",
+        startChapter: 4, targetChapter: 10, nextChapter: 5, chapterNumber: 5, completedThisRun: 0, responseArtifactStatus: "COMPLETE",
+      }));
+      await correctLegacyPendingChapterArtifactBindings({
+        projectRoot: retryFixture.root, bookId: retryFixture.bookId, jobId, pendingChapterNumber: 4,
+      });
+      const retryPlan = await resolveFormalPendingChapterRecoveryPlan({
+        projectRoot: retryFixture.root, bookId: retryFixture.bookId, jobId, pendingChapterNumber: 4,
+      });
+      if (retryPlan?.kind !== "FORMAL_BOUNDED_STATE_REBASELINE") throw new Error("EXPECTED_RETRY_REBASELINE_PLAN");
+      await snapshotRevisionBaseline(retryFixture.state, retryFixture.bookId, retryPlan.baselineChapterNumber);
+      const settlementCallsBefore = vi.mocked(WriterAgent.prototype.settleChapterState).mock.calls.length;
+      const validationCallsBefore = vi.mocked(StateValidatorAgent.prototype.validate).mock.calls.length;
+      vi.mocked(StateValidatorAgent.prototype.validate)
+        .mockResolvedValueOnce({ passed: false, repairRequired: true, warnings: [{ category: "repair", description: "Retry once." }] })
+        .mockResolvedValueOnce({ passed: true, warnings: [] });
+      await expect(retryFixture.runner.rebaselinePendingChapterState(retryPlan)).resolves.toMatchObject({
+        status: "accepted-with-findings", providerCallCount: 6,
+      });
+      expect(vi.mocked(WriterAgent.prototype.settleChapterState).mock.calls.length - settlementCallsBefore).toBe(2);
+      expect(vi.mocked(StateValidatorAgent.prototype.validate).mock.calls.length - validationCallsBefore).toBe(2);
+      expect((await retryFixture.state.loadChapterIndex(retryFixture.bookId))[3]).toMatchObject({ status: "accepted-with-findings" });
+      expect(await readdir(join(retryFixture.bookDir, "chapters"))).not.toContain(expect.stringMatching(/^0005_/u));
       expect(transport).toHaveBeenCalledTimes(0);
       expect(chapterWriter).toHaveBeenCalledTimes(0);
-      expect(realFinalReview).toHaveBeenCalledTimes(3);
+      expect(realFinalReview).toHaveBeenCalledTimes(0);
     } finally {
       globalThis.fetch = originalFetch;
-      if (discoveryRoot) await rm(discoveryRoot, { recursive: true, force: true });
       if (targetRoot) await rm(targetRoot, { recursive: true, force: true });
       if (invalidRoot) await rm(invalidRoot, { recursive: true, force: true });
+      if (retryRoot) await rm(retryRoot, { recursive: true, force: true });
     }
   }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
 

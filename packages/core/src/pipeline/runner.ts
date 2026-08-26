@@ -77,9 +77,12 @@ import {
   writeProductionRunSnapshot,
 } from "../production/harness.js";
 import {
+  finalizePendingChapterOfflinePlan,
   loadAutonomousProductionState,
+  resolveFormalPendingChapterRecoveryPlan,
   verifyFormalPendingChapterRecoveryEvidence,
   type AutonomousRunProgress,
+  type FormalPendingChapterRecoveryPlan,
 } from "../production/bounded-autonomous-controller.js";
 
 const SEQUENCE_LEVEL_CATEGORIES = new Set([
@@ -281,7 +284,7 @@ export interface PipelineConfig {
   readonly onStreamProgress?: OnStreamProgress;
   readonly onContextCompression?: ContextCompressionCallback;
   readonly onAutonomousStage?: (event: {
-    readonly stage: "WRITING" | "LOGIC_REVIEW" | "READER_REVIEW" | "REVISING_1" | "RESCUE_REVISING_2" | "SETTLING_STATE" | "APPROVED";
+    readonly stage: "WRITING" | "LOGIC_REVIEW" | "READER_REVIEW" | "REVISING_1" | "RESCUE_REVISING_2" | "SETTLING_STATE" | "STATE_REBASELINE_SETTLEMENT" | "STATE_REBASELINE_VALIDATION" | "APPROVED";
     readonly role: string;
     readonly provider: string | null;
     readonly model: string | null;
@@ -1997,6 +2000,207 @@ export class PipelineRunner {
           reviser: reviseOutput.tokenUsage ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
           "logic-canon-auditor": effectivePostRevision.auditResult.tokenUsage ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
         },
+      };
+    } finally {
+      await releaseLock();
+    }
+  }
+
+  /** Atomically consumes a pre-resolved formal recovery plan without entering any model-backed path. */
+  async finalizePendingChapterOffline(plan: FormalPendingChapterRecoveryPlan) {
+    const releaseLock = await this.state.acquireBookLock(plan.bookId);
+    try {
+      return await finalizePendingChapterOfflinePlan({ projectRoot: this.config.projectRoot, plan });
+    } finally {
+      await releaseLock();
+    }
+  }
+
+  /** Rebuilds only the pending chapter's state projection from formally authorized rescue text. */
+  async rebaselinePendingChapterState(plan: FormalPendingChapterRecoveryPlan): Promise<{
+    readonly chapterNumber: number;
+    readonly status: "approved" | "accepted-with-findings";
+    readonly revisionCount: number;
+    readonly logicReviewCount: number;
+    readonly commercialReviewCount: number;
+    readonly roleUsage: Record<string, RoleTokenUsage>;
+    readonly recoveryMode: "FORMAL_BOUNDED_STATE_REBASELINE";
+    readonly providerCallCount: 3 | 6;
+  }> {
+    if (plan.kind !== "FORMAL_BOUNDED_STATE_REBASELINE") throw new Error("STATE_REBASELINE_MODE_MISMATCH");
+    const releaseLock = await this.state.acquireBookLock(plan.bookId);
+    try {
+      const verified = await resolveFormalPendingChapterRecoveryPlan({
+        projectRoot: this.config.projectRoot,
+        bookId: plan.bookId,
+        jobId: plan.jobId,
+        pendingChapterNumber: plan.pendingChapterNumber,
+      });
+      if (!verified || JSON.stringify(verified) !== JSON.stringify(plan)) throw new Error("STATE_REBASELINE_PLAN_CHANGED");
+
+      const book = await this.state.loadBookConfig(plan.bookId);
+      const bookDir = this.state.bookDir(plan.bookId);
+      const index = [...await this.state.loadChapterIndex(plan.bookId)];
+      const targetIndex = index.findIndex((chapter) => chapter.number === plan.pendingChapterNumber);
+      const target = index[targetIndex];
+      if (!target || target.status !== "audit-failed" || Math.max(...index.map((chapter) => chapter.number)) !== plan.pendingChapterNumber) {
+        throw new Error("STATE_REBASELINE_PENDING_CHAPTER_MISMATCH");
+      }
+      const baselineDir = join(bookDir, "story", "snapshots", String(plan.baselineChapterNumber));
+      const [oldState, oldHooks] = await Promise.all([
+        readFile(join(baselineDir, "current_state.md"), "utf-8"),
+        readFile(join(baselineDir, "pending_hooks.md"), "utf-8"),
+      ]).catch((error) => {
+        throw new Error("STATE_REBASELINE_BASELINE_UNAVAILABLE", { cause: error });
+      });
+      const { profile } = await this.loadGenreProfile(book.genre);
+      const language = book.language ?? profile.language;
+      const writer = new WriterAgent(this.agentCtxFor("writer", plan.bookId));
+      const validator = new StateValidatorAgent(this.agentCtxFor("state-validator", plan.bookId));
+      const settlementIdentity = this.resolveOverride("writer");
+      const validationIdentity = this.resolveOverride("state-validator");
+      const rebaselineRoleUsage: Record<string, RoleTokenUsage> = {};
+      const rebaselineOutcomes: Array<{
+        readonly modelCallId: string;
+        readonly role: string;
+        readonly provider: string;
+        readonly model: string;
+        readonly usage: RoleTokenUsage;
+      }> = [];
+      const observeRole = <T>(role: string, task: () => Promise<T>) => runWithLLMOutcomeObserver(async (record) => {
+        rebaselineRoleUsage[role] = PipelineRunner.addUsage(
+          rebaselineRoleUsage[role] ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+          record.usage,
+        );
+        rebaselineOutcomes.push({
+          modelCallId: record.modelCallId, role, provider: record.provider, model: record.model, usage: record.usage,
+        });
+      }, task);
+      const stagedWriter = {
+        settleChapterState: async (...args: Parameters<WriterAgent["settleChapterState"]>) => {
+          await this.config.onAutonomousStage?.({
+            stage: "STATE_REBASELINE_SETTLEMENT", role: "writer",
+            provider: settlementIdentity.client.service ?? settlementIdentity.client.provider,
+            model: settlementIdentity.model,
+          });
+          return observeRole("writer", () => writer.settleChapterState(...args));
+        },
+      };
+      const stagedValidator = {
+        validate: async (...args: Parameters<StateValidatorAgent["validate"]>) => {
+          await this.config.onAutonomousStage?.({
+            stage: "STATE_REBASELINE_VALIDATION", role: "state-validator",
+            provider: validationIdentity.client.service ?? validationIdentity.client.provider,
+            model: validationIdentity.model,
+          });
+          return observeRole("state-validator", () => validator.validate(...args));
+        },
+      };
+      let output = await stagedWriter.settleChapterState({
+        book, bookDir, chapterNumber: plan.pendingChapterNumber,
+        baselineChapter: plan.baselineChapterNumber, title: target.title,
+        content: plan.rescue.candidateBody, allowReapply: true,
+      });
+      let validation = await stagedValidator.validate(
+        plan.rescue.candidateBody, plan.pendingChapterNumber,
+        oldState, output.updatedState, oldHooks, output.updatedHooks, language,
+      );
+      let providerCallCount: 3 | 6 = 3;
+      if (!validation.passed || validation.repairRequired) {
+        providerCallCount = 6;
+        const retry = await retrySettlementAfterValidationFailure({
+          writer: stagedWriter, validator: stagedValidator, book, bookDir,
+          chapterNumber: plan.pendingChapterNumber, baselineChapter: plan.baselineChapterNumber,
+          title: target.title, content: plan.rescue.candidateBody,
+          oldState, oldHooks, originalValidation: validation, language,
+          logger: this.config.logger,
+        });
+        if (retry.kind !== "recovered") throw new Error("STATE_REBASELINE_VALIDATION_FAILED");
+        output = retry.output;
+        validation = retry.validation;
+      }
+      if (!validation.passed || validation.repairRequired) throw new Error("STATE_REBASELINE_VALIDATION_FAILED");
+
+      await writer.saveChapter(bookDir, output, profile.numericalSystem, language);
+      await this.syncLegacyStructuredStateFromMarkdown(bookDir, plan.pendingChapterNumber, output);
+      await this.syncNarrativeMemoryIndex(plan.bookId);
+      await this.state.snapshotState(plan.bookId, plan.pendingChapterNumber);
+      await this.syncCurrentStateFactHistory(plan.bookId, plan.pendingChapterNumber);
+
+      const snapshotAuthority = async (chapterNumber: number) => {
+        const snapshotDir = join(bookDir, "story", "snapshots", String(chapterNumber));
+        const names = (await readdir(snapshotDir, { recursive: true })).sort();
+        const artifacts: Array<{ readonly relativePath: string; readonly sha256: string }> = [];
+        for (const relativePath of names) {
+          const bytes = await readFile(join(snapshotDir, relativePath)).catch(() => null);
+          if (bytes) artifacts.push({ relativePath: toPosixPath(relativePath), sha256: createHash("sha256").update(bytes).digest("hex") });
+        }
+        return { chapterNumber, snapshotId: `chapter-${chapterNumber}`, artifacts };
+      };
+      const [baselineSnapshot, committedSnapshot] = await Promise.all([
+        snapshotAuthority(plan.baselineChapterNumber), snapshotAuthority(plan.pendingChapterNumber),
+      ]);
+
+      const status = plan.finalReview.decision === "APPROVED" ? "approved" as const : "accepted-with-findings" as const;
+      const roleUsage: Record<string, RoleTokenUsage> = { ...plan.provenance.roleUsage };
+      for (const [role, usage] of Object.entries(rebaselineRoleUsage)) {
+        roleUsage[role] = PipelineRunner.addUsage(
+          roleUsage[role] ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 }, usage,
+        );
+      }
+      const tokenUsage = Object.values(roleUsage).reduce((sum, usage) => PipelineRunner.addUsage(sum, usage), {
+        promptTokens: 0, completionTokens: 0, totalTokens: 0,
+      });
+      const receiptDir = join(bookDir, "story", "runtime", "bounded-autonomous", `chapter-${String(plan.pendingChapterNumber).padStart(4, "0")}`);
+      const receiptPath = join(receiptDir, "bounded-state-rebaseline-settlement.json");
+      const receiptAuthority = {
+        schema_version: "1.0", evidence_type: "BOUNDED_STATE_REBASELINE_SETTLEMENT",
+        book_id: plan.bookId, job_id: plan.jobId,
+        chapter_number: plan.pendingChapterNumber, baseline_chapter_number: plan.baselineChapterNumber,
+        historical_rescue_artifact_id: plan.rescue.sourceLogicalStepId,
+        rescue_artifact_sha256: plan.rescue.sourceArtifactSha256,
+        rescue_content_sha256: plan.rescue.sourceContentSha256,
+        candidate_body_sha256: plan.rescue.candidateBodySha256,
+        historical_final_review_artifact_id: plan.finalReview.sourceLogicalStepId,
+        final_review_artifact_sha256: plan.finalReview.sourceArtifactSha256,
+        final_review_content_sha256: plan.finalReview.sourceContentSha256,
+        final_review_decision: plan.finalReview.decision,
+        baseline_snapshot: baselineSnapshot,
+        committed_snapshot: committedSnapshot,
+        state_validation: validation,
+        provider_call_count: providerCallCount,
+        provider_outcomes: rebaselineOutcomes,
+        new_role_usage: rebaselineRoleUsage,
+        failed_reentry_supersession_authority: plan.recoveryClass === "FAILED_REENTRY"
+          ? plan.failedReentryArtifacts
+          : [],
+      };
+      await mkdir(receiptDir, { recursive: true });
+      try {
+        await writeFile(receiptPath, `${JSON.stringify({ ...receiptAuthority, created_at: new Date().toISOString() }, null, 2)}\n`, { encoding: "utf-8", flag: "wx" });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        const { created_at: _createdAt, ...existing } = JSON.parse(await readFile(receiptPath, "utf-8")) as Record<string, unknown>;
+        if (JSON.stringify(existing) !== JSON.stringify(receiptAuthority)) throw new Error("STATE_REBASELINE_RECEIPT_CONFLICT");
+      }
+      index[targetIndex] = {
+        ...target, status, wordCount: countChapterLength(plan.rescue.candidateBody, resolveLengthCountingMode(language)),
+        updatedAt: new Date().toISOString(),
+        auditIssues: plan.finalReview.issues.map((issue) => `[${issue.severity}] ${issue.description}`),
+        tokenUsage, roleUsage,
+        autonomousReview: {
+          status: plan.finalReview.decision,
+          grade: plan.finalReview.overallScore >= 90 ? "A" : plan.finalReview.overallScore >= 80 ? "B" : "C",
+          revisionCount: plan.provenance.revisionCount,
+        },
+      };
+      await this.state.saveChapterIndex(plan.bookId, index);
+      return {
+        chapterNumber: plan.pendingChapterNumber, status,
+        revisionCount: plan.provenance.revisionCount,
+        logicReviewCount: plan.provenance.logicReviewCount,
+        commercialReviewCount: plan.provenance.commercialReviewCount,
+        roleUsage, recoveryMode: "FORMAL_BOUNDED_STATE_REBASELINE", providerCallCount,
       };
     } finally {
       await releaseLock();

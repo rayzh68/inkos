@@ -6,11 +6,12 @@ import {
   loadAutonomousProductionState,
   projectAutonomousEconomics,
   resolveProductionScope,
+  resolveFormalPendingChapterRecoveryPlan,
   saveAutonomousProductionState,
-  verifyFormalPendingChapterRecoveryEvidence,
   type AutonomousRunProgress,
   type AutonomousUsageRecord,
   type BookProductionMap,
+  type FormalPendingChapterRecoveryPlan,
   type ProductionMode,
 } from "@actalk/inkos-core";
 import {
@@ -21,21 +22,42 @@ import {
 
 export const AUTONOMOUS_BUDGET_NOT_CONFIGURED = { status: "BUDGET_NOT_CONFIGURED" } as const;
 
-export async function verifyOfflineFinalizationEvidence(params: {
+interface AutonomousRecoveryOwnershipProjection {
+  readonly kind: "FORMAL_OFFLINE_FINALIZATION" | "FORMAL_BOUNDED_STATE_REBASELINE";
+  readonly recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED" | "FAILED_REENTRY";
+  readonly bookId: string;
+  readonly jobId: string;
+  readonly pendingChapterNumber: number;
+}
+
+export async function resolveOfflineFinalizationPlan(params: {
   readonly projectRoot: string;
   readonly bookId: string;
   readonly pendingChapter: number;
   readonly nextChapter: number;
   readonly runtime: AutonomousRuntimeProjection | null;
-}): Promise<boolean> {
-  if (!params.runtime?.jobId || params.runtime.status !== "REVIEW_EXHAUSTED"
-    || params.nextChapter !== params.pendingChapter + 1 || params.runtime.nextChapter !== params.nextChapter) return false;
-  return verifyFormalPendingChapterRecoveryEvidence({
+}): Promise<FormalPendingChapterRecoveryPlan | null> {
+  const ownership = params.runtime?.recoveryOwnership;
+  const ownedReentry = ownership?.bookId === params.bookId
+    && ownership.jobId === params.runtime?.jobId
+    && ownership.pendingChapterNumber === params.pendingChapter
+    && ["RUNNING", "WAITING_PROVIDER_RETRY", "PAUSED_PROVIDER_UNAVAILABLE", "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", "PAUSED_DETERMINISTIC_PROVIDER_ERROR"].includes(params.runtime?.status ?? "");
+  if (!params.runtime?.jobId || (!ownedReentry && !["REVIEW_EXHAUSTED", "BLOCKED_CRITICAL_FINDINGS"].includes(params.runtime.status))
+    || params.nextChapter !== params.pendingChapter + 1 || params.runtime.nextChapter !== params.nextChapter) return null;
+  return resolveFormalPendingChapterRecoveryPlan({
     projectRoot: params.projectRoot,
     bookId: params.bookId,
     jobId: params.runtime.jobId,
     pendingChapterNumber: params.pendingChapter,
   });
+}
+
+export async function verifyOfflineFinalizationEvidence(params: Parameters<typeof resolveOfflineFinalizationPlan>[0]): Promise<boolean> {
+  try {
+    return await resolveOfflineFinalizationPlan(params) !== null;
+  } catch {
+    return false;
+  }
 }
 
 export interface AutonomousRuntimeProjection {
@@ -45,6 +67,8 @@ export interface AutonomousRuntimeProjection {
   readonly nextChapter: number;
   readonly updatedAt: string;
   readonly lastError?: string | null;
+  readonly reason?: string;
+  readonly recoveryOwnership?: AutonomousRecoveryOwnershipProjection | null;
   readonly phase?: string;
   readonly activeRole?: string;
   readonly activeProvider?: string | null;
@@ -187,7 +211,7 @@ export function projectAutonomousProductionView(params: {
   readonly config: SafeConfigProjection;
   readonly catalog?: ReadonlyArray<ProductionModelCatalogEntry>;
   readonly runtime: AutonomousRuntimeProjection | null;
-  readonly offlineFinalizationVerified?: boolean;
+  readonly offlineFinalizationPlan?: FormalPendingChapterRecoveryPlan | null;
   readonly active: boolean;
   readonly budget?: { readonly status: "BUDGET_NOT_CONFIGURED" };
 }) {
@@ -214,26 +238,37 @@ export function projectAutonomousProductionView(params: {
   const repairNeedsReconciliation = !params.active && params.runtime?.status === "REPAIRING";
   if (repairNeedsReconciliation) blockers.push("STATE_REPAIR_RECONCILIATION_REQUIRED");
   const auditFailed = params.chapters.find((chapter) => chapter.status === "audit-failed");
+  const recoveryOwnership = params.runtime?.recoveryOwnership;
+  const ownedFormalRecovery = auditFailed !== undefined
+    && recoveryOwnership?.bookId === params.map.bookId
+    && recoveryOwnership.jobId === params.runtime?.jobId
+    && recoveryOwnership.pendingChapterNumber === auditFailed.number;
   const finalReviewRecovery = auditFailed
-    && params.runtime?.status === "REVIEW_EXHAUSTED"
-    && params.runtime.responseArtifactStatus === "COMPLETE"
-    && (params.runtime.revisionRound === 2 || params.runtime.phase === "RESCUE_REVISING_2")
-    && params.offlineFinalizationVerified === true
+    && ((params.runtime?.status === "REVIEW_EXHAUSTED" || params.runtime?.status === "BLOCKED_CRITICAL_FINDINGS")
+      ? params.runtime.responseArtifactStatus === "COMPLETE" && (params.runtime.revisionRound === 2 || params.runtime.phase === "RESCUE_REVISING_2")
+      : ownedFormalRecovery)
+    && params.offlineFinalizationPlan !== undefined && params.offlineFinalizationPlan !== null
       ? {
+          recoveryMode: params.offlineFinalizationPlan.kind,
           chapter: auditFailed.number,
           rescueCandidate: "PRESERVED" as const,
           rescueGeneration: "REUSED" as const,
           rescueArtifactIdentity: `VERIFIED_CHAPTER_${String(auditFailed.number).padStart(3, "0")}` as const,
           finalReview: "PRESERVED" as const,
-          finalReviewDecision: "PASSED_WITH_NONBLOCKING_FINDINGS" as const,
+          finalReviewDecision: params.offlineFinalizationPlan.finalReview.decision,
           writerRegeneration: false as const,
           normalRevisionRegeneration: false as const,
           rescueRevisionRegeneration: false as const,
-          nextAction: `FINALIZE_CHAPTER_${String(auditFailed.number).padStart(3, "0")}_AND_CONTINUE` as const,
-          additionalWriterCalls: 0 as const,
+          nextAction: params.offlineFinalizationPlan.kind === "FORMAL_OFFLINE_FINALIZATION"
+            ? `FINALIZE_CHAPTER_${String(auditFailed.number).padStart(3, "0")}_AND_CONTINUE` as const
+            : `REBASELINE_CHAPTER_${String(auditFailed.number).padStart(3, "0")}_STATE_AND_CONTINUE` as const,
+          additionalWriterCalls: params.offlineFinalizationPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : 2 as const,
           additionalReviserCalls: 0 as const,
-          additionalReviewerCalls: 0 as const,
+          additionalReviewerCalls: params.offlineFinalizationPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : 1 as const,
+          normalProviderCalls: params.offlineFinalizationPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : 3 as const,
+          maximumProviderCalls: params.offlineFinalizationPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : 6 as const,
           additionalRevisionAllowed: false as const,
+          recoveryClass: params.offlineFinalizationPlan?.recoveryClass ?? "ORIGINAL_REVIEW_EXHAUSTED" as const,
         }
       : undefined;
   if (!roles.writer) blockers.push("WRITER_MODEL_NOT_CONFIGURED");
@@ -246,7 +281,11 @@ export function projectAutonomousProductionView(params: {
     blockers.push("REVIEW_EXHAUSTED");
   }
   if (params.runtime?.status === "REVIEW_DECISION_CONTRADICTORY") blockers.push("REVIEW_DECISION_CONTRADICTORY");
-  if (params.runtime?.status === "BLOCKED_CRITICAL_FINDINGS") blockers.push("BLOCKED_CRITICAL_FINDINGS");
+  if (params.runtime?.status === "BLOCKED_CRITICAL_FINDINGS" && !finalReviewRecovery) blockers.push("BLOCKED_CRITICAL_FINDINGS");
+  if (recoveryOwnership?.kind === "FORMAL_BOUNDED_STATE_REBASELINE"
+    && (params.runtime?.lastError === "STATE_REBASELINE_VALIDATION_FAILED" || params.runtime?.reason === "STATE_REBASELINE_VALIDATION_FAILED")) {
+    blockers.push("STATE_REBASELINE_VALIDATION_FAILED");
+  }
   const orderedChapterNumbers = params.chapters.map((chapter) => chapter.number).sort((left, right) => left - right);
   if (orderedChapterNumbers.some((number, index) => number !== index + 1) || params.nextChapter !== orderedChapterNumbers.length + 1) {
     blockers.push("CHAPTER_CURSOR_INTEGRITY_MISMATCH");
@@ -408,7 +447,11 @@ export function projectAutonomousProductionView(params: {
       chapter.number >= scope.currentVolume.startChapter && chapter.number <= scope.currentVolume.endChapter,
     ).length,
     runtimeStatus: finalReviewRecovery
-      ? "RECOVERY_READY_OFFLINE_FINALIZATION"
+      ? finalReviewRecovery.recoveryMode === "FORMAL_BOUNDED_STATE_REBASELINE"
+        ? "RECOVERY_READY_BOUNDED_STATE_REBASELINE"
+        : finalReviewRecovery.recoveryClass === "FAILED_REENTRY"
+        ? "RECOVERY_READY_OFFLINE_FINALIZATION_AFTER_FAILED_REENTRY"
+        : "RECOVERY_READY_OFFLINE_FINALIZATION"
       : params.runtime?.status === "WAITING_PROVIDER_RETRY"
       ? "WAITING_PROVIDER_RETRY"
       : params.active
