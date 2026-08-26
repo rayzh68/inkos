@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { loadStudioTaskSnapshot, saveStudioTaskSnapshot, studioTaskSnapshotPath } from "./task-store.js";
@@ -21,6 +21,7 @@ const resyncChapterArtifactsMock = vi.fn();
 const writeNextChapterMock = vi.fn();
 const resumeAuditFailedChapterBoundedMock = vi.fn();
 const finalizePendingChapterOfflineMock = vi.fn();
+const rebaselinePendingChapterStateMock = vi.fn();
 const resolveFormalPendingChapterRecoveryPlanMock = vi.fn();
 let actualResolveFormalPendingChapterRecoveryPlan: (params: unknown) => Promise<unknown>;
 const reviewExistingChapterBoundedMock = vi.fn();
@@ -300,6 +301,7 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
     writeNextChapter = writeNextChapterMock;
     resumeAuditFailedChapterBounded = resumeAuditFailedChapterBoundedMock;
     finalizePendingChapterOffline = finalizePendingChapterOfflineMock;
+    rebaselinePendingChapterState = rebaselinePendingChapterStateMock;
     reviewExistingChapterBounded = reviewExistingChapterBoundedMock;
     writeChapters = writeChaptersMock;
   }
@@ -549,6 +551,7 @@ describe("createStudioServer daemon lifecycle", () => {
     writeNextChapterMock.mockReset();
     resumeAuditFailedChapterBoundedMock.mockReset();
     finalizePendingChapterOfflineMock.mockReset();
+    rebaselinePendingChapterStateMock.mockReset();
     resolveFormalPendingChapterRecoveryPlanMock.mockReset();
     resolveFormalPendingChapterRecoveryPlanMock.mockImplementation(actualResolveFormalPendingChapterRecoveryPlan);
     reviewExistingChapterBoundedMock.mockReset();
@@ -6653,7 +6656,7 @@ describe("createStudioServer daemon lifecycle", () => {
     expect(chapters.find((chapter) => chapter.number === 4)?.status).toBe("approved");
   });
 
-  it("carries the admitted formal recovery plan into the Core offline finalizer before ordinary resume", async () => {
+  it("routes an admitted bounded state rebaseline through Core before Chapter N+1", async () => {
     const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
     raw.llm = { ...raw.llm, service: "openrouter", defaultModel: "openai/gpt", model: "openai/gpt", services: [{ service: "openrouter" }] };
     raw.modelOverrides = { auditor: "deepseek/chat", "commercial-reader": "google/gemini", reviser: "openai/gpt", "observer-reflector": "deepseek/flash" };
@@ -6686,15 +6689,16 @@ describe("createStudioServer daemon lifecycle", () => {
     const normalizedMap = await loadBookProductionMap(root, "demo-book");
     const jobId = deriveAutonomousJobIdentity({ map: normalizedMap!, mode: "current-volume", nextChapter: 5 });
     const admittedPlan = {
-      kind: "FORMAL_OFFLINE_FINALIZATION",
+      kind: "FORMAL_BOUNDED_STATE_REBASELINE",
       recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED",
       bookId: "demo-book",
       jobId,
       pendingChapterNumber: 4,
+      baselineChapterNumber: 3,
       finalReview: { decision: "ACCEPTED_WITH_FINDINGS" },
     };
     resolveFormalPendingChapterRecoveryPlanMock.mockResolvedValue(admittedPlan);
-    finalizePendingChapterOfflineMock.mockImplementationOnce(async (plan) => {
+    rebaselinePendingChapterStateMock.mockImplementationOnce(async (plan) => {
       expect(plan).toBe(admittedPlan);
       chapters = chapters.map((chapter) => chapter.number === 4 ? { ...chapter, status: "accepted-with-findings" } : chapter);
       return { chapterNumber: 4, status: "accepted-with-findings", revisionCount: 2, logicReviewCount: 2, commercialReviewCount: 0, roleUsage: {} };
@@ -6713,9 +6717,14 @@ describe("createStudioServer daemon lifecycle", () => {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "current-volume" }),
     });
     expect(response.status).toBe(202);
-    expect(finalizePendingChapterOfflineMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(rebaselinePendingChapterStateMock).toHaveBeenCalledTimes(1));
+    expect(finalizePendingChapterOfflineMock).not.toHaveBeenCalled();
     expect(resumeAuditFailedChapterBoundedMock).not.toHaveBeenCalled();
     await vi.waitFor(() => expect(writeNextChapterMock).toHaveBeenCalledTimes(1));
+    await vi.waitFor(async () => {
+      await expect(access(join(runtimeDir, "active-job.json"))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(readdir(join(runtimeDir, "active-job.json.reclaim-contenders"))).resolves.toEqual([]);
+    });
   });
 
   it("recovers the same durable Provider wait on Studio restart without a second user start", async () => {

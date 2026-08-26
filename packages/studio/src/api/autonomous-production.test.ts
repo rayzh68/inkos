@@ -126,20 +126,30 @@ describe("autonomous production Studio projection", () => {
         chapter_number: 4, status: "REVIEW_EXHAUSTED", revisionCount: 2, logicReviewCount: 2, commercialReviewCount: 0,
         baselineRoleUsage: {}, roleUsage: {}, modelOutcomes: responses.map(([modelCallId]) => ({ modelCallId })),
       }));
-      await expect(resolveOfflineFinalizationPlan({
+      const rebaselinePlan = await resolveOfflineFinalizationPlan({
         projectRoot: root, bookId: "book", pendingChapter: 4, nextChapter: 5, runtime,
-      })).rejects.toThrow("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE");
+      });
+      expect(rebaselinePlan).toMatchObject({
+        kind: "FORMAL_BOUNDED_STATE_REBASELINE",
+        pendingChapterNumber: 4,
+        baselineChapterNumber: 3,
+      });
       expect(await verifyOfflineFinalizationEvidence({
         projectRoot: root, bookId: "book", pendingChapter: 4, nextChapter: 5, runtime,
-      })).toBe(false);
-      const blocked = projectAutonomousProductionView({
+      })).toBe(true);
+      const rebaselineReady = projectAutonomousProductionView({
         map, targetChapters: 156, nextChapter: 5,
         chapters: [1, 2, 3, 4].map((number) => ({ number, status: number === 4 ? "audit-failed" as const : "approved" as const })),
         config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini", reviser: "gpt", "observer-reflector": "flash" } },
-        catalog, runtime, offlineFinalizationPlan: null, active: false, budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
+        catalog, runtime, offlineFinalizationPlan: rebaselinePlan, active: false, budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
       });
-      expect(blocked.runtimeStatus).not.toContain("RECOVERY_READY_OFFLINE_FINALIZATION");
-      expect(blocked.runtimeBlockers).toContain("REVIEW_EXHAUSTED");
+      expect(rebaselineReady.runtimeStatus).toBe("RECOVERY_READY_BOUNDED_STATE_REBASELINE");
+      expect(rebaselineReady.runtimeBlockers).not.toContain("REVIEW_EXHAUSTED");
+      expect(rebaselineReady.finalReviewRecovery).toMatchObject({
+        recoveryMode: "FORMAL_BOUNDED_STATE_REBASELINE",
+        normalProviderCalls: 3,
+        maximumProviderCalls: 6,
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -213,7 +223,7 @@ describe("autonomous production Studio projection", () => {
       map, targetChapters: 156, nextChapter: 5,
       chapters: [1, 2, 3, 4].map((number) => ({ number, status: number === 4 ? "audit-failed" as const : "approved" as const })),
       config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini", reviser: "gpt", "observer-reflector": "flash" } },
-      catalog, runtime, offlineFinalizationPlan: { recoveryClass: "FAILED_REENTRY", finalReview: { decision: "ACCEPTED_WITH_FINDINGS" } } as never,
+      catalog, runtime, offlineFinalizationPlan: { kind: "FORMAL_OFFLINE_FINALIZATION", recoveryClass: "FAILED_REENTRY", finalReview: { decision: "ACCEPTED_WITH_FINDINGS" } } as never,
       active: false, budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
     });
     expect(view.runtimeStatus).toBe("RECOVERY_READY_OFFLINE_FINALIZATION_AFTER_FAILED_REENTRY");
@@ -418,7 +428,7 @@ describe("autonomous production Studio projection", () => {
       config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini", reviser: "gpt", "observer-reflector": "flash" } },
       catalog,
       runtime: { jobId: "autonomous-deadbeef", status: "REVIEW_EXHAUSTED", mode: "current-volume", nextChapter: 5, updatedAt: "2026-08-21T00:00:00.000Z", phase: "RESCUE_REVISING_2", responseArtifactStatus: "COMPLETE" },
-      offlineFinalizationPlan: { recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED", finalReview: { decision: "APPROVED" } } as never,
+      offlineFinalizationPlan: { kind: "FORMAL_OFFLINE_FINALIZATION", recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED", finalReview: { decision: "APPROVED" } } as never,
       active: false,
       budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
     });
@@ -426,6 +436,7 @@ describe("autonomous production Studio projection", () => {
     expect(view.startEnabled).toBe(true);
     expect(view.runtimeStatus).toBe("RECOVERY_READY_OFFLINE_FINALIZATION");
     expect(view.finalReviewRecovery).toEqual({
+      recoveryMode: "FORMAL_OFFLINE_FINALIZATION",
       chapter: 4,
       rescueCandidate: "PRESERVED",
       rescueGeneration: "REUSED",
@@ -439,6 +450,8 @@ describe("autonomous production Studio projection", () => {
       additionalWriterCalls: 0,
       additionalReviserCalls: 0,
       additionalReviewerCalls: 0,
+      normalProviderCalls: 0,
+      maximumProviderCalls: 0,
       additionalRevisionAllowed: false,
       recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED",
     });

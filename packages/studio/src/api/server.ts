@@ -2954,7 +2954,9 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       stopDurableHeartbeat = startAutonomousJobHeartbeat(root, bookId, durableClaim, (error) => { durableClaimFailure = error; });
       if (admittedOfflineFinalizationPlan) {
         if (admittedOfflineFinalizationPlan.jobId !== jobId) throw new Error("OFFLINE_FINALIZATION_ADMISSION_JOB_IDENTITY_MISMATCH");
-        await pipeline.finalizePendingChapterOffline(admittedOfflineFinalizationPlan);
+        if (admittedOfflineFinalizationPlan.kind === "FORMAL_OFFLINE_FINALIZATION") {
+          await pipeline.finalizePendingChapterOffline(admittedOfflineFinalizationPlan);
+        }
       }
       actions = await createAutonomousPipelineActions({ bookId, state, pipeline });
       providerRecovery = createAutonomousProviderExecution({
@@ -2988,7 +2990,14 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       getNextChapter: () => state.getNextChapterNumber(bookId),
       ...(actions.pendingChapterNumber !== undefined ? { pendingChapterNumber: actions.pendingChapterNumber } : {}),
       shouldStop: () => autonomousJobs.shouldStop(bookId),
-      ...(actions.resumePendingChapter ? { resumePendingChapter: async (options?: { readonly safeReplayStage?: string }) => {
+      ...(admittedOfflineFinalizationPlan?.kind === "FORMAL_BOUNDED_STATE_REBASELINE"
+        ? { resumePendingChapter: async () => {
+          if (durableClaimFailure) throw durableClaimFailure;
+          const result = await pipeline.rebaselinePendingChapterState(admittedOfflineFinalizationPlan);
+          if (durableClaimFailure) throw durableClaimFailure;
+          return result;
+        } }
+        : actions.resumePendingChapter ? { resumePendingChapter: async (options?: { readonly safeReplayStage?: string }) => {
         if (durableClaimFailure) throw durableClaimFailure;
         const result = await actions.resumePendingChapter!(options);
         if (durableClaimFailure) throw durableClaimFailure;

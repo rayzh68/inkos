@@ -229,6 +229,7 @@ export function projectAutonomousProductionView(params: {
     && (params.runtime.revisionRound === 2 || params.runtime.phase === "RESCUE_REVISING_2")
     && params.offlineFinalizationPlan !== undefined && params.offlineFinalizationPlan !== null
       ? {
+          recoveryMode: params.offlineFinalizationPlan.kind,
           chapter: auditFailed.number,
           rescueCandidate: "PRESERVED" as const,
           rescueGeneration: "REUSED" as const,
@@ -238,10 +239,14 @@ export function projectAutonomousProductionView(params: {
           writerRegeneration: false as const,
           normalRevisionRegeneration: false as const,
           rescueRevisionRegeneration: false as const,
-          nextAction: `FINALIZE_CHAPTER_${String(auditFailed.number).padStart(3, "0")}_AND_CONTINUE` as const,
-          additionalWriterCalls: 0 as const,
+          nextAction: params.offlineFinalizationPlan.kind === "FORMAL_OFFLINE_FINALIZATION"
+            ? `FINALIZE_CHAPTER_${String(auditFailed.number).padStart(3, "0")}_AND_CONTINUE` as const
+            : `REBASELINE_CHAPTER_${String(auditFailed.number).padStart(3, "0")}_STATE_AND_CONTINUE` as const,
+          additionalWriterCalls: params.offlineFinalizationPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : 2 as const,
           additionalReviserCalls: 0 as const,
-          additionalReviewerCalls: 0 as const,
+          additionalReviewerCalls: params.offlineFinalizationPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : 1 as const,
+          normalProviderCalls: params.offlineFinalizationPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : 3 as const,
+          maximumProviderCalls: params.offlineFinalizationPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : 6 as const,
           additionalRevisionAllowed: false as const,
           recoveryClass: params.offlineFinalizationPlan?.recoveryClass ?? "ORIGINAL_REVIEW_EXHAUSTED" as const,
         }
@@ -418,7 +423,9 @@ export function projectAutonomousProductionView(params: {
       chapter.number >= scope.currentVolume.startChapter && chapter.number <= scope.currentVolume.endChapter,
     ).length,
     runtimeStatus: finalReviewRecovery
-      ? finalReviewRecovery.recoveryClass === "FAILED_REENTRY"
+      ? finalReviewRecovery.recoveryMode === "FORMAL_BOUNDED_STATE_REBASELINE"
+        ? "RECOVERY_READY_BOUNDED_STATE_REBASELINE"
+        : finalReviewRecovery.recoveryClass === "FAILED_REENTRY"
         ? "RECOVERY_READY_OFFLINE_FINALIZATION_AFTER_FAILED_REENTRY"
         : "RECOVERY_READY_OFFLINE_FINALIZATION"
       : params.runtime?.status === "WAITING_PROVIDER_RETRY"

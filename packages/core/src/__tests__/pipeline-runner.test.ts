@@ -5169,7 +5169,7 @@ describe("PipelineRunner", () => {
     }
   }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
 
-  it("REAL_INKOS_OFFLINE_RECOVERY_INTEGRATION_TEST settles Chapter 004 through the real PipelineRunner with zero transport", async () => {
+  it("REAL_INKOS_FORMAL_RECOVERY_INTEGRATION_TEST routes offline finalization and bounded state rebaseline", async () => {
     const originalFetch = globalThis.fetch;
     const transport = vi.fn(async () => { throw new Error("PROVIDER_TRANSPORT_MUST_NOT_RUN"); });
     globalThis.fetch = transport as typeof fetch;
@@ -5255,6 +5255,7 @@ describe("PipelineRunner", () => {
 
     let targetRoot: string | undefined;
     let invalidRoot: string | undefined;
+    let retryRoot: string | undefined;
     try {
       const target = await createFixture([]);
       targetRoot = target.root;
@@ -5510,15 +5511,92 @@ describe("PipelineRunner", () => {
       });
       const invalidResume = vi.spyOn(invalid.runner, "resumeAuditFailedChapterBounded");
 
-      await expect(resolveFormalPendingChapterRecoveryPlan({
+      const rebaselinePlan = await resolveFormalPendingChapterRecoveryPlan({
         projectRoot: invalid.root, bookId: invalid.bookId, jobId, pendingChapterNumber: 4,
-      })).rejects.toThrow("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE");
-      expect(invalidResume).not.toHaveBeenCalled();
-      expect((await invalid.state.loadChapterIndex(invalid.bookId))[3]).toMatchObject({ number: 4, status: "audit-failed" });
-      expect(await invalid.state.getNextChapterNumber(invalid.bookId)).toBe(5);
+      });
+      expect(rebaselinePlan).toMatchObject({
+        kind: "FORMAL_BOUNDED_STATE_REBASELINE",
+        pendingChapterNumber: 4,
+        sourceChapterNumber: 5,
+        rescue: { candidateBodySha256: createHash("sha256").update(candidateBody).digest("hex") },
+        finalReview: { decision: "ACCEPTED_WITH_FINDINGS", overallScore: 92 },
+        baselineChapterNumber: 3,
+      });
+      if (rebaselinePlan?.kind !== "FORMAL_BOUNDED_STATE_REBASELINE") throw new Error("EXPECTED_REBASELINE_PLAN");
+      await snapshotRevisionBaseline(invalid.state, invalid.bookId, rebaselinePlan.baselineChapterNumber);
+      vi.mocked(StateValidatorAgent.prototype.validate).mockResolvedValue({
+        passed: false,
+        repairRequired: true,
+        warnings: [{ category: "contradiction", description: "Synthetic double-failure." }],
+      });
+      await expect(invalid.runner.rebaselinePendingChapterState(rebaselinePlan))
+        .rejects.toThrow("STATE_REBASELINE_VALIDATION_FAILED");
+      expect((await invalid.state.loadChapterIndex(invalid.bookId))[3]).toMatchObject({ status: "audit-failed" });
       expect(await readFile(join(invalid.bookDir, "chapters", "0004_Pending.md"), "utf-8")).toBe(`# 第4章 Pending\n\n${oldBody}`);
       expect(await readFile(join(invalid.bookDir, "story", "current_state.md"), "utf-8")).toBe(oldState);
+      await expect(stat(join(invalid.evidenceDir, "bounded-state-rebaseline-settlement.json"))).rejects.toMatchObject({ code: "ENOENT" });
+      vi.mocked(StateValidatorAgent.prototype.validate).mockResolvedValue({ warnings: [], passed: true });
+      const normalSettlementCallsBefore = vi.mocked(WriterAgent.prototype.settleChapterState).mock.calls.length;
+      const normalValidationCallsBefore = vi.mocked(StateValidatorAgent.prototype.validate).mock.calls.length;
+      const rebaselineResult = await invalid.runner.rebaselinePendingChapterState(rebaselinePlan);
+      expect(rebaselineResult).toMatchObject({
+        chapterNumber: rebaselinePlan.pendingChapterNumber,
+        status: "accepted-with-findings",
+        recoveryMode: "FORMAL_BOUNDED_STATE_REBASELINE",
+        providerCallCount: 3,
+      });
+      expect(vi.mocked(WriterAgent.prototype.settleChapterState).mock.calls.length - normalSettlementCallsBefore).toBe(1);
+      expect(vi.mocked(StateValidatorAgent.prototype.validate).mock.calls.length - normalValidationCallsBefore).toBe(1);
+      expect(invalidResume).not.toHaveBeenCalled();
+      expect((await invalid.state.loadChapterIndex(invalid.bookId))[3]).toMatchObject({ number: 4, status: "accepted-with-findings" });
+      expect(await invalid.state.getNextChapterNumber(invalid.bookId)).toBe(5);
+      expect(await readFile(join(invalid.bookDir, "chapters", "0004_Pending.md"), "utf-8")).toBe(`# 第4章 Pending\n\n${candidateBody}`);
+      expect(await readFile(join(invalid.bookDir, "story", "current_state.md"), "utf-8")).not.toBe(oldState);
+      const rebaselineReceipt = JSON.parse(await readFile(join(invalid.evidenceDir, "bounded-state-rebaseline-settlement.json"), "utf-8"));
+      expect(rebaselineReceipt).toMatchObject({
+        evidence_type: "BOUNDED_STATE_REBASELINE_SETTLEMENT",
+        chapter_number: rebaselinePlan.pendingChapterNumber,
+        baseline_chapter_number: rebaselinePlan.baselineChapterNumber,
+        historical_rescue_artifact_id: rescueId,
+        historical_final_review_artifact_id: finalId,
+        final_review_decision: "ACCEPTED_WITH_FINDINGS",
+        state_validation: { passed: true },
+        provider_call_count: 3,
+      });
+      expect(rebaselineReceipt.baseline_snapshot.artifacts.length).toBeGreaterThan(0);
+      expect(rebaselineReceipt.committed_snapshot.artifacts.length).toBeGreaterThan(0);
       expect(await readdir(join(invalid.bookDir, "chapters"))).not.toContain(expect.stringMatching(/^0005_/u));
+
+      const retryFixture = await createFixture(outcomes);
+      retryRoot = retryFixture.root;
+      const retryResponseDir = join(retryFixture.bookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
+      await mkdir(retryResponseDir, { recursive: true });
+      await writeArtifact(retryResponseDir, rescueId, rescueFingerprint, `=== REVISED_CONTENT ===\n${candidateBody}`);
+      await writeArtifact(retryResponseDir, finalId, finalFingerprint, finalContent);
+      await writeFile(join(retryFixture.bookDir, "story", "runtime", "bounded-autonomous", "production-state.json"), JSON.stringify({
+        jobId, status: "REVIEW_EXHAUSTED", mode: "current-volume", volumeId: "volume-001",
+        startChapter: 4, targetChapter: 10, nextChapter: 5, chapterNumber: 5, completedThisRun: 0, responseArtifactStatus: "COMPLETE",
+      }));
+      await correctLegacyPendingChapterArtifactBindings({
+        projectRoot: retryFixture.root, bookId: retryFixture.bookId, jobId, pendingChapterNumber: 4,
+      });
+      const retryPlan = await resolveFormalPendingChapterRecoveryPlan({
+        projectRoot: retryFixture.root, bookId: retryFixture.bookId, jobId, pendingChapterNumber: 4,
+      });
+      if (retryPlan?.kind !== "FORMAL_BOUNDED_STATE_REBASELINE") throw new Error("EXPECTED_RETRY_REBASELINE_PLAN");
+      await snapshotRevisionBaseline(retryFixture.state, retryFixture.bookId, retryPlan.baselineChapterNumber);
+      const settlementCallsBefore = vi.mocked(WriterAgent.prototype.settleChapterState).mock.calls.length;
+      const validationCallsBefore = vi.mocked(StateValidatorAgent.prototype.validate).mock.calls.length;
+      vi.mocked(StateValidatorAgent.prototype.validate)
+        .mockResolvedValueOnce({ passed: false, repairRequired: true, warnings: [{ category: "repair", description: "Retry once." }] })
+        .mockResolvedValueOnce({ passed: true, warnings: [] });
+      await expect(retryFixture.runner.rebaselinePendingChapterState(retryPlan)).resolves.toMatchObject({
+        status: "accepted-with-findings", providerCallCount: 6,
+      });
+      expect(vi.mocked(WriterAgent.prototype.settleChapterState).mock.calls.length - settlementCallsBefore).toBe(2);
+      expect(vi.mocked(StateValidatorAgent.prototype.validate).mock.calls.length - validationCallsBefore).toBe(2);
+      expect((await retryFixture.state.loadChapterIndex(retryFixture.bookId))[3]).toMatchObject({ status: "accepted-with-findings" });
+      expect(await readdir(join(retryFixture.bookDir, "chapters"))).not.toContain(expect.stringMatching(/^0005_/u));
       expect(transport).toHaveBeenCalledTimes(0);
       expect(chapterWriter).toHaveBeenCalledTimes(0);
       expect(realFinalReview).toHaveBeenCalledTimes(0);
@@ -5526,6 +5604,7 @@ describe("PipelineRunner", () => {
       globalThis.fetch = originalFetch;
       if (targetRoot) await rm(targetRoot, { recursive: true, force: true });
       if (invalidRoot) await rm(invalidRoot, { recursive: true, force: true });
+      if (retryRoot) await rm(retryRoot, { recursive: true, force: true });
     }
   }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
 

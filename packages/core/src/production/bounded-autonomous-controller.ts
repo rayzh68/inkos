@@ -706,8 +706,7 @@ export async function correctLegacyPendingChapterArtifactBindings(params: {
   return bindings;
 }
 
-export interface FormalPendingChapterRecoveryPlan {
-  readonly kind: "FORMAL_OFFLINE_FINALIZATION";
+interface FormalPendingChapterRecoveryAuthority {
   readonly recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED" | "FAILED_REENTRY";
   readonly bookId: string;
   readonly jobId: string;
@@ -736,18 +735,6 @@ export interface FormalPendingChapterRecoveryPlan {
     readonly overallScore: number;
     readonly issues: AcceptedFinalReview["issues"];
   };
-  readonly stateSettlement: {
-    readonly proofRelativePath: "state-settlement-proof.json";
-    readonly proofSha256: string;
-    readonly snapshotId: string;
-    readonly candidateBodySha256: string;
-    readonly artifacts: ReadonlyArray<{
-      readonly sourceRelativePath: string;
-      readonly targetRelativePath: string;
-      readonly sha256: string;
-      readonly content: string;
-    }>;
-  };
   readonly provenance: {
     readonly revisionCount: number;
     readonly logicReviewCount: number;
@@ -774,6 +761,29 @@ export interface FormalPendingChapterRecoveryPlan {
     readonly contentSha256: string;
   }>;
 }
+
+export interface FormalOfflineFinalizationPlan extends FormalPendingChapterRecoveryAuthority {
+  readonly kind: "FORMAL_OFFLINE_FINALIZATION";
+  readonly stateSettlement: {
+    readonly proofRelativePath: "state-settlement-proof.json";
+    readonly proofSha256: string;
+    readonly snapshotId: string;
+    readonly candidateBodySha256: string;
+    readonly artifacts: ReadonlyArray<{
+      readonly sourceRelativePath: string;
+      readonly targetRelativePath: string;
+      readonly sha256: string;
+      readonly content: string;
+    }>;
+  };
+}
+
+export interface FormalBoundedStateRebaselinePlan extends FormalPendingChapterRecoveryAuthority {
+  readonly kind: "FORMAL_BOUNDED_STATE_REBASELINE";
+  readonly baselineChapterNumber: number;
+}
+
+export type FormalPendingChapterRecoveryPlan = FormalOfflineFinalizationPlan | FormalBoundedStateRebaselinePlan;
 
 interface RecoveryBindingAuthority {
   readonly schema_version: "1.0";
@@ -951,7 +961,7 @@ async function resolveStateSettlementProof(params: {
   readonly jobId: string;
   readonly chapterNumber: number;
   readonly candidateBodySha256: string;
-}): Promise<FormalPendingChapterRecoveryPlan["stateSettlement"]> {
+}): Promise<FormalOfflineFinalizationPlan["stateSettlement"]> {
   const reference = params.evidence.stateSettlementProof as { readonly relativePath?: unknown; readonly sha256?: unknown } | undefined;
   if (reference?.relativePath !== "state-settlement-proof.json" || !/^[a-f0-9]{64}$/u.test(String(reference.sha256 ?? ""))) {
     throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE");
@@ -1122,20 +1132,22 @@ async function resolveFormalPendingChapterRecoveryPlanUnsafe(params: {
   if (!accepted) throw new Error("OFFLINE_FINALIZATION_FINAL_REVIEW_NOT_ACCEPTED");
   const candidateBody = extractRescueCandidate(rescueSource.artifact.response.content);
   const candidateBodySha256 = sha256(candidateBody);
-  let stateSettlement: FormalPendingChapterRecoveryPlan["stateSettlement"];
-  try {
-    stateSettlement = await resolveStateSettlementProof({
-      bookDir,
-      evidenceDir,
-      evidence,
-      bookId: params.bookId,
-      jobId: params.jobId,
-      chapterNumber: params.pendingChapterNumber,
-      candidateBodySha256,
-    });
-  } catch (error) {
-    if (error instanceof Error && error.message === "OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE") throw error;
-    throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE", { cause: error });
+  let stateSettlement: FormalOfflineFinalizationPlan["stateSettlement"] | undefined;
+  if (Object.prototype.hasOwnProperty.call(evidence, "stateSettlementProof")) {
+    try {
+      stateSettlement = await resolveStateSettlementProof({
+        bookDir,
+        evidenceDir,
+        evidence,
+        bookId: params.bookId,
+        jobId: params.jobId,
+        chapterNumber: params.pendingChapterNumber,
+        candidateBodySha256,
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE") throw error;
+      throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE", { cause: error });
+    }
   }
   const provenance = resolveRecoveryProvenance(evidence);
   const expectedBindings = [
@@ -1201,8 +1213,7 @@ async function resolveFormalPendingChapterRecoveryPlanUnsafe(params: {
     }
   }
 
-  return {
-    kind: "FORMAL_OFFLINE_FINALIZATION",
+  const authority = {
     recoveryClass,
     bookId: params.bookId,
     jobId: params.jobId,
@@ -1228,11 +1239,17 @@ async function resolveFormalPendingChapterRecoveryPlanUnsafe(params: {
       overallScore: accepted.overallScore,
       issues: accepted.issues,
     },
-    stateSettlement,
     provenance,
     bindings,
     failedReentryArtifacts,
   };
+  return stateSettlement
+    ? { ...authority, kind: "FORMAL_OFFLINE_FINALIZATION", stateSettlement }
+    : {
+        ...authority,
+        kind: "FORMAL_BOUNDED_STATE_REBASELINE",
+        baselineChapterNumber: params.pendingChapterNumber - 1,
+      };
 }
 
 export async function resolveFormalPendingChapterRecoveryPlan(params: {
@@ -1263,6 +1280,7 @@ export async function finalizePendingChapterOfflinePlan(params: {
   readonly roleUsage: FormalPendingChapterRecoveryPlan["provenance"]["roleUsage"];
 }> {
   const plan = params.plan;
+  if (plan.kind !== "FORMAL_OFFLINE_FINALIZATION") throw new Error("OFFLINE_FINALIZATION_MODE_MISMATCH");
   const verified = await resolveFormalPendingChapterRecoveryPlan({
     projectRoot: params.projectRoot,
     bookId: plan.bookId,
