@@ -3,8 +3,8 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createAutonomousProviderExecution } from "@actalk/inkos-core";
-import { AUTONOMOUS_BUDGET_NOT_CONFIGURED, AutonomousJobRegistry, classifyStateRepairError, projectAutonomousProductionView, verifyOfflineFinalizationEvidence } from "./autonomous-production.js";
+import { createAutonomousProviderExecution, deriveAutonomousJobIdentity } from "@actalk/inkos-core";
+import { AUTONOMOUS_BUDGET_NOT_CONFIGURED, AutonomousJobRegistry, classifyStateRepairError, projectAutonomousProductionView, resolveOfflineFinalizationPlan, verifyOfflineFinalizationEvidence } from "./autonomous-production.js";
 
 const map = {
   schemaVersion: "1.0" as const,
@@ -35,9 +35,25 @@ describe("autonomous production Studio projection", () => {
     const evidenceDir = join(bookDir, "story", "runtime", "bounded-autonomous", "chapter-0004");
     await mkdir(responseDir, { recursive: true });
     await mkdir(evidenceDir, { recursive: true });
+    await mkdir(join(bookDir, "story", "outline"), { recursive: true });
+    await mkdir(join(bookDir, "chapters"), { recursive: true });
+    const recoveryMap = {
+      schemaVersion: "1.0" as const, bookId: "book", authorityBookId: "authority", title: "Book", totalChapters: 6,
+      volumes: [{ volumeId: "volume-001", volumeNumber: 1, title: "One", startChapter: 1, endChapter: 6, chapterCount: 6 }],
+    };
+    const jobId = deriveAutonomousJobIdentity({ map: recoveryMap, mode: "current-volume", nextChapter: 5 });
+    await writeFile(join(bookDir, "story", "outline", "book-production-map.json"), JSON.stringify({
+      schema_version: "1.0", book_id: "book", authority_book_id: "authority", title: "Book", total_chapters: 6,
+      volumes: [{ volume_id: "volume-001", volume_number: 1, title: "One", start_chapter: 1, end_chapter: 6, chapter_count: 6 }],
+    }));
+    await writeFile(join(bookDir, "chapters", "0004_Pending.md"), "# Chapter 4\n\nOLD_BODY_A");
+    await writeFile(join(bookDir, "chapters", "index.json"), JSON.stringify([{
+      number: 4, title: "Pending", status: "audit-failed", wordCount: 10,
+      createdAt: "2026-08-23T00:00:00.000Z", updatedAt: "2026-08-23T00:00:00.000Z", auditIssues: [], lengthWarnings: [],
+    }]));
     const dimensions = { blueprint_transition: 95, causal_logic: 90, canon_continuity: 92, character_motivation: 95, state_inheritance: 95, hooks_disclosure: 95, narrative_clarity: 93 };
     const sourceExecution = createAutonomousProviderExecution({
-      projectRoot: root, bookId: "book", jobId: "job",
+      projectRoot: root, bookId: "book", jobId,
       getActiveStage: () => ({ role: "reviser", stage: "RESCUE_REVISING_2", provider: "openrouter", model: "model" }),
     });
     const fingerprints = ["a".repeat(64), "b".repeat(64)] as const;
@@ -47,28 +63,31 @@ describe("autonomous production Studio projection", () => {
     ] as const;
     try {
       await writeFile(join(bookDir, "story", "runtime", "bounded-autonomous", "production-state.json"), JSON.stringify({
-        jobId: "job", status: "REVIEW_EXHAUSTED", nextChapter: 5, chapterNumber: 5, responseArtifactStatus: "COMPLETE",
+        jobId, status: "REVIEW_EXHAUSTED", mode: "current-volume", nextChapter: 5, chapterNumber: 5, responseArtifactStatus: "COMPLETE",
       }));
       await writeFile(join(evidenceDir, "resume-review.json"), JSON.stringify({ chapter_number: 4, status: "REVIEW_EXHAUSTED", modelOutcomes: responses.map(([modelCallId]) => ({ modelCallId })) }));
       for (const [id, role, stage, content, fingerprint] of responses) {
         await writeFile(join(responseDir, `${id}.json`), JSON.stringify({
-          schema_version: "1.0", job_id: "job", logical_step_id: id, usage_identity: id,
+          schema_version: "1.0", job_id: jobId, logical_step_id: id, usage_identity: id,
           chapter_number: 5, role, stage, provider: "openrouter", requested_model: "model",
           input_fingerprint: fingerprint, response_artifact_status: "COMPLETE",
           content_sha256: createHash("sha256").update(content).digest("hex"), response: { content }, completed_at: "now",
         }));
       }
-      const runtime = { jobId: "job", status: "REVIEW_EXHAUSTED", mode: "current-volume", nextChapter: 5, updatedAt: "now", phase: "RESCUE_REVISING_2", responseArtifactStatus: "COMPLETE" } as const;
+      const runtime = { jobId, status: "REVIEW_EXHAUSTED", mode: "current-volume", nextChapter: 5, updatedAt: "now", phase: "RESCUE_REVISING_2", responseArtifactStatus: "COMPLETE" } as const;
       const verified = await verifyOfflineFinalizationEvidence({
         projectRoot: root, bookId: "book", pendingChapter: 4, nextChapter: 5,
         runtime,
       });
       expect(verified).toBe(true);
+      const offlineFinalizationPlan = await resolveOfflineFinalizationPlan({
+        projectRoot: root, bookId: "book", pendingChapter: 4, nextChapter: 5, runtime,
+      });
       const view = projectAutonomousProductionView({
         map, targetChapters: 156, nextChapter: 5,
         chapters: [1, 2, 3, 4].map((number) => ({ number, status: number === 4 ? "audit-failed" as const : "approved" as const })),
         config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini", reviser: "gpt", "observer-reflector": "flash" } },
-        catalog, runtime, offlineFinalizationVerified: verified, active: false, budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
+        catalog, runtime, offlineFinalizationPlan, active: false, budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
       });
       expect(view.runtimeBlockers).not.toContain("REVIEW_EXHAUSTED");
       expect(view.runtimeStatus).toBe("RECOVERY_READY_OFFLINE_FINALIZATION");
@@ -127,7 +146,7 @@ describe("autonomous production Studio projection", () => {
           map, targetChapters: 156, nextChapter: 5,
           chapters: [1, 2, 3, 4].map((number) => ({ number, status: number === 4 ? "audit-failed" as const : "approved" as const })),
           config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini", reviser: "gpt", "observer-reflector": "flash" } },
-          catalog, runtime, offlineFinalizationVerified: verified, active: false, budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
+          catalog, runtime, offlineFinalizationPlan: null, active: false, budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
         });
         expect(view.runtimeBlockers).toContain("REVIEW_EXHAUSTED");
       } finally {
@@ -135,6 +154,24 @@ describe("autonomous production Studio projection", () => {
       }
     }
   });
+
+  it("projects a provable failed re-entry as offline finalization instead of a critical-findings dead end", () => {
+    const runtime = {
+      jobId: "job", status: "BLOCKED_CRITICAL_FINDINGS", mode: "current-volume", nextChapter: 5,
+      updatedAt: "now", phase: "RESCUE_REVISING_2", responseArtifactStatus: "COMPLETE",
+    } as const;
+    const view = projectAutonomousProductionView({
+      map, targetChapters: 156, nextChapter: 5,
+      chapters: [1, 2, 3, 4].map((number) => ({ number, status: number === 4 ? "audit-failed" as const : "approved" as const })),
+      config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini", reviser: "gpt", "observer-reflector": "flash" } },
+      catalog, runtime, offlineFinalizationPlan: { recoveryClass: "FAILED_REENTRY" } as never,
+      active: false, budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
+    });
+    expect(view.runtimeStatus).toBe("RECOVERY_READY_OFFLINE_FINALIZATION_AFTER_FAILED_REENTRY");
+    expect(view.runtimeBlockers).not.toContain("BLOCKED_CRITICAL_FINDINGS");
+    expect(view.finalReviewRecovery).toMatchObject({ recoveryClass: "FAILED_REENTRY", additionalWriterCalls: 0, additionalReviserCalls: 0, additionalReviewerCalls: 0 });
+  });
+
   it("derives current volume and budget without hard-coded chapter boundaries", () => {
     const view = projectAutonomousProductionView({
       map,
@@ -332,7 +369,7 @@ describe("autonomous production Studio projection", () => {
       config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini", reviser: "gpt", "observer-reflector": "flash" } },
       catalog,
       runtime: { jobId: "autonomous-deadbeef", status: "REVIEW_EXHAUSTED", mode: "current-volume", nextChapter: 5, updatedAt: "2026-08-21T00:00:00.000Z", phase: "RESCUE_REVISING_2", responseArtifactStatus: "COMPLETE" },
-      offlineFinalizationVerified: true,
+      offlineFinalizationPlan: { recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED" } as never,
       active: false,
       budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
     });
@@ -354,6 +391,7 @@ describe("autonomous production Studio projection", () => {
       additionalReviserCalls: 0,
       additionalReviewerCalls: 0,
       additionalRevisionAllowed: false,
+      recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED",
     });
   });
 

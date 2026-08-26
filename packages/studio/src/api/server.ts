@@ -133,7 +133,6 @@ import {
   type SessionKind,
   type AgentSessionAttachment,
   createAutonomousPipelineActions,
-  correctLegacyPendingChapterArtifactBindings,
   createAutonomousProviderExecution,
   claimAutonomousJob,
   deriveAutonomousJobIdentity,
@@ -164,8 +163,8 @@ import {
   loadSafeAutonomousConfig,
   projectAutonomousProductionView,
   requireBookProductionMap,
+  resolveOfflineFinalizationPlan,
   saveAutonomousRuntime,
-  verifyOfflineFinalizationEvidence,
 } from "./autonomous-production.js";
 
 // -- Studio server language (read per request from the project config's `language`) --
@@ -2747,7 +2746,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     return normalizeStudioLanguage(raw.language);
   }
 
-  async function loadAutonomousView(
+  async function loadAutonomousProjection(
     bookId: string,
     nextChapterOverride?: number,
   ) {
@@ -2761,10 +2760,10 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       loadProductionRoleModels(),
     ]);
     const pending = chapters.find((chapter) => chapter.status === "audit-failed");
-    const offlineFinalizationVerified = pending
-      ? await verifyOfflineFinalizationEvidence({ projectRoot: root, bookId, pendingChapter: pending.number, nextChapter, runtime })
-      : false;
-    return projectAutonomousProductionView({
+    const offlineFinalizationPlan = pending
+      ? await resolveOfflineFinalizationPlan({ projectRoot: root, bookId, pendingChapter: pending.number, nextChapter, runtime }).catch(() => null)
+      : null;
+    const view = projectAutonomousProductionView({
       map,
       targetChapters: book.targetChapters,
       nextChapter: nextChapterOverride ?? nextChapter,
@@ -2772,10 +2771,15 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       config: safeConfig,
       catalog: productionModels.catalog,
       runtime,
-      offlineFinalizationVerified,
+      offlineFinalizationPlan,
       active: autonomousJobs.isActive(bookId),
       budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
     });
+    return { view, offlineFinalizationPlan };
+  }
+
+  async function loadAutonomousView(bookId: string, nextChapterOverride?: number) {
+    return (await loadAutonomousProjection(bookId, nextChapterOverride)).view;
   }
 
   async function buildPipelineConfig(
@@ -2892,7 +2896,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const persistedRuntime = await loadAutonomousRuntime(root, bookId);
     const recoveringProviderWait = persistedRuntime?.status === "WAITING_PROVIDER_RETRY"
       && persistedRuntime.mode === mode;
-    const admission = await loadAutonomousView(bookId);
+    const { view: admission, offlineFinalizationPlan: admittedOfflineFinalizationPlan } = await loadAutonomousProjection(bookId);
     if (!admission.startEnabled && !recoveringProviderWait) {
       throw new ApiError(409, "AUTONOMOUS_ADMISSION_BLOCKED", admission.runtimeBlockers.join(", "));
     }
@@ -2946,23 +2950,19 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       if (recoveringProviderWait && persistedRuntime?.jobId !== jobId) {
         throw new Error("AUTONOMOUS_WAITING_JOB_IDENTITY_MISMATCH");
       }
-      actions = await createAutonomousPipelineActions({ bookId, state, pipeline });
-      if (actions.pendingChapterNumber !== undefined) {
-        await correctLegacyPendingChapterArtifactBindings({
-          projectRoot: root,
-          bookId,
-          jobId,
-          pendingChapterNumber: actions.pendingChapterNumber,
-        });
+      durableClaim = await claimAutonomousJob({ projectRoot: root, bookId, jobId });
+      stopDurableHeartbeat = startAutonomousJobHeartbeat(root, bookId, durableClaim, (error) => { durableClaimFailure = error; });
+      if (admittedOfflineFinalizationPlan) {
+        if (admittedOfflineFinalizationPlan.jobId !== jobId) throw new Error("OFFLINE_FINALIZATION_ADMISSION_JOB_IDENTITY_MISMATCH");
+        await pipeline.finalizePendingChapterOffline(admittedOfflineFinalizationPlan);
       }
+      actions = await createAutonomousPipelineActions({ bookId, state, pipeline });
       providerRecovery = createAutonomousProviderExecution({
         projectRoot: root,
         bookId,
         jobId,
         getActiveStage: () => activeStage,
       });
-      durableClaim = await claimAutonomousJob({ projectRoot: root, bookId, jobId });
-      stopDurableHeartbeat = startAutonomousJobHeartbeat(root, bookId, durableClaim, (error) => { durableClaimFailure = error; });
       if (!recoveringProviderWait) {
         await saveAutonomousRuntime(root, bookId, {
           jobId,

@@ -77,9 +77,11 @@ import {
   writeProductionRunSnapshot,
 } from "../production/harness.js";
 import {
+  finalizePendingChapterOfflinePlan,
   loadAutonomousProductionState,
   verifyFormalPendingChapterRecoveryEvidence,
   type AutonomousRunProgress,
+  type FormalPendingChapterRecoveryPlan,
 } from "../production/bounded-autonomous-controller.js";
 
 const SEQUENCE_LEVEL_CATEGORIES = new Set([
@@ -1998,6 +2000,16 @@ export class PipelineRunner {
           "logic-canon-auditor": effectivePostRevision.auditResult.tokenUsage ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
         },
       };
+    } finally {
+      await releaseLock();
+    }
+  }
+
+  /** Atomically consumes a pre-resolved formal recovery plan without entering any model-backed path. */
+  async finalizePendingChapterOffline(plan: FormalPendingChapterRecoveryPlan) {
+    const releaseLock = await this.state.acquireBookLock(plan.bookId);
+    try {
+      return await finalizePendingChapterOfflinePlan({ projectRoot: this.config.projectRoot, plan });
     } finally {
       await releaseLock();
     }

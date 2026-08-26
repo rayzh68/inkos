@@ -6,11 +6,12 @@ import {
   loadAutonomousProductionState,
   projectAutonomousEconomics,
   resolveProductionScope,
+  resolveFormalPendingChapterRecoveryPlan,
   saveAutonomousProductionState,
-  verifyFormalPendingChapterRecoveryEvidence,
   type AutonomousRunProgress,
   type AutonomousUsageRecord,
   type BookProductionMap,
+  type FormalPendingChapterRecoveryPlan,
   type ProductionMode,
 } from "@actalk/inkos-core";
 import {
@@ -21,21 +22,29 @@ import {
 
 export const AUTONOMOUS_BUDGET_NOT_CONFIGURED = { status: "BUDGET_NOT_CONFIGURED" } as const;
 
-export async function verifyOfflineFinalizationEvidence(params: {
+export async function resolveOfflineFinalizationPlan(params: {
   readonly projectRoot: string;
   readonly bookId: string;
   readonly pendingChapter: number;
   readonly nextChapter: number;
   readonly runtime: AutonomousRuntimeProjection | null;
-}): Promise<boolean> {
-  if (!params.runtime?.jobId || params.runtime.status !== "REVIEW_EXHAUSTED"
-    || params.nextChapter !== params.pendingChapter + 1 || params.runtime.nextChapter !== params.nextChapter) return false;
-  return verifyFormalPendingChapterRecoveryEvidence({
+}): Promise<FormalPendingChapterRecoveryPlan | null> {
+  if (!params.runtime?.jobId || !["REVIEW_EXHAUSTED", "BLOCKED_CRITICAL_FINDINGS"].includes(params.runtime.status)
+    || params.nextChapter !== params.pendingChapter + 1 || params.runtime.nextChapter !== params.nextChapter) return null;
+  return resolveFormalPendingChapterRecoveryPlan({
     projectRoot: params.projectRoot,
     bookId: params.bookId,
     jobId: params.runtime.jobId,
     pendingChapterNumber: params.pendingChapter,
   });
+}
+
+export async function verifyOfflineFinalizationEvidence(params: Parameters<typeof resolveOfflineFinalizationPlan>[0]): Promise<boolean> {
+  try {
+    return await resolveOfflineFinalizationPlan(params) !== null;
+  } catch {
+    return false;
+  }
 }
 
 export interface AutonomousRuntimeProjection {
@@ -187,7 +196,7 @@ export function projectAutonomousProductionView(params: {
   readonly config: SafeConfigProjection;
   readonly catalog?: ReadonlyArray<ProductionModelCatalogEntry>;
   readonly runtime: AutonomousRuntimeProjection | null;
-  readonly offlineFinalizationVerified?: boolean;
+  readonly offlineFinalizationPlan?: FormalPendingChapterRecoveryPlan | null;
   readonly active: boolean;
   readonly budget?: { readonly status: "BUDGET_NOT_CONFIGURED" };
 }) {
@@ -215,10 +224,10 @@ export function projectAutonomousProductionView(params: {
   if (repairNeedsReconciliation) blockers.push("STATE_REPAIR_RECONCILIATION_REQUIRED");
   const auditFailed = params.chapters.find((chapter) => chapter.status === "audit-failed");
   const finalReviewRecovery = auditFailed
-    && params.runtime?.status === "REVIEW_EXHAUSTED"
+    && (params.runtime?.status === "REVIEW_EXHAUSTED" || params.runtime?.status === "BLOCKED_CRITICAL_FINDINGS")
     && params.runtime.responseArtifactStatus === "COMPLETE"
     && (params.runtime.revisionRound === 2 || params.runtime.phase === "RESCUE_REVISING_2")
-    && params.offlineFinalizationVerified === true
+    && params.offlineFinalizationPlan !== undefined && params.offlineFinalizationPlan !== null
       ? {
           chapter: auditFailed.number,
           rescueCandidate: "PRESERVED" as const,
@@ -234,6 +243,7 @@ export function projectAutonomousProductionView(params: {
           additionalReviserCalls: 0 as const,
           additionalReviewerCalls: 0 as const,
           additionalRevisionAllowed: false as const,
+          recoveryClass: params.offlineFinalizationPlan?.recoveryClass ?? "ORIGINAL_REVIEW_EXHAUSTED" as const,
         }
       : undefined;
   if (!roles.writer) blockers.push("WRITER_MODEL_NOT_CONFIGURED");
@@ -246,7 +256,7 @@ export function projectAutonomousProductionView(params: {
     blockers.push("REVIEW_EXHAUSTED");
   }
   if (params.runtime?.status === "REVIEW_DECISION_CONTRADICTORY") blockers.push("REVIEW_DECISION_CONTRADICTORY");
-  if (params.runtime?.status === "BLOCKED_CRITICAL_FINDINGS") blockers.push("BLOCKED_CRITICAL_FINDINGS");
+  if (params.runtime?.status === "BLOCKED_CRITICAL_FINDINGS" && !finalReviewRecovery) blockers.push("BLOCKED_CRITICAL_FINDINGS");
   const orderedChapterNumbers = params.chapters.map((chapter) => chapter.number).sort((left, right) => left - right);
   if (orderedChapterNumbers.some((number, index) => number !== index + 1) || params.nextChapter !== orderedChapterNumbers.length + 1) {
     blockers.push("CHAPTER_CURSOR_INTEGRITY_MISMATCH");
@@ -408,7 +418,9 @@ export function projectAutonomousProductionView(params: {
       chapter.number >= scope.currentVolume.startChapter && chapter.number <= scope.currentVolume.endChapter,
     ).length,
     runtimeStatus: finalReviewRecovery
-      ? "RECOVERY_READY_OFFLINE_FINALIZATION"
+      ? finalReviewRecovery.recoveryClass === "FAILED_REENTRY"
+        ? "RECOVERY_READY_OFFLINE_FINALIZATION_AFTER_FAILED_REENTRY"
+        : "RECOVERY_READY_OFFLINE_FINALIZATION"
       : params.runtime?.status === "WAITING_PROVIDER_RETRY"
       ? "WAITING_PROVIDER_RETRY"
       : params.active

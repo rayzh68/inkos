@@ -31,7 +31,7 @@ import {
   readChapterVersion,
   saveChapterUserBrief,
 } from "../state/chapter-workspace.js";
-import { correctLegacyPendingChapterArtifactBindings, createAutonomousProviderExecution } from "../production/bounded-autonomous-controller.js";
+import { correctLegacyPendingChapterArtifactBindings, createAutonomousProviderExecution, deriveAutonomousJobIdentity, resolveFormalPendingChapterRecoveryPlan } from "../production/bounded-autonomous-controller.js";
 
 const require = createRequire(import.meta.url);
 const hasNodeSqlite = (() => {
@@ -5180,7 +5180,9 @@ describe("PipelineRunner", () => {
       _apiKey: "test-only", _piModel: { id: "test-model", name: "test-model", api: "openai-completions", provider: "custom", baseUrl: "http://127.0.0.1:9/v1" },
       defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
     } as ConstructorParameters<typeof PipelineRunner>[0]["client"];
-    const candidateBody = "门被风顶开，林越停在门槛前，听见柜台后的灯轻轻晃动。";
+    const oldBody = "OLD_BODY_A：林越仍站在旧门外，尚未进入正式救援版本。";
+    const candidateBody = "RESCUE_BODY_B：门被风顶开，林越停在门槛前，听见柜台后的灯轻轻晃动。";
+    expect(oldBody).not.toBe(candidateBody);
     const finding = {
       severity: "warning" as const, category: "causal_logic", description: "Synthetic structural warning.",
       suggestion: "Track this in the rolling review.", repair_scope: "structural" as const,
@@ -5202,9 +5204,14 @@ describe("PipelineRunner", () => {
       const storyDir = join(bookDir, "story");
       const evidenceDir = join(storyDir, "runtime", "bounded-autonomous", "chapter-0004");
       await mkdir(evidenceDir, { recursive: true });
+      await mkdir(join(storyDir, "outline"), { recursive: true });
       await Promise.all([
         ...[1, 2, 3].map((number) => writeFile(join(bookDir, "chapters", `${String(number).padStart(4, "0")}_Approved.md`), `# 第${number}章 Approved\n\nSettled chapter ${number}.`, "utf-8")),
-        writeFile(join(bookDir, "chapters", "0004_Pending.md"), `# 第4章 Pending\n\n${candidateBody}`, "utf-8"),
+        writeFile(join(bookDir, "chapters", "0004_Pending.md"), `# 第4章 Pending\n\n${oldBody}`, "utf-8"),
+        writeFile(join(storyDir, "outline", "book-production-map.json"), JSON.stringify({
+          schema_version: "1.0", book_id: fixture.bookId, authority_book_id: "authority", title: "Test Book", total_chapters: 10,
+          volumes: [{ volume_id: "volume-001", volume_number: 1, title: "One", start_chapter: 1, end_chapter: 10, chapter_count: 10 }],
+        }), "utf-8"),
         writeFile(join(storyDir, "current_state.md"), createStateCard({
           chapter: 4, location: "Ashen ferry crossing", protagonistState: "Lin Yue holds the oath token.",
           goal: "Find the vanished mentor.", conflict: "The mentor debt remains unresolved.",
@@ -5225,7 +5232,7 @@ describe("PipelineRunner", () => {
           auditIssues: [], lengthWarnings: [],
         })),
         {
-          number: 4, title: "Pending", status: "audit-failed" as const, wordCount: candidateBody.length,
+          number: 4, title: "Pending", status: "audit-failed" as const, wordCount: oldBody.length,
           createdAt: "2026-03-19T00:00:00.000Z", updatedAt: "2026-03-19T00:00:00.000Z",
           auditIssues: ["[warning] Synthetic structural warning."], lengthWarnings: [],
         },
@@ -5241,35 +5248,34 @@ describe("PipelineRunner", () => {
       };
     };
 
-    let discoveryRoot: string | undefined;
     let targetRoot: string | undefined;
     let invalidRoot: string | undefined;
     try {
-      const discovery = await createFixture([]);
-      discoveryRoot = discovery.root;
-      let finalFingerprint: string | undefined;
-      const capture = new Error("CAPTURE_FINAL_REVIEW_FINGERPRINT");
-      await expect(llmProvider.runWithLLMCallExecutionPolicy({
-        prepare: async (request) => { finalFingerprint = request.inputFingerprint; throw capture; },
-        persistSuccess: async () => undefined,
-      }, () => discovery.runner.resumeAuditFailedChapterBounded(discovery.bookId, 4))).rejects.toBe(capture);
-      expect(finalFingerprint).toMatch(/^[a-f0-9]{64}$/u);
-      expect(transport).toHaveBeenCalledTimes(0);
-
-      const jobId = "autonomous-test-book-recovery";
+      const target = await createFixture([]);
+      targetRoot = target.root;
+      const jobId = deriveAutonomousJobIdentity({
+        map: {
+          schemaVersion: "1.0", bookId: target.bookId, authorityBookId: "authority", title: "Test Book", totalChapters: 10,
+          volumes: [{ volumeId: "volume-001", volumeNumber: 1, title: "One", startChapter: 1, endChapter: 10, chapterCount: 10 }],
+        },
+        mode: "current-volume",
+        nextChapter: 5,
+      });
       const rescueFingerprint = "a".repeat(64);
+      const finalFingerprint = "b".repeat(64);
       const sourceExecution = createAutonomousProviderExecution({
-        projectRoot: discovery.root, bookId: discovery.bookId, jobId,
+        projectRoot: target.root, bookId: target.bookId, jobId,
         getActiveStage: () => ({ stage: "RESCUE_REVISING_2", role: "reviser", provider: "custom", model: "test-model" }),
       });
       const rescueId = sourceExecution.responseArtifactPath(rescueFingerprint, "custom", "test-model", 5).split(/[\\/]/).at(-1)!.replace(/\.json$/u, "");
-      const finalId = sourceExecution.responseArtifactPath(finalFingerprint!, "custom", "test-model", 5).split(/[\\/]/).at(-1)!.replace(/\.json$/u, "");
+      const finalId = sourceExecution.responseArtifactPath(finalFingerprint, "custom", "test-model", 5).split(/[\\/]/).at(-1)!.replace(/\.json$/u, "");
       const outcomes = [rescueId, finalId].map((modelCallId) => ({
         modelCallId, provider: "custom", model: "test-model", usage: ZERO_USAGE,
         returnedAt: "2026-08-23T00:00:00.000Z", stage: "REVISION_AND_LOGIC",
       }));
-      const target = await createFixture(outcomes);
-      targetRoot = target.root;
+      const targetEvidence = JSON.parse(await readFile(join(target.evidenceDir, "resume-review.json"), "utf-8"));
+      targetEvidence.modelOutcomes = outcomes;
+      await writeFile(join(target.evidenceDir, "resume-review.json"), `${JSON.stringify(targetEvidence, null, 2)}\n`, "utf-8");
       const responseDir = join(target.bookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
       await mkdir(responseDir, { recursive: true });
       const writeArtifact = async (dir: string, id: string, fingerprint: string, content: string) => {
@@ -5284,7 +5290,7 @@ describe("PipelineRunner", () => {
         return bytes;
       };
       const rescueBytes = await writeArtifact(responseDir, rescueId, rescueFingerprint, `=== REVISED_CONTENT ===\n${candidateBody}`);
-      const finalBytes = await writeArtifact(responseDir, finalId, finalFingerprint!, finalContent);
+      const finalBytes = await writeArtifact(responseDir, finalId, finalFingerprint, finalContent);
       await writeFile(join(target.bookDir, "story", "runtime", "bounded-autonomous", "production-state.json"), JSON.stringify({
         jobId, status: "REVIEW_EXHAUSTED", mode: "current-volume", volumeId: "volume-001",
         startChapter: 4, targetChapter: 10, nextChapter: 5, chapterNumber: 5, completedThisRun: 0, responseArtifactStatus: "COMPLETE",
@@ -5292,14 +5298,92 @@ describe("PipelineRunner", () => {
       await expect(correctLegacyPendingChapterArtifactBindings({
         projectRoot: target.root, bookId: target.bookId, jobId, pendingChapterNumber: 4,
       })).resolves.toHaveLength(2);
-      const execution = createAutonomousProviderExecution({
-        projectRoot: target.root, bookId: target.bookId, jobId, getActiveStage: target.getActiveStage,
-      });
       const resume = vi.spyOn(target.runner, "resumeAuditFailedChapterBounded");
+      const plan = await resolveFormalPendingChapterRecoveryPlan({
+        projectRoot: target.root, bookId: target.bookId, jobId, pendingChapterNumber: 4,
+      });
+      expect(plan).toMatchObject({
+        kind: "FORMAL_OFFLINE_FINALIZATION",
+        bookId: target.bookId,
+        jobId,
+        pendingChapterNumber: 4,
+        rescue: { sourceLogicalStepId: rescueId },
+        finalReview: { sourceLogicalStepId: finalId, decision: "ACCEPTED_WITH_FINDINGS" },
+      });
+      expect(plan?.rescue.candidateBodySha256).toBe(createHash("sha256").update(candidateBody).digest("hex"));
+      const runtimePath = join(target.bookDir, "story", "runtime", "bounded-autonomous", "production-state.json");
+      const mapPath = join(target.bookDir, "story", "outline", "book-production-map.json");
+      const indexPath = join(target.bookDir, "chapters", "index.json");
+      const evidencePath = join(target.evidenceDir, "resume-review.json");
+      const bindingPath = join(responseDir, `${plan!.bindings[0]!.logicalStepId}.binding.json`);
+      const finalBindingPath = join(responseDir, `${plan!.bindings[1]!.logicalStepId}.binding.json`);
+      const [runtimeBytes, mapBytes, indexBytes, evidenceBytes, bindingBytes, finalBindingBytes] = await Promise.all([
+        readFile(runtimePath), readFile(mapPath), readFile(indexPath), readFile(evidencePath), readFile(bindingPath), readFile(finalBindingPath),
+      ]);
+      const expectEvidenceRejected = async (mutate: () => Promise<void>, restore: () => Promise<void>) => {
+        await mutate();
+        await expect(resolveFormalPendingChapterRecoveryPlan({
+          projectRoot: target.root, bookId: target.bookId, jobId, pendingChapterNumber: 4,
+        })).rejects.toThrow("OFFLINE_FINALIZATION_EVIDENCE_NOT_PROVABLE");
+        await restore();
+        expect(transport).toHaveBeenCalledTimes(0);
+      };
+      await expectEvidenceRejected(
+        () => writeFile(join(responseDir, `${rescueId}.json`), Buffer.concat([rescueBytes, Buffer.from("tampered")])),
+        () => writeFile(join(responseDir, `${rescueId}.json`), rescueBytes),
+      );
+      await expectEvidenceRejected(
+        () => writeFile(join(responseDir, `${finalId}.json`), Buffer.concat([finalBytes, Buffer.from("tampered")])),
+        () => writeFile(join(responseDir, `${finalId}.json`), finalBytes),
+      );
+      await expectEvidenceRejected(async () => {
+        const artifact = JSON.parse(finalBytes.toString("utf-8"));
+        const rejectedContent = JSON.stringify({ ...JSON.parse(artifact.response.content), passed: false, overall_score: 40 });
+        const rejectedBytes = Buffer.from(`${JSON.stringify({
+          ...artifact, content_sha256: createHash("sha256").update(rejectedContent).digest("hex"),
+          response: { ...artifact.response, content: rejectedContent },
+        }, null, 2)}\n`);
+        const binding = JSON.parse(finalBindingBytes.toString("utf-8"));
+        await writeFile(join(responseDir, `${finalId}.json`), rejectedBytes);
+        await writeFile(finalBindingPath, JSON.stringify({
+          ...binding,
+          source_artifact_sha256: createHash("sha256").update(rejectedBytes).digest("hex"),
+          source_content_sha256: createHash("sha256").update(rejectedContent).digest("hex"),
+        }));
+      }, async () => {
+        await writeFile(join(responseDir, `${finalId}.json`), finalBytes);
+        await writeFile(finalBindingPath, finalBindingBytes);
+      });
+      await expectEvidenceRejected(async () => {
+        const binding = JSON.parse(bindingBytes.toString("utf-8"));
+        await writeFile(bindingPath, JSON.stringify({ ...binding, source_artifact_sha256: "0".repeat(64) }));
+      }, () => writeFile(bindingPath, bindingBytes));
+      await expectEvidenceRejected(async () => {
+        const runtime = JSON.parse(runtimeBytes.toString("utf-8"));
+        await writeFile(runtimePath, JSON.stringify({ ...runtime, jobId: "wrong-job" }));
+      }, () => writeFile(runtimePath, runtimeBytes));
+      await expectEvidenceRejected(async () => {
+        const evidence = JSON.parse(evidenceBytes.toString("utf-8"));
+        await writeFile(evidencePath, JSON.stringify({ ...evidence, chapter_number: 3 }));
+      }, () => writeFile(evidencePath, evidenceBytes));
+      await expectEvidenceRejected(async () => {
+        const productionMap = JSON.parse(mapBytes.toString("utf-8"));
+        await writeFile(mapPath, JSON.stringify({ ...productionMap, book_id: "wrong-book" }));
+      }, () => writeFile(mapPath, mapBytes));
+      await expectEvidenceRejected(async () => {
+        const chapters = JSON.parse(indexBytes.toString("utf-8"));
+        chapters[3].status = "approved";
+        await writeFile(indexPath, JSON.stringify(chapters));
+      }, () => writeFile(indexPath, indexBytes));
+      await expectEvidenceRejected(async () => {
+        const evidence = JSON.parse(evidenceBytes.toString("utf-8"));
+        evidence.modelOutcomes.reverse();
+        await writeFile(evidencePath, JSON.stringify(evidence));
+      }, () => writeFile(evidencePath, evidenceBytes));
 
-      const result = await execution.execute(4, () => target.runner.resumeAuditFailedChapterBounded(target.bookId, 4));
+      const result = await target.runner.finalizePendingChapterOffline(plan!);
 
-      expect(resume).toHaveBeenCalledTimes(1);
+      expect(resume).not.toHaveBeenCalled();
       expect(result).toMatchObject({ chapterNumber: 4, status: "accepted-with-findings", revisionCount: 2 });
       expect((await target.state.loadChapterIndex(target.bookId))[3]).toMatchObject({ number: 4, status: "accepted-with-findings" });
       expect(await target.state.getNextChapterNumber(target.bookId)).toBe(5);
@@ -5316,7 +5400,7 @@ describe("PipelineRunner", () => {
       const invalidResponseDir = join(invalid.bookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
       await mkdir(invalidResponseDir, { recursive: true });
       await writeArtifact(invalidResponseDir, rescueId, rescueFingerprint, `=== REVISED_CONTENT ===\n${candidateBody}`);
-      await writeArtifact(invalidResponseDir, finalId, finalFingerprint!, finalContent);
+      await writeArtifact(invalidResponseDir, finalId, finalFingerprint, finalContent);
       await writeFile(join(invalid.bookDir, "story", "runtime", "bounded-autonomous", "production-state.json"), JSON.stringify({
         jobId, status: "REVIEW_EXHAUSTED", mode: "current-volume", volumeId: "volume-001",
         startChapter: 4, targetChapter: 10, nextChapter: 5, chapterNumber: 5, completedThisRun: 0, responseArtifactStatus: "COMPLETE",
@@ -5327,23 +5411,20 @@ describe("PipelineRunner", () => {
       const invalidEvidence = JSON.parse(await readFile(join(invalid.evidenceDir, "resume-review.json"), "utf-8"));
       invalidEvidence.modelOutcomes = invalidEvidence.modelOutcomes.filter((outcome: { modelCallId: string }) => outcome.modelCallId !== finalId);
       await writeFile(join(invalid.evidenceDir, "resume-review.json"), `${JSON.stringify(invalidEvidence, null, 2)}\n`, "utf-8");
-      const invalidExecution = createAutonomousProviderExecution({
-        projectRoot: invalid.root, bookId: invalid.bookId, jobId, getActiveStage: invalid.getActiveStage,
-      });
       const invalidResume = vi.spyOn(invalid.runner, "resumeAuditFailedChapterBounded");
 
-      await expect(invalidExecution.execute(4, () => invalid.runner.resumeAuditFailedChapterBounded(invalid.bookId, 4)))
-        .rejects.toThrow("AUTONOMOUS_PROVIDER_RESPONSE_BINDING_AUTHORITY_MISMATCH");
-      expect(invalidResume).toHaveBeenCalledTimes(1);
+      await expect(resolveFormalPendingChapterRecoveryPlan({
+        projectRoot: invalid.root, bookId: invalid.bookId, jobId, pendingChapterNumber: 4,
+      })).rejects.toThrow("OFFLINE_FINALIZATION_EVIDENCE_NOT_PROVABLE");
+      expect(invalidResume).not.toHaveBeenCalled();
       expect((await invalid.state.loadChapterIndex(invalid.bookId))[3]).toMatchObject({ number: 4, status: "audit-failed" });
       expect(await invalid.state.getNextChapterNumber(invalid.bookId)).toBe(5);
       expect(await readdir(join(invalid.bookDir, "chapters"))).not.toContain(expect.stringMatching(/^0005_/u));
       expect(transport).toHaveBeenCalledTimes(0);
       expect(chapterWriter).toHaveBeenCalledTimes(0);
-      expect(realFinalReview).toHaveBeenCalledTimes(3);
+      expect(realFinalReview).toHaveBeenCalledTimes(0);
     } finally {
       globalThis.fetch = originalFetch;
-      if (discoveryRoot) await rm(discoveryRoot, { recursive: true, force: true });
       if (targetRoot) await rm(targetRoot, { recursive: true, force: true });
       if (invalidRoot) await rm(invalidRoot, { recursive: true, force: true });
     }
