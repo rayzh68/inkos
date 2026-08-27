@@ -81,13 +81,14 @@ export interface BoundedCandidate {
 }
 
 export interface BoundedReviewResult {
-  readonly status: "APPROVED" | "ACCEPTED_WITH_FINDINGS" | "BLOCKED_CRITICAL_FINDINGS" | "HELD_AFTER_TWO_REVISIONS";
+  readonly status: "APPROVED" | "ACCEPTED_WITH_FINDINGS" | "BLOCKED_CRITICAL_FINDINGS" | "HELD_AFTER_TWO_REVISIONS" | "REVIEW_OUTPUT_INVALID";
   readonly grade: "A" | "B" | "C" | "D" | "E";
   readonly finalContent: string;
   readonly revisionCount: 0 | 1 | 2;
   readonly candidates: ReadonlyArray<BoundedCandidate>;
   readonly bestCandidate: BoundedCandidate;
   readonly holdReason?: "AUTHORITY_BLOCKER" | "INVALID_OUTPUT" | "REVISION_LIMIT_REACHED";
+  readonly invalidReviewerRole?: ReviewerRole;
   readonly usageByRole: Readonly<Record<string, RoleTokenUsage>>;
 }
 
@@ -184,20 +185,38 @@ export async function runBoundedReviewCycle(params: {
     findings: ReadonlyArray<ReviewFinding>,
     round: 1 | 2,
   ) => Promise<{ readonly content: string; readonly tokenUsage?: RoleTokenUsage }>;
-  readonly onStage?: (stage: "LOGIC_REVIEW" | "READER_REVIEW" | "REVISING_1" | "RESCUE_REVISING_2") => Promise<void> | void;
+  readonly onStage?: (
+    stage: "LOGIC_REVIEW" | "READER_REVIEW" | "REVISING_1" | "RESCUE_REVISING_2",
+    detail?: { readonly semanticRetry: 1 },
+  ) => Promise<void> | void;
 }): Promise<BoundedReviewResult> {
   const usageByRole: Record<string, RoleTokenUsage> = {};
   const candidates: BoundedCandidate[] = [];
   let content = params.initialContent;
+  const reviewCandidate = async (
+    stage: "LOGIC_REVIEW" | "READER_REVIEW",
+    reviewer: Reviewer,
+    candidateSha: string,
+  ): Promise<ScoredReview> => {
+    await params.onStage?.(stage);
+    let result = bindReview(await reviewer(content, candidateSha), candidateSha);
+    usageByRole[result.reviewerRole] = usageAdd(usageByRole[result.reviewerRole], result.tokenUsage);
+    if (result.decision !== "INVALID_OUTPUT") return result;
+
+    await params.onStage?.(stage, { semanticRetry: 1 });
+    result = bindReview(await reviewer(content, candidateSha), candidateSha);
+    usageByRole[result.reviewerRole] = usageAdd(usageByRole[result.reviewerRole], result.tokenUsage);
+    return result;
+  };
+
+  const invalidReviewerRole = (logic: ScoredReview, commercial: ScoredReview): ReviewerRole | undefined =>
+    logic.decision === "INVALID_OUTPUT"
+      ? "logic-canon-auditor"
+      : commercial.decision === "INVALID_OUTPUT" ? "commercial-reader" : undefined;
+
   const initialSha = sha256(content);
-  await params.onStage?.("LOGIC_REVIEW");
-  const initialLogic = await params.reviewLogic(content, initialSha);
-  await params.onStage?.("READER_REVIEW");
-  const initialCommercial = await params.reviewCommercial(content, initialSha);
-  let logic = bindReview(initialLogic, initialSha);
-  let commercial = bindReview(initialCommercial, initialSha);
-  usageByRole[logic.reviewerRole] = usageAdd(usageByRole[logic.reviewerRole], logic.tokenUsage);
-  usageByRole[commercial.reviewerRole] = usageAdd(usageByRole[commercial.reviewerRole], commercial.tokenUsage);
+  let logic = await reviewCandidate("LOGIC_REVIEW", params.reviewLogic, initialSha);
+  let commercial = await reviewCandidate("READER_REVIEW", params.reviewCommercial, initialSha);
 
   const appendCandidate = (label: BoundedCandidate["label"]) => {
     const candidate: BoundedCandidate = {
@@ -213,14 +232,18 @@ export async function runBoundedReviewCycle(params: {
 
   let current = appendCandidate("INITIAL");
   let currentGrade = grade(logic, commercial);
+  const initialInvalidRole = invalidReviewerRole(logic, commercial);
+  if (initialInvalidRole) {
+    return {
+      status: "REVIEW_OUTPUT_INVALID", grade: "E", finalContent: content, revisionCount: 0,
+      candidates, bestCandidate: current, holdReason: "INVALID_OUTPUT", invalidReviewerRole: initialInvalidRole, usageByRole,
+    };
+  }
   if (currentGrade === "A" || currentGrade === "B") {
     return { status: "APPROVED", grade: currentGrade, finalContent: content, revisionCount: 0, candidates, bestCandidate: current, usageByRole };
   }
   if (logic.authorityBlocker || commercial.authorityBlocker) {
-    return { status: "HELD_AFTER_TWO_REVISIONS", grade: "D", finalContent: content, revisionCount: 0, candidates, bestCandidate: current, holdReason: "AUTHORITY_BLOCKER", usageByRole };
-  }
-  if (currentGrade === "E") {
-    return { status: "HELD_AFTER_TWO_REVISIONS", grade: "E", finalContent: content, revisionCount: 0, candidates, bestCandidate: current, holdReason: "INVALID_OUTPUT", usageByRole };
+    return { status: "BLOCKED_CRITICAL_FINDINGS", grade: "D", finalContent: content, revisionCount: 0, candidates, bestCandidate: current, holdReason: "AUTHORITY_BLOCKER", usageByRole };
   }
 
   for (const round of [1, 2] as const) {
@@ -247,33 +270,41 @@ export async function runBoundedReviewCycle(params: {
     content = revised.content;
     const candidateSha = sha256(content);
     if (logicNeedsReview) {
-      await params.onStage?.("LOGIC_REVIEW");
-      logic = bindReview(await params.reviewLogic(content, candidateSha), candidateSha);
-      usageByRole[logic.reviewerRole] = usageAdd(usageByRole[logic.reviewerRole], logic.tokenUsage);
+      logic = await reviewCandidate("LOGIC_REVIEW", params.reviewLogic, candidateSha);
     }
     if (commercialNeedsReview) {
-      await params.onStage?.("READER_REVIEW");
-      commercial = bindReview(await params.reviewCommercial(content, candidateSha), candidateSha);
-      usageByRole[commercial.reviewerRole] = usageAdd(usageByRole[commercial.reviewerRole], commercial.tokenUsage);
+      commercial = await reviewCandidate("READER_REVIEW", params.reviewCommercial, candidateSha);
     }
     current = appendCandidate(round === 1 ? "REVISION_1" : "REVISION_2");
     currentGrade = grade(logic, commercial);
+    const invalidRole = invalidReviewerRole(logic, commercial);
+    if (invalidRole) {
+      return {
+        status: "REVIEW_OUTPUT_INVALID", grade: "E", finalContent: content, revisionCount: round,
+        candidates, bestCandidate: current, holdReason: "INVALID_OUTPUT", invalidReviewerRole: invalidRole, usageByRole,
+      };
+    }
     if (currentGrade === "A" || currentGrade === "B") {
       return { status: "APPROVED", grade: currentGrade, finalContent: content, revisionCount: round, candidates, bestCandidate: current, usageByRole };
     }
-    if (logic.authorityBlocker || commercial.authorityBlocker) break;
+    if (logic.authorityBlocker || commercial.authorityBlocker) {
+      return {
+        status: "BLOCKED_CRITICAL_FINDINGS", grade: "D", finalContent: content, revisionCount: round,
+        candidates, bestCandidate: current, holdReason: "AUTHORITY_BLOCKER", usageByRole,
+      };
+    }
   }
 
   const finalFindings = current.reviews.flatMap((review) => review.findings);
   const finalBlocking = finalFindings.some((finding) => finding.severity === "CRITICAL" || finding.severity === "MAJOR");
   return {
-    status: finalBlocking ? "BLOCKED_CRITICAL_FINDINGS" : "ACCEPTED_WITH_FINDINGS",
+    status: finalBlocking ? "HELD_AFTER_TWO_REVISIONS" : "ACCEPTED_WITH_FINDINGS",
     grade: currentGrade === "E" ? "E" : "D",
     finalContent: current.content,
     revisionCount: 2,
     candidates,
     bestCandidate: current,
-    ...(finalBlocking ? { holdReason: logic.authorityBlocker || commercial.authorityBlocker ? "AUTHORITY_BLOCKER" as const : "REVISION_LIMIT_REACHED" as const } : {}),
+    ...(finalBlocking ? { holdReason: "REVISION_LIMIT_REACHED" as const } : {}),
     usageByRole,
   };
 }

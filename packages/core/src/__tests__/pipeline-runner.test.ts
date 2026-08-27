@@ -32,6 +32,7 @@ import {
   saveChapterUserBrief,
 } from "../state/chapter-workspace.js";
 import { correctLegacyPendingChapterArtifactBindings, createAutonomousProviderExecution, deriveAutonomousJobIdentity, resolveFormalPendingChapterRecoveryPlan } from "../production/bounded-autonomous-controller.js";
+import type { BoundedReviewResult } from "../pipeline/bounded-review.js";
 
 const require = createRequire(import.meta.url);
 const hasNodeSqlite = (() => {
@@ -391,6 +392,108 @@ describe("PipelineRunner", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it("resets Chapter 7 preparation telemetry and emits APPROVED exactly once only after terminal approval", async () => {
+    const stages: Array<{ stage: string; role: string }> = [];
+    const { root, runner, state, bookId } = await createRunnerFixture({
+      boundedAutonomousReview: true,
+      onAutonomousStage: async (event) => { stages.push({ stage: event.stage, role: event.role }); },
+    });
+    const bookDir = state.bookDir(bookId);
+    const storyDir = join(bookDir, "story");
+    const chaptersDir = join(bookDir, "chapters");
+    const body = "林越推开第七道门，确认账本仍在原处，然后把封条交给守门人核验。";
+    const dimensions = {
+      blueprint_transition: 92, causal_logic: 92, canon_continuity: 92, character_motivation: 92,
+      state_inheritance: 92, hooks_disclosure: 92, narrative_clarity: 92,
+    };
+    try {
+      await Promise.all([
+        writeFile(join(storyDir, "current_state.md"), createStateCard({
+          chapter: 6, location: "Archive gate", protagonistState: "Lin Yue holds the seal.",
+          goal: "Verify the ledger.", conflict: "The gate closes at dusk.",
+        }), "utf-8"),
+        writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n", "utf-8"),
+        ...Array.from({ length: 6 }, (_, index) => writeFile(
+          join(chaptersDir, `${String(index + 1).padStart(4, "0")}_Chapter_${index + 1}.md`),
+          `# Chapter ${index + 1}\n\nSettled chapter ${index + 1}.`,
+          "utf-8",
+        )),
+      ]);
+      await state.saveChapterIndex(bookId, Array.from({ length: 6 }, (_, index) => ({
+        number: index + 1, title: `Chapter ${index + 1}`, status: "approved" as const, wordCount: 20,
+        createdAt: "2026-08-27T00:00:00.000Z", updatedAt: "2026-08-27T00:00:00.000Z",
+        auditIssues: [], lengthWarnings: [],
+      })));
+      vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(createWriterOutput({
+        chapterNumber: 7, title: "The Seventh Door", content: body, wordCount: body.length,
+      }));
+      vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockResolvedValue(createAuditResult({
+        passed: true, overallScore: 92, dimensionScores: dimensions, issues: [],
+      }));
+      vi.spyOn(CommercialReaderAgent.prototype, "reviewChapter").mockResolvedValue({
+        reviewerRole: "commercial-reader", provider: "test", model: "test", totalScore: 90,
+        dimensionScores: {
+          opening_hook: 90, pacing_tension: 90, emotional_investment: 90, plot_clarity: 90,
+          dialogue_appeal: 90, western_cultural_naturalness: 90, commercial_appeal: 90, ending_hook: 90,
+        },
+        decision: "APPROVED", findings: [], reviewedCandidateSha: "bound-by-runner",
+        reviewedAt: "2026-08-27T00:00:00.000Z", tokenUsage: ZERO_USAGE,
+      });
+      vi.spyOn(ChapterAnalyzerAgent.prototype, "analyzeChapter").mockResolvedValue(createAnalyzedOutput({
+        chapterNumber: 7, title: "The Seventh Door", content: body, wordCount: body.length,
+        chapterSummary: "| 7 | The Seventh Door | Lin Yue | Ledger verified | State advances | seal | tense | mainline |",
+      }));
+
+      const result = await runner.writeNextChapter(bookId, body.length);
+
+      expect(result.autonomousReview?.status).toBe("APPROVED");
+      expect(stages[0]).toEqual({ stage: "PREPARING", role: "writer" });
+      expect(stages.filter((event) => event.stage === "APPROVED")).toHaveLength(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
+
+  it("never emits APPROVED while persisting invalid or exhausted bounded-review evidence", async () => {
+    const stages: string[] = [];
+    const { root, runner, state, bookId } = await createRunnerFixture({
+      boundedAutonomousReview: true,
+      onAutonomousStage: async (event) => { stages.push(event.stage); },
+    });
+    const candidate = {
+      label: "INITIAL" as const,
+      content: "candidate",
+      sha256: "a".repeat(64),
+      reviews: [],
+      combinedScore: 0,
+    };
+    const invalid: BoundedReviewResult = {
+      status: "REVIEW_OUTPUT_INVALID", grade: "E", finalContent: "candidate", revisionCount: 0,
+      candidates: [candidate], bestCandidate: candidate, holdReason: "INVALID_OUTPUT",
+      invalidReviewerRole: "commercial-reader", usageByRole: {},
+    };
+    const exhausted: BoundedReviewResult = {
+      status: "HELD_AFTER_TWO_REVISIONS", grade: "D", finalContent: "candidate", revisionCount: 2,
+      candidates: [candidate], bestCandidate: candidate, holdReason: "REVISION_LIMIT_REACHED", usageByRole: {},
+    };
+    const persist = (runner as unknown as {
+      persistBoundedReviewEvidence: (bookDir: string, chapter: number, result: BoundedReviewResult) => Promise<string>;
+    }).persistBoundedReviewEvidence.bind(runner);
+    try {
+      const invalidPath = await persist(state.bookDir(bookId), 7, invalid);
+      await persist(state.bookDir(bookId), 8, exhausted);
+      const evidence = JSON.parse(await readFile(join(state.bookDir(bookId), invalidPath), "utf-8"));
+
+      expect(evidence).toMatchObject({
+        status: "REVIEW_OUTPUT_INVALID", revision_count: 0, hold_reason: "INVALID_OUTPUT",
+        invalid_reviewer_role: "commercial-reader",
+      });
+      expect(stages.filter((stage) => stage === "APPROVED")).toHaveLength(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("does not reuse override clients when credential sources differ", () => {

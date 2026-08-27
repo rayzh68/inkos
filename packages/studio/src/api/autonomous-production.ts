@@ -68,6 +68,8 @@ export interface AutonomousRuntimeProjection {
   readonly updatedAt: string;
   readonly lastError?: string | null;
   readonly reason?: string;
+  readonly revisionCount?: number;
+  readonly invalidReviewerRole?: string;
   readonly recoveryOwnership?: AutonomousRecoveryOwnershipProjection | null;
   readonly phase?: string;
   readonly activeRole?: string;
@@ -279,6 +281,7 @@ export function projectAutonomousProductionView(params: {
   if ((params.runtime?.status === "REVIEW_EXHAUSTED" && !finalReviewRecovery) || params.runtime?.status === "HELD_AFTER_TWO_REVISIONS") {
     blockers.push("REVIEW_EXHAUSTED");
   }
+  if (params.runtime?.status === "REVIEW_OUTPUT_INVALID") blockers.push("REVIEW_OUTPUT_INVALID");
   if (params.runtime?.status === "REVIEW_DECISION_CONTRADICTORY") blockers.push("REVIEW_DECISION_CONTRADICTORY");
   if (params.runtime?.status === "BLOCKED_CRITICAL_FINDINGS" && !finalReviewRecovery) blockers.push("BLOCKED_CRITICAL_FINDINGS");
   if (recoveryOwnership?.kind === "FORMAL_BOUNDED_STATE_REBASELINE"
@@ -453,6 +456,8 @@ export function projectAutonomousProductionView(params: {
         : "RECOVERY_READY_OFFLINE_FINALIZATION"
       : params.runtime?.status === "WAITING_PROVIDER_RETRY"
       ? "WAITING_PROVIDER_RETRY"
+      : params.runtime?.status === "REVIEW_OUTPUT_INVALID"
+      ? "REVIEW_OUTPUT_INVALID"
       : params.active
         ? "RUNNING"
       : params.runtime?.status === "RUNNING"
