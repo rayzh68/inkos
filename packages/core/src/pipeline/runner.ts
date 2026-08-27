@@ -284,10 +284,11 @@ export interface PipelineConfig {
   readonly onStreamProgress?: OnStreamProgress;
   readonly onContextCompression?: ContextCompressionCallback;
   readonly onAutonomousStage?: (event: {
-    readonly stage: "WRITING" | "LOGIC_REVIEW" | "READER_REVIEW" | "REVISING_1" | "RESCUE_REVISING_2" | "SETTLING_STATE" | "STATE_REBASELINE_SETTLEMENT" | "STATE_REBASELINE_VALIDATION" | "APPROVED";
+    readonly stage: "PREPARING" | "WRITING" | "LOGIC_REVIEW" | "READER_REVIEW" | "REVISING_1" | "RESCUE_REVISING_2" | "SETTLING_STATE" | "STATE_REBASELINE_SETTLEMENT" | "STATE_REBASELINE_VALIDATION" | "APPROVED";
     readonly role: string;
     readonly provider: string | null;
     readonly model: string | null;
+    readonly reviewRound?: number;
   }) => Promise<void> | void;
 }
 
@@ -314,7 +315,7 @@ export interface ChapterPipelineResult {
   readonly wordCount: number;
   readonly auditResult: AuditResult;
   readonly revised: boolean;
-  readonly status: "ready-for-review" | "accepted-with-findings" | "audit-failed" | "state-degraded" | "blocked-critical-findings" | "held-after-two-revisions";
+  readonly status: "ready-for-review" | "accepted-with-findings" | "audit-failed" | "state-degraded" | "blocked-critical-findings" | "held-after-two-revisions" | "review-output-invalid";
   readonly lengthWarnings?: ReadonlyArray<string>;
   readonly lengthTelemetry?: LengthTelemetry;
   readonly tokenUsage?: TokenUsageSummary;
@@ -2781,6 +2782,15 @@ export class PipelineRunner {
     externalContext?: string,
   ): Promise<ChapterPipelineResult> {
     const book = await this.state.loadBookConfig(bookId);
+    if (this.config.boundedAutonomousReview) {
+      const identity = this.resolveOverride("writer");
+      await this.config.onAutonomousStage?.({
+        stage: "PREPARING",
+        role: "writer",
+        provider: identity.client.service ?? identity.client.provider,
+        model: identity.model,
+      });
+    }
     const bookDir = this.state.bookDir(bookId);
     const chapterNumber = await this.state.getNextChapterNumber(bookId);
     const paddedChapter = String(chapterNumber).padStart(4, "0");
@@ -2813,7 +2823,7 @@ export class PipelineRunner {
         temperatureOverride,
         externalContext,
       );
-      if (result.status === "held-after-two-revisions" || result.status === "blocked-critical-findings") {
+      if (result.status === "held-after-two-revisions" || result.status === "blocked-critical-findings" || result.status === "review-output-invalid") {
         await writeProductionRunSnapshot({
           rootDir: bookDir,
           runPath,
@@ -3018,7 +3028,7 @@ export class PipelineRunner {
           );
           return { content: revised.revisedContent, tokenUsage: revised.tokenUsage };
         },
-        onStage: async (stage) => {
+        onStage: async (stage, detail) => {
           const role = stage === "LOGIC_REVIEW"
             ? "auditor"
             : stage === "READER_REVIEW" ? "commercial-reader" : "reviser";
@@ -3028,6 +3038,7 @@ export class PipelineRunner {
             role,
             provider: identity.client.service ?? identity.client.provider,
             model: identity.model,
+            ...(detail?.semanticRetry === 1 ? { reviewRound: 0 } : {}),
           });
         },
       });
@@ -3058,7 +3069,9 @@ export class PipelineRunner {
             ? `Bounded autonomous review ${autonomousReviewResult.grade} accepted with deferred non-blocking findings.`
             : `BLOCKED_CRITICAL_FINDINGS: ${autonomousReviewResult.holdReason ?? "CRITICAL_OR_MAJOR_FINDINGS_REMAIN"}`,
       };
-      if (autonomousReviewResult.status === "HELD_AFTER_TWO_REVISIONS" || autonomousReviewResult.status === "BLOCKED_CRITICAL_FINDINGS") {
+      if (autonomousReviewResult.status === "HELD_AFTER_TWO_REVISIONS"
+        || autonomousReviewResult.status === "BLOCKED_CRITICAL_FINDINGS"
+        || autonomousReviewResult.status === "REVIEW_OUTPUT_INVALID") {
         const candidateEvidencePath = await this.persistBoundedReviewEvidence(
           bookDir,
           chapterNumber,
@@ -3070,7 +3083,11 @@ export class PipelineRunner {
           wordCount: finalWordCount,
           auditResult,
           revised,
-          status: autonomousReviewResult.status === "BLOCKED_CRITICAL_FINDINGS" ? "blocked-critical-findings" : "held-after-two-revisions",
+          status: autonomousReviewResult.status === "BLOCKED_CRITICAL_FINDINGS"
+            ? "blocked-critical-findings"
+            : autonomousReviewResult.status === "REVIEW_OUTPUT_INVALID"
+              ? "review-output-invalid"
+              : "held-after-two-revisions",
           tokenUsage: totalUsage,
           roleUsage,
           autonomousReview: this.projectBoundedReview(autonomousReviewResult),
@@ -3332,7 +3349,7 @@ export class PipelineRunner {
       degradedIssues,
       tokenUsage: totalUsage,
       ...(roleUsage ? { roleUsage } : {}),
-      ...(autonomousReviewResult ? {
+      ...(autonomousReviewResult && autonomousReviewResult.status !== "REVIEW_OUTPUT_INVALID" ? {
         autonomousReview: {
           status: autonomousReviewResult.status,
           grade: autonomousReviewResult.grade,
@@ -3359,6 +3376,15 @@ export class PipelineRunner {
       logSnapshotStage: () =>
         this.logStage(stageLanguage, { zh: "更新章节索引与快照", en: "updating chapter index and snapshots" }),
     });
+
+    if (autonomousReviewResult?.status === "APPROVED") {
+      await this.config.onAutonomousStage?.({
+        stage: "APPROVED",
+        role: "state-manager",
+        provider: null,
+        model: null,
+      });
+    }
 
     // 6. Send notification
     if (this.config.notifyChannels && this.config.notifyChannels.length > 0) {
@@ -4229,6 +4255,7 @@ ${matrix}`,
       grade: result.grade,
       revisionCount: result.revisionCount,
       holdReason: result.holdReason,
+      invalidReviewerRole: result.invalidReviewerRole,
       usageByRole: result.usageByRole,
       candidates: result.candidates.map(({ label, sha256, combinedScore }) => ({ label, sha256, combinedScore })),
       bestCandidate: {
@@ -4253,6 +4280,7 @@ ${matrix}`,
       grade: result.grade,
       revision_count: result.revisionCount,
       hold_reason: result.holdReason ?? null,
+      invalid_reviewer_role: result.invalidReviewerRole ?? null,
       best_candidate: {
         label: result.bestCandidate.label,
         sha256: result.bestCandidate.sha256,
@@ -4279,14 +4307,6 @@ ${matrix}`,
         },
       ],
     });
-    if (this.config.boundedAutonomousReview) {
-      await this.config.onAutonomousStage?.({
-        stage: "APPROVED",
-        role: "state-manager",
-        provider: null,
-        model: null,
-      });
-    }
     return toPosixPath(join(base, "review.json"));
   }
 

@@ -229,11 +229,36 @@ describe("bounded autonomous production controller", () => {
       map,
       mode: "full-book",
       getNextChapter: async () => next,
-      runChapter: async () => ({ status: "held-after-two-revisions" }),
+      runChapter: async () => ({ status: "held-after-two-revisions", autonomousReview: { revisionCount: 2 } }),
       shouldStop: () => false,
       persistProgress: async () => undefined,
     });
     expect(result.status).toBe("HELD_AFTER_TWO_REVISIONS");
+    expect(result.nextChapter).toBe(1);
+    expect(result.reason).toBe("REVISION_LIMIT_REACHED");
+    expect(result.revisionCount).toBe(2);
+  });
+
+  it("preserves a twice-invalid reviewer contract as REVIEW_OUTPUT_INVALID without advancing or revising", async () => {
+    let calls = 0;
+    const result = await runBoundedAutonomousScope({
+      map,
+      mode: "full-book",
+      getNextChapter: async () => 1,
+      runChapter: async () => {
+        calls += 1;
+        return {
+          status: "review-output-invalid",
+          autonomousReview: { revisionCount: 0, holdReason: "INVALID_OUTPUT", invalidReviewerRole: "commercial-reader" },
+        };
+      },
+      shouldStop: () => calls > 0,
+      persistProgress: async () => undefined,
+    });
+    expect(result.status).toBe("REVIEW_OUTPUT_INVALID");
+    expect(result.reason).toBe("INVALID_OUTPUT");
+    expect(result.revisionCount).toBe(0);
+    expect(result.invalidReviewerRole).toBe("commercial-reader");
     expect(result.nextChapter).toBe(1);
   });
 
@@ -484,6 +509,46 @@ describe("bounded autonomous production controller", () => {
         attempt: 1,
       });
       expect(runtime.providerAttemptHistory).toHaveLength(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("gives one semantic reviewer retry a distinct durable identity and replays both outcomes without another transport", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-autonomous-semantic-review-retry-"));
+    try {
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      await mkdir(runtimeDir, { recursive: true });
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId: "job", status: "RUNNING", mode: "current-volume", volumeId: "volume-001",
+        startChapter: 7, targetChapter: 7, nextChapter: 7, completedThisRun: 0,
+      }), "utf-8");
+      let stage: { stage: string; role: string; provider: string; model: string; reviewRound?: number } = {
+        stage: "READER_REVIEW", role: "commercial-reader", provider: "openrouter", model: "provider/model",
+      };
+      const execution = createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId: "job", getActiveStage: () => stage });
+      const fingerprint = "d".repeat(64);
+      let transportCalls = 0;
+      const run = (content: string) => execution.runProviderCall(7, async () => {
+        transportCalls += 1;
+        return { content, usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 } };
+      }, { provider: "openrouter", model: "provider/model", inputFingerprint: fingerprint });
+
+      const invalid = await run('{"decision":"ACCEPT"}');
+      const firstPath = execution.responseArtifactPath(fingerprint, "openrouter", "provider/model", 7);
+      stage = { ...stage, reviewRound: 0 };
+      const valid = await run('{"decision":"APPROVED_WITH_NOTES"}');
+      const retryPath = execution.responseArtifactPath(fingerprint, "openrouter", "provider/model", 7);
+      const replayedRetry = await run("TRANSPORT_MUST_NOT_REPLACE_RETRY");
+
+      expect(firstPath).not.toBe(retryPath);
+      expect(invalid.content).toContain("ACCEPT");
+      expect(valid.content).toContain("APPROVED_WITH_NOTES");
+      expect(replayedRetry).toEqual(valid);
+      expect(transportCalls).toBe(2);
+      const runtime = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
+      expect(runtime.providerAttemptHistory).toHaveLength(2);
+      expect(new Set(runtime.providerAttemptHistory.map((entry: { logicalStepId: string }) => entry.logicalStepId)).size).toBe(2);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

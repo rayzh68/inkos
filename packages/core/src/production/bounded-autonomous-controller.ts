@@ -28,7 +28,8 @@ export type AutonomousRunStatus =
   | "BLOCKED_CRITICAL_FINDINGS"
   | "REVIEW_DECISION_CONTRADICTORY"
   | "REVIEW_EXHAUSTED"
-  | "HELD_AFTER_TWO_REVISIONS";
+  | "HELD_AFTER_TWO_REVISIONS"
+  | "REVIEW_OUTPUT_INVALID";
 
 export interface AutonomousRecoveryOwnership {
   readonly kind: "FORMAL_OFFLINE_FINALIZATION" | "FORMAL_BOUNDED_STATE_REBASELINE";
@@ -81,6 +82,8 @@ export interface AutonomousRunProgress {
   readonly responseArtifactStatus?: "NONE" | "COMPLETE";
   readonly revisionRound?: number;
   readonly reviewRound?: number;
+  readonly revisionCount?: number;
+  readonly invalidReviewerRole?: string;
   readonly recoveryOwnership?: AutonomousRecoveryOwnership | null;
 }
 
@@ -1449,6 +1452,7 @@ function logicalProviderStepId(params: {
     params.provider,
     params.model,
     params.inputFingerprint,
+    ...(params.stage.reviewRound === 0 ? ["semantic-review-retry:1"] : []),
   ].join("\n");
   return `provider-step-${createHash("sha256").update(raw, "utf-8").digest("hex")}`;
 }
@@ -1769,8 +1773,20 @@ export async function runBoundedAutonomousScope(params: {
   readonly mode: ProductionMode;
   readonly getNextChapter: () => Promise<number>;
   readonly pendingChapterNumber?: number;
-  readonly resumePendingChapter?: (options?: { readonly safeReplayStage?: string }) => Promise<{ readonly status: string; readonly chapterNumber: number }>;
-  readonly runChapter: () => Promise<{ readonly status: string }>;
+  readonly resumePendingChapter?: (options?: { readonly safeReplayStage?: string }) => Promise<{
+    readonly status: string;
+    readonly chapterNumber: number;
+    readonly revisionCount?: number;
+    readonly invalidReviewerRole?: string;
+  }>;
+  readonly runChapter: () => Promise<{
+    readonly status: string;
+    readonly autonomousReview?: {
+      readonly revisionCount: number;
+      readonly holdReason?: string;
+      readonly invalidReviewerRole?: string;
+    };
+  }>;
   readonly shouldStop: () => boolean;
   readonly persistProgress: (progress: AutonomousRunProgress) => Promise<void>;
   readonly providerRecovery?: AutonomousProviderRecovery;
@@ -1936,8 +1952,18 @@ export async function runBoundedAutonomousScope(params: {
   if (params.resumePendingChapter) {
     const resumed = await executeRecoverably(params.pendingChapterNumber ?? initialNext, (safeReplayStage) => params.resumePendingChapter!({ ...(safeReplayStage ? { safeReplayStage } : {}) }));
     if ("mode" in resumed) return resumed;
+    if (resumed.status === "review-output-invalid") {
+      const invalid = project("REVIEW_OUTPUT_INVALID", initialNext, "INVALID_OUTPUT", {
+        chapterNumber: params.pendingChapterNumber ?? initialNext,
+        revisionCount: resumed.revisionCount ?? 0,
+        ...(resumed.invalidReviewerRole ? { invalidReviewerRole: resumed.invalidReviewerRole } : {}),
+      });
+      await params.persistProgress(invalid);
+      return invalid;
+    }
     if (resumed.status === "held-after-two-revisions" || resumed.status === "review-exhausted") {
-      const held = project("REVIEW_EXHAUSTED", initialNext, "REVISION_LIMIT_REACHED");
+      if (resumed.revisionCount !== 2) throw new Error("AUTONOMOUS_REVISION_LIMIT_INVARIANT_VIOLATION");
+      const held = project("REVIEW_EXHAUSTED", initialNext, "REVISION_LIMIT_REACHED", { revisionCount: 2 });
       await params.persistProgress(held);
       return held;
     }
@@ -1974,9 +2000,22 @@ export async function runBoundedAutonomousScope(params: {
     if (result.status === "audit-failed") {
       throw new Error("AUTONOMOUS_REVIEW_DID_NOT_SETTLE");
     }
+    if (result.status === "review-output-invalid") {
+      const invalidNext = await params.getNextChapter();
+      const invalid = project("REVIEW_OUTPUT_INVALID", invalidNext, "INVALID_OUTPUT", {
+        chapterNumber: invalidNext,
+        revisionCount: result.autonomousReview?.revisionCount ?? 0,
+        ...(result.autonomousReview?.invalidReviewerRole
+          ? { invalidReviewerRole: result.autonomousReview.invalidReviewerRole }
+          : {}),
+      });
+      await params.persistProgress(invalid);
+      return invalid;
+    }
     if (result.status === "held-after-two-revisions") {
+      if (result.autonomousReview?.revisionCount !== 2) throw new Error("AUTONOMOUS_REVISION_LIMIT_INVARIANT_VIOLATION");
       const heldNext = await params.getNextChapter();
-      const held = project("HELD_AFTER_TWO_REVISIONS", heldNext, "REVISION_LIMIT_REACHED");
+      const held = project("HELD_AFTER_TWO_REVISIONS", heldNext, "REVISION_LIMIT_REACHED", { revisionCount: 2 });
       await params.persistProgress(held);
       return held;
     }

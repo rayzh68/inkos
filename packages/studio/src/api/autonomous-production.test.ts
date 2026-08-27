@@ -599,4 +599,27 @@ describe("autonomous production Studio projection", () => {
     expect(view.startEnabled).toBe(false);
     expect(view.runtimeBlockers).toContain("REVIEW_DECISION_CONTRADICTORY");
   });
+
+  it("blocks a reviewer contract failure truthfully without projecting revision exhaustion", () => {
+    const view = projectAutonomousProductionView({
+      map,
+      targetChapters: 156,
+      nextChapter: 7,
+      chapters: [1, 2, 3, 4, 5, 6].map((number) => ({ number, status: "approved" })),
+      config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini", reviser: "gpt", "observer-reflector": "flash" } },
+      catalog,
+      runtime: {
+        jobId: "autonomous-review-invalid", status: "REVIEW_OUTPUT_INVALID", mode: "current-volume",
+        nextChapter: 7, updatedAt: "2026-08-27T00:00:00.000Z", reason: "INVALID_OUTPUT",
+        revisionCount: 0, invalidReviewerRole: "commercial-reader",
+      },
+      active: false,
+      budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
+    });
+
+    expect(view.startEnabled).toBe(false);
+    expect(view.runtimeStatus).toBe("REVIEW_OUTPUT_INVALID");
+    expect(view.runtimeBlockers).toContain("REVIEW_OUTPUT_INVALID");
+    expect(view.runtimeBlockers).not.toContain("REVIEW_EXHAUSTED");
+  });
 });

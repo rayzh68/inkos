@@ -16,6 +16,13 @@ function review(role: "logic-canon-auditor" | "commercial-reader", score: number
   };
 }
 
+function invalidReview(role: "logic-canon-auditor" | "commercial-reader"): ScoredReview {
+  return {
+    ...review(role, 0, "CRITICAL"),
+    decision: "INVALID_OUTPUT",
+  };
+}
+
 describe("bounded autonomous chapter review", () => {
   it("requires all seven logic dimensions without promoting a structural warning to MAJOR", () => {
     const valid = scoredLogicReviewFromAudit({
@@ -114,7 +121,73 @@ describe("bounded autonomous chapter review", () => {
     expect(stages).toEqual(["LOGIC_REVIEW", "READER_REVIEW"]);
   });
 
-  it("runs one normal and one rescue revision, then blocks critical findings without a third", async () => {
+  it("retries one commercial semantic contract failure on the same candidate without revising prose", async () => {
+    const commercial = vi.fn()
+      .mockResolvedValueOnce(invalidReview("commercial-reader"))
+      .mockResolvedValueOnce(review("commercial-reader", 86));
+    const revise = vi.fn();
+    const stages: Array<{ stage: string; semanticRetry?: 1 }> = [];
+
+    const result = await runBoundedReviewCycle({
+      initialContent: "draft",
+      reviewLogic: vi.fn().mockResolvedValue(review("logic-canon-auditor", 92)),
+      reviewCommercial: commercial,
+      revise,
+      onStage: async (stage, detail) => { stages.push({ stage, ...detail }); },
+    });
+
+    expect(result.status).toBe("APPROVED");
+    expect(result.revisionCount).toBe(0);
+    expect(commercial).toHaveBeenCalledTimes(2);
+    expect(commercial.mock.calls[0]?.[1]).toBe(commercial.mock.calls[1]?.[1]);
+    expect(revise).not.toHaveBeenCalled();
+    expect(result.usageByRole["commercial-reader"]).toEqual({ promptTokens: 20, completionTokens: 10, totalTokens: 30 });
+    expect(stages).toEqual([
+      { stage: "LOGIC_REVIEW" },
+      { stage: "READER_REVIEW" },
+      { stage: "READER_REVIEW", semanticRetry: 1 },
+    ]);
+  });
+
+  it("retries one logic semantic contract failure without invoking the Reviser", async () => {
+    const logic = vi.fn()
+      .mockResolvedValueOnce(invalidReview("logic-canon-auditor"))
+      .mockResolvedValueOnce(review("logic-canon-auditor", 92));
+    const revise = vi.fn();
+
+    const result = await runBoundedReviewCycle({
+      initialContent: "draft",
+      reviewLogic: logic,
+      reviewCommercial: vi.fn().mockResolvedValue(review("commercial-reader", 86)),
+      revise,
+    });
+
+    expect(result.status).toBe("APPROVED");
+    expect(result.revisionCount).toBe(0);
+    expect(logic).toHaveBeenCalledTimes(2);
+    expect(revise).not.toHaveBeenCalled();
+  });
+
+  it("fails closed truthfully when the same reviewer returns INVALID_OUTPUT twice", async () => {
+    const commercial = vi.fn().mockResolvedValue(invalidReview("commercial-reader"));
+    const revise = vi.fn();
+
+    const result = await runBoundedReviewCycle({
+      initialContent: "draft",
+      reviewLogic: vi.fn().mockResolvedValue(review("logic-canon-auditor", 92)),
+      reviewCommercial: commercial,
+      revise,
+    });
+
+    expect(result.status).toBe("REVIEW_OUTPUT_INVALID");
+    expect(result.revisionCount).toBe(0);
+    expect(result.holdReason).toBe("INVALID_OUTPUT");
+    expect(result.invalidReviewerRole).toBe("commercial-reader");
+    expect(commercial).toHaveBeenCalledTimes(2);
+    expect(revise).not.toHaveBeenCalled();
+  });
+
+  it("runs one normal and one rescue revision, then reports true revision exhaustion without a third", async () => {
     const logic = vi.fn()
       .mockResolvedValueOnce(review("logic-canon-auditor", 72, "MAJOR"))
       .mockResolvedValueOnce(review("logic-canon-auditor", 78, "MAJOR"))
@@ -124,8 +197,9 @@ describe("bounded autonomous chapter review", () => {
       .mockResolvedValueOnce({ content: "revision one", tokenUsage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } })
       .mockResolvedValueOnce({ content: "revision two", tokenUsage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } });
     const result = await runBoundedReviewCycle({ initialContent: "draft", reviewLogic: logic, reviewCommercial: commercial, revise });
-    expect(result.status).toBe("BLOCKED_CRITICAL_FINDINGS");
+    expect(result.status).toBe("HELD_AFTER_TWO_REVISIONS");
     expect(result.revisionCount).toBe(2);
+    expect(result.holdReason).toBe("REVISION_LIMIT_REACHED");
     expect(result.candidates.map((candidate) => candidate.label)).toEqual(["INITIAL", "REVISION_1", "REVISION_2"]);
     expect(revise).toHaveBeenCalledTimes(2);
     expect(logic).toHaveBeenCalledTimes(3);
@@ -179,7 +253,7 @@ describe("bounded autonomous chapter review", () => {
       reviewCommercial: vi.fn().mockResolvedValue(review("commercial-reader", 90)),
       revise,
     });
-    expect(result.status).toBe("HELD_AFTER_TWO_REVISIONS");
+    expect(result.status).toBe("BLOCKED_CRITICAL_FINDINGS");
     expect(result.holdReason).toBe("AUTHORITY_BLOCKER");
     expect(revise).not.toHaveBeenCalled();
   });
