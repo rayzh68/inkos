@@ -2209,8 +2209,32 @@ export class PipelineRunner {
     }
   }
 
+  /** Re-verifies a fully terminal preserved recovery without invoking review, revision, state generation, or Writer generation. */
+  async reconcilePreservedBoundedCandidateTerminal(plan: FormalPreservedBoundedReviewResumePlan): Promise<{
+    readonly chapterNumber: number;
+    readonly status: "approved" | "accepted-with-findings";
+  }> {
+    const releaseLock = await this.state.acquireBookLock(plan.bookId);
+    try {
+      const verified = await resolveFormalPendingChapterRecoveryPlan({
+        projectRoot: this.config.projectRoot,
+        bookId: plan.bookId,
+        jobId: plan.jobId,
+        pendingChapterNumber: plan.pendingChapterNumber,
+      });
+      if (!plan.terminalReconciliation || !verified || verified.kind !== "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
+        || !verified.terminalReconciliation || JSON.stringify(verified) !== JSON.stringify(plan)) {
+        throw new Error("PRESERVED_CANDIDATE_TERMINAL_RECONCILIATION_CHANGED");
+      }
+      return { chapterNumber: plan.pendingChapterNumber, status: plan.terminalReconciliation.status };
+    } finally {
+      await releaseLock();
+    }
+  }
+
   /** Resumes bounded review from a formally proven, unindexed prose candidate without invoking Writer generation. */
   async resumePreservedBoundedCandidateReview(plan: FormalPreservedBoundedReviewResumePlan): Promise<ChapterPipelineResult> {
+    if (plan.terminalReconciliation) throw new Error("PRESERVED_CANDIDATE_TERMINAL_RECONCILIATION_REQUIRED");
     const releaseLock = await this.state.acquireBookLock(plan.bookId);
     try {
       const verified = await resolveFormalPendingChapterRecoveryPlan({

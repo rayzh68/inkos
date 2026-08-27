@@ -2958,7 +2958,11 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         },
       });
       productionMap = await requireBookProductionMap(root, bookId);
-      jobId = deriveAutonomousJobIdentity({ map: productionMap, mode, nextChapter: startedNextChapter });
+      const identityNextChapter = admittedOfflineFinalizationPlan?.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
+        && admittedOfflineFinalizationPlan.terminalReconciliation
+        ? admittedOfflineFinalizationPlan.pendingChapterNumber
+        : startedNextChapter;
+      jobId = deriveAutonomousJobIdentity({ map: productionMap, mode, nextChapter: identityNextChapter });
       if ((recoveringProviderWait || recoveringOwnedFormalRecovery) && persistedRuntime?.jobId !== jobId) {
         throw new Error("AUTONOMOUS_WAITING_JOB_IDENTITY_MISMATCH");
       }
@@ -3035,6 +3039,10 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       ...(admittedOfflineFinalizationPlan?.pendingChapterNumber !== undefined
         ? { pendingChapterNumber: admittedOfflineFinalizationPlan.pendingChapterNumber }
         : actions.pendingChapterNumber !== undefined ? { pendingChapterNumber: actions.pendingChapterNumber } : {}),
+      ...(admittedOfflineFinalizationPlan?.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
+        && admittedOfflineFinalizationPlan.terminalReconciliation
+        ? { recoveryScopeChapterNumber: admittedOfflineFinalizationPlan.pendingChapterNumber }
+        : {}),
       shouldStop: () => autonomousJobs.shouldStop(bookId),
       ...(admittedOfflineFinalizationPlan?.kind === "FORMAL_BOUNDED_STATE_REBASELINE"
         ? { resumePendingChapter: async () => {
@@ -3054,15 +3062,26 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         : admittedOfflineFinalizationPlan?.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
           ? { resumePendingChapter: async () => {
             if (durableClaimFailure) throw durableClaimFailure;
-            const result = await pipeline.resumePreservedBoundedCandidateReview(admittedOfflineFinalizationPlan);
+            const terminalReconciliation = admittedOfflineFinalizationPlan.terminalReconciliation;
+            const result = terminalReconciliation
+              ? await pipeline.reconcilePreservedBoundedCandidateTerminal(admittedOfflineFinalizationPlan)
+              : await pipeline.resumePreservedBoundedCandidateReview(admittedOfflineFinalizationPlan);
             if (durableClaimFailure) throw durableClaimFailure;
-            if (result.status === "ready-for-review" || result.status === "accepted-with-findings") {
-              await saveAutonomousRuntime(root, bookId, {
-                jobId, status: "RUNNING", mode, nextChapter: startedNextChapter + 1,
-                updatedAt: new Date().toISOString(), recoveryOwnership: null,
-              });
-            }
-            return result;
+            const terminalStatus = result.status === "accepted-with-findings"
+              ? "accepted-with-findings" as const
+              : result.status === "approved" || (!terminalReconciliation && result.status === "ready-for-review"
+                && result.autonomousReview?.status === "APPROVED")
+                ? "approved" as const
+                : null;
+            if (!terminalStatus) return result;
+            if (terminalReconciliation) await actions.verifyChapterTerminal(result.chapterNumber, terminalStatus);
+            else await actions.promoteChapterTerminal(result.chapterNumber, terminalStatus);
+            const nextChapter = await state.getNextChapterNumber(bookId);
+            await saveAutonomousRuntime(root, bookId, {
+              jobId, status: "RUNNING", mode, nextChapter,
+              updatedAt: new Date().toISOString(), recoveryOwnership: null,
+            });
+            return { ...result, status: terminalStatus };
           } }
         : actions.resumePendingChapter ? { resumePendingChapter: async (options?: { readonly safeReplayStage?: string }) => {
         if (durableClaimFailure) throw durableClaimFailure;

@@ -832,6 +832,15 @@ export interface FormalPreservedBoundedReviewResumePlan {
   readonly initialReviews: Partial<Readonly<Record<ReviewerRole, ScoredReview>>>;
   readonly invalidReviewerRoles: ReadonlyArray<ReviewerRole>;
   readonly historicalRoleUsage: Readonly<Record<string, RecoveryUsage>>;
+  readonly terminalReconciliation?: {
+    readonly status: "approved" | "accepted-with-findings";
+    readonly chapterFile: string;
+    readonly candidateSha256: string;
+    readonly receiptRelativePath: string;
+    readonly receiptSha256: string;
+    readonly snapshotManifestSha256: string;
+    readonly stateManifestSha256: string;
+  };
 }
 
 export type FormalPendingChapterRecoveryPlan = FormalOfflineFinalizationPlan | FormalBoundedStateRebaselinePlan | FormalPreservedBoundedReviewResumePlan;
@@ -1060,6 +1069,80 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
+async function attachPreservedTerminalReconciliation(params: {
+  readonly bookDir: string;
+  readonly evidenceDir: string;
+  readonly chapterFile: string;
+  readonly indexEntry: ChapterMeta;
+  readonly plan: FormalPreservedBoundedReviewResumePlan;
+}): Promise<FormalPreservedBoundedReviewResumePlan> {
+  try {
+    const receiptNames = (await readdir(params.evidenceDir))
+      .filter((name) => /^preserved-review-resume-\d{3}\.json$/u.test(name))
+      .sort();
+    const receipts = await Promise.all(receiptNames.map(async (name) => {
+      const bytes = await readFile(join(params.evidenceDir, name));
+      return { name, bytes, value: JSON.parse(bytes.toString("utf-8")) as {
+        readonly schema_version?: unknown;
+        readonly chapter_number?: unknown;
+        readonly status?: unknown;
+        readonly best_candidate?: { readonly label?: unknown; readonly sha256?: unknown };
+        readonly candidates?: ReadonlyArray<{ readonly label?: unknown; readonly sha256?: unknown }>;
+      } };
+    }));
+    const terminalReceipts = receipts.filter(({ value }) => value.status === "APPROVED" || value.status === "ACCEPTED_WITH_FINDINGS");
+    if (terminalReceipts.length !== 1 || terminalReceipts[0]!.name !== receiptNames.at(-1)) throw new Error("terminal receipt mismatch");
+    const receipt = terminalReceipts[0]!;
+    const expectedStatus = receipt.value.status === "APPROVED" ? "approved" as const : "accepted-with-findings" as const;
+    if (receipt.value.schema_version !== "1.0" || receipt.value.chapter_number !== params.plan.pendingChapterNumber
+      || params.indexEntry.status !== expectedStatus || typeof params.indexEntry.title !== "string" || !params.indexEntry.title.trim()
+      || !Array.isArray(receipt.value.candidates)) {
+      throw new Error("terminal identity mismatch");
+    }
+    const initialAuthorities = receipt.value.candidates.filter((candidate) => candidate.label === "INITIAL" && candidate.sha256 === params.plan.candidate.sha256);
+    const finalAuthorities = receipt.value.candidates.filter((candidate) => candidate.label === receipt.value.best_candidate?.label
+      && candidate.sha256 === receipt.value.best_candidate?.sha256);
+    if (initialAuthorities.length !== 1 || finalAuthorities.length !== 1 || typeof receipt.value.best_candidate?.label !== "string"
+      || !["INITIAL", "REVISION_1", "REVISION_2"].includes(receipt.value.best_candidate.label)
+      || !/^[a-f0-9]{64}$/u.test(String(receipt.value.best_candidate.sha256 ?? ""))) {
+      throw new Error("terminal candidate authority mismatch");
+    }
+    const candidateName = `preserved-review-resume-${receipt.name.match(/(\d{3})/u)![1]}-${receipt.value.best_candidate.label.toLowerCase()}.md`;
+    const finalCandidateBytes = await readFile(join(params.evidenceDir, candidateName));
+    if (sha256(finalCandidateBytes) !== receipt.value.best_candidate.sha256) throw new Error("terminal candidate hash mismatch");
+    const finalCandidate = finalCandidateBytes.toString("utf-8");
+    if (!Buffer.from(finalCandidate, "utf-8").equals(finalCandidateBytes)) throw new Error("terminal candidate encoding mismatch");
+
+    const book = JSON.parse(await readFile(join(params.bookDir, "book.json"), "utf-8")) as { readonly language?: unknown };
+    const heading = book.language === "en"
+      ? `# Chapter ${params.plan.pendingChapterNumber}: ${params.indexEntry.title}`
+      : `# 第${params.plan.pendingChapterNumber}章 ${params.indexEntry.title}`;
+    const formalChapterBytes = await readFile(join(params.bookDir, "chapters", params.chapterFile));
+    if (formalChapterBytes.toString("utf-8") !== `${heading}\n\n${finalCandidate}`) throw new Error("formal chapter mismatch");
+
+    const stateManifestBytes = await readFile(join(params.bookDir, "story", "state", "manifest.json"));
+    const snapshotManifestBytes = await readFile(join(params.bookDir, "story", "snapshots", String(params.plan.pendingChapterNumber), "state", "manifest.json"));
+    for (const bytes of [stateManifestBytes, snapshotManifestBytes]) {
+      const manifest = JSON.parse(bytes.toString("utf-8")) as { readonly schemaVersion?: unknown; readonly lastAppliedChapter?: unknown };
+      if (manifest.schemaVersion !== 2 || manifest.lastAppliedChapter !== params.plan.pendingChapterNumber) throw new Error("terminal state mismatch");
+    }
+    return {
+      ...params.plan,
+      terminalReconciliation: {
+        status: expectedStatus,
+        chapterFile: params.chapterFile,
+        candidateSha256: receipt.value.best_candidate.sha256 as string,
+        receiptRelativePath: join("story", "runtime", "bounded-autonomous", `chapter-${String(params.plan.pendingChapterNumber).padStart(4, "0")}`, receipt.name).replace(/\\/gu, "/"),
+        receiptSha256: sha256(receipt.bytes),
+        snapshotManifestSha256: sha256(snapshotManifestBytes),
+        stateManifestSha256: sha256(stateManifestBytes),
+      },
+    };
+  } catch (error) {
+    throw new Error("PRESERVED_CANDIDATE_TERMINAL_RECONCILIATION_CONFLICT", { cause: error });
+  }
+}
+
 async function resolvePreservedBoundedReviewResumePlan(params: {
   readonly projectRoot: string;
   readonly bookId: string;
@@ -1075,7 +1158,7 @@ async function resolvePreservedBoundedReviewResumePlan(params: {
     && ownership.pendingChapterNumber === params.pendingChapterNumber
     && ["RUNNING", "WAITING_PROVIDER_RETRY", "PAUSED_PROVIDER_UNAVAILABLE", "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", "PAUSED_DETERMINISTIC_PROVIDER_ERROR"].includes(runtime.status);
   if (!ownedReentry && runtime.status !== "REVIEW_OUTPUT_INVALID" && runtime.status !== "HELD_AFTER_TWO_REVISIONS") return null;
-  if (runtime.jobId !== params.jobId || runtime.nextChapter !== params.pendingChapterNumber) {
+  if (runtime.jobId !== params.jobId) {
     throw new Error("PRESERVED_CANDIDATE_RUNTIME_IDENTITY_MISMATCH");
   }
   if ((runtime.providerAttemptHistory ?? []).some((attempt) => attempt.chapterNumber === params.pendingChapterNumber
@@ -1092,32 +1175,42 @@ async function resolvePreservedBoundedReviewResumePlan(params: {
     throw new Error("PRESERVED_CANDIDATE_PRODUCTION_JOB_IDENTITY_MISMATCH");
   }
   const chapterPrefix = new RegExp(`^${String(params.pendingChapterNumber).padStart(4, "0")}[_-].*\\.md$`, "u");
-  if ((await readdir(join(bookDir, "chapters"))).some((name) => chapterPrefix.test(name))) {
-    throw new Error("PRESERVED_CANDIDATE_FORMAL_CHAPTER_ALREADY_EXISTS");
-  }
+  const formalChapterFiles = (await readdir(join(bookDir, "chapters"))).filter((name) => chapterPrefix.test(name));
   const index = JSON.parse(await readFile(join(bookDir, "chapters", "index.json"), "utf-8")) as ChapterMeta[];
-  if (index.some((entry) => entry.number === params.pendingChapterNumber)) throw new Error("PRESERVED_CANDIDATE_INDEX_ALREADY_EXISTS");
+  const terminalIndexEntries = index.filter((entry) => entry.number === params.pendingChapterNumber);
+  const terminalSnapshotExists = await pathExists(join(bookDir, "story", "snapshots", String(params.pendingChapterNumber)));
+  const hasTerminalArtifacts = formalChapterFiles.length > 0 || terminalIndexEntries.length > 0 || terminalSnapshotExists;
+  if (runtime.nextChapter !== params.pendingChapterNumber
+    && !(ownedReentry && hasTerminalArtifacts && runtime.nextChapter === params.pendingChapterNumber + 1)) {
+    throw new Error("PRESERVED_CANDIDATE_RUNTIME_IDENTITY_MISMATCH");
+  }
+  if (hasTerminalArtifacts && !ownedReentry) {
+    if (formalChapterFiles.length > 0) throw new Error("PRESERVED_CANDIDATE_FORMAL_CHAPTER_ALREADY_EXISTS");
+    if (terminalIndexEntries.length > 0) throw new Error("PRESERVED_CANDIDATE_INDEX_ALREADY_EXISTS");
+    throw new Error("PRESERVED_CANDIDATE_TERMINAL_SNAPSHOT_CONFLICT");
+  }
+  if (hasTerminalArtifacts && (formalChapterFiles.length !== 1 || terminalIndexEntries.length !== 1 || !terminalSnapshotExists)) {
+    throw new Error("PRESERVED_CANDIDATE_TERMINAL_RECONCILIATION_CONFLICT");
+  }
   const baselineChapterNumber = params.pendingChapterNumber - 1;
   const terminalBaselineStatuses = new Set<ChapterMeta["status"]>(["approved", "accepted-with-findings", "published", "imported"]);
-  const orderedIndex = [...index].sort((left, right) => left.number - right.number);
+  const orderedIndex = index.filter((entry) => entry.number !== params.pendingChapterNumber).sort((left, right) => left.number - right.number);
   if (baselineChapterNumber < 0 || orderedIndex.length !== baselineChapterNumber
     || orderedIndex.some((entry, offset) => entry.number !== offset + 1 || !terminalBaselineStatuses.has(entry.status))) {
     throw new Error("PRESERVED_CANDIDATE_BASELINE_NOT_PROVABLE");
-  }
-  if (await pathExists(join(bookDir, "story", "snapshots", String(params.pendingChapterNumber)))) {
-    throw new Error("PRESERVED_CANDIDATE_TERMINAL_SNAPSHOT_CONFLICT");
   }
   const [baselineManifest, currentManifest] = await Promise.all([
     readFile(join(bookDir, "story", "snapshots", String(baselineChapterNumber), "state", "manifest.json"), "utf-8"),
     readFile(join(bookDir, "story", "state", "manifest.json"), "utf-8"),
   ]).then((values) => values.map((value) => JSON.parse(value) as { readonly lastAppliedChapter?: unknown }));
-  if (baselineManifest.lastAppliedChapter !== baselineChapterNumber || currentManifest.lastAppliedChapter !== baselineChapterNumber) {
+  if (baselineManifest.lastAppliedChapter !== baselineChapterNumber
+    || currentManifest.lastAppliedChapter !== (hasTerminalArtifacts ? params.pendingChapterNumber : baselineChapterNumber)) {
     throw new Error("PRESERVED_CANDIDATE_BASELINE_NOT_PROVABLE");
   }
 
   const padded = String(params.pendingChapterNumber).padStart(4, "0");
   const evidenceDir = join(bookDir, "story", "runtime", "bounded-autonomous", `chapter-${padded}`);
-  if ((await readdir(evidenceDir)).some((name) => /^preserved-review-resume-\d{3}\.json$/u.test(name))) {
+  if (!hasTerminalArtifacts && (await readdir(evidenceDir)).some((name) => /^preserved-review-resume-\d{3}\.json$/u.test(name))) {
     throw new Error("PRESERVED_CANDIDATE_RECOVERY_ALREADY_ATTEMPTED");
   }
   const initialBytes = await readFile(join(evidenceDir, "initial.md"));
@@ -1187,7 +1280,7 @@ async function resolvePreservedBoundedReviewResumePlan(params: {
   const titleAuthority = titleAuthorities[0]!;
   const historicalRoleUsage = parseRecoveryUsage(evidence.usage_by_role ?? {}, "usage_by_role");
   if (titleAuthority.usage) historicalRoleUsage.writer = parseRecoveryUsage({ writer: titleAuthority.usage }, "titleAuthorityUsage").writer!;
-  return {
+  const plan: FormalPreservedBoundedReviewResumePlan = {
     kind: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME", recoveryClass: "PRESERVED_BOUNDED_REVIEW",
     bookId: params.bookId, jobId: params.jobId, pendingChapterNumber: params.pendingChapterNumber,
     baselineChapterNumber, productionMapSha256: sha256(mapBytes),
@@ -1196,6 +1289,15 @@ async function resolvePreservedBoundedReviewResumePlan(params: {
     initialReviews, invalidReviewerRoles,
     historicalRoleUsage,
   };
+  return hasTerminalArtifacts
+    ? attachPreservedTerminalReconciliation({
+        bookDir,
+        evidenceDir,
+        chapterFile: formalChapterFiles[0]!,
+        indexEntry: terminalIndexEntries[0]!,
+        plan,
+      })
+    : plan;
 }
 
 async function resolveStateSettlementProof(params: {
@@ -1974,27 +2076,49 @@ export async function createAutonomousPipelineActions<
   if (pending && pending.number !== latest) {
     throw new Error("AUTONOMOUS_AUDIT_FAILED_CHAPTER_NOT_LATEST");
   }
-  const approve = async (chapterNumber: number) => {
+  const verifyChapterTerminal = async (chapterNumber: number, status: "approved" | "accepted-with-findings") => {
     const latest = await params.state.loadChapterIndex(params.bookId);
+    const matches = latest.filter((chapter) => chapter.number === chapterNumber);
+    if (matches.length !== 1 || matches[0]!.status !== status) {
+      throw new Error("AUTONOMOUS_CHAPTER_TERMINAL_PROMOTION_FAILED");
+    }
+    return { chapterNumber, status } as const;
+  };
+  const promoteChapterTerminal = async (chapterNumber: number, status: "approved" | "accepted-with-findings") => {
+    const latest = await params.state.loadChapterIndex(params.bookId);
+    const matches = latest.filter((chapter) => chapter.number === chapterNumber);
+    if (matches.length !== 1) throw new Error("AUTONOMOUS_CHAPTER_TERMINAL_PROMOTION_FAILED");
+    const current = matches[0]!;
+    const promotable = status === "approved"
+      ? current.status === "ready-for-review" || current.status === "audit-failed" || current.status === "approved"
+      : current.status === "ready-for-review" || current.status === "audit-failed" || current.status === "accepted-with-findings";
+    if (!promotable) throw new Error("AUTONOMOUS_CHAPTER_TERMINAL_PROMOTION_CONFLICT");
+    if (current.status === status) return verifyChapterTerminal(chapterNumber, status);
     const now = new Date().toISOString();
     await params.state.saveChapterIndex(params.bookId, latest.map((chapter) => chapter.number === chapterNumber
-      ? { ...chapter, status: "approved" as const, updatedAt: now }
+      ? { ...chapter, status, updatedAt: now }
       : chapter));
+    return verifyChapterTerminal(chapterNumber, status);
   };
   return {
     ...(pending ? { pendingChapterNumber: pending.number } : {}),
     ...(pending ? {
       resumePendingChapter: async (options?: { readonly safeReplayStage?: string }) => {
         const result = await params.pipeline.resumeAuditFailedChapterBounded(params.bookId, pending.number, options);
-        if (result.status === "approved") await approve(pending.number);
+        if (result.status === "approved" || result.status === "accepted-with-findings") {
+          await promoteChapterTerminal(pending.number, result.status);
+        }
         return result;
       },
     } : {}),
     runChapter: async (wordCount?: number) => {
       const result = await params.pipeline.writeNextChapter(params.bookId, wordCount);
-      if (result.status === "ready-for-review") await approve(result.chapterNumber);
+      if (result.status === "ready-for-review") await promoteChapterTerminal(result.chapterNumber, "approved");
+      if (result.status === "accepted-with-findings") await promoteChapterTerminal(result.chapterNumber, "accepted-with-findings");
       return result;
     },
+    promoteChapterTerminal,
+    verifyChapterTerminal,
   };
 }
 
@@ -2003,6 +2127,7 @@ export async function runBoundedAutonomousScope(params: {
   readonly mode: ProductionMode;
   readonly getNextChapter: () => Promise<number>;
   readonly pendingChapterNumber?: number;
+  readonly recoveryScopeChapterNumber?: number;
   readonly resumePendingChapter?: (options?: { readonly safeReplayStage?: string }) => Promise<{
     readonly status: string;
     readonly chapterNumber: number;
@@ -2022,8 +2147,9 @@ export async function runBoundedAutonomousScope(params: {
   readonly providerRecovery?: AutonomousProviderRecovery;
 }): Promise<AutonomousRunProgress> {
   const initialNext = await params.getNextChapter();
-  const scope = resolveProductionScope(params.map, initialNext, params.mode);
-  const jobId = deriveAutonomousJobIdentity({ map: params.map, mode: params.mode, nextChapter: initialNext });
+  const scopeChapterNumber = params.recoveryScopeChapterNumber ?? initialNext;
+  const scope = resolveProductionScope(params.map, scopeChapterNumber, params.mode);
+  const jobId = deriveAutonomousJobIdentity({ map: params.map, mode: params.mode, nextChapter: scopeChapterNumber });
   let completedThisRun = 0;
 
   const project = (
@@ -2172,7 +2298,7 @@ export async function runBoundedAutonomousScope(params: {
     }
   };
 
-  if (scope.complete) {
+  if (scope.complete && !params.resumePendingChapter) {
     const complete = project("BOOK_COMPLETE", initialNext);
     await params.persistProgress(complete);
     return complete;
@@ -2206,6 +2332,9 @@ export async function runBoundedAutonomousScope(params: {
       const blocked = project("REVIEW_DECISION_CONTRADICTORY", initialNext, "FINAL_REVIEW_DECISION_CONTRADICTORY", { chapterNumber: params.pendingChapterNumber ?? initialNext });
       await params.persistProgress(blocked);
       return blocked;
+    }
+    if (resumed.status !== "approved" && resumed.status !== "accepted-with-findings") {
+      throw new Error("AUTONOMOUS_RECOVERED_CHAPTER_NOT_TERMINAL");
     }
     await params.persistProgress(project("RUNNING", initialNext));
   }

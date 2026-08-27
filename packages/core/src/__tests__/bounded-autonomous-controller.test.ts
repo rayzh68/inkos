@@ -200,6 +200,59 @@ describe("bounded autonomous production controller", () => {
         .rejects.toThrow("PRESERVED_CANDIDATE_TITLE_AUTHORITY_NOT_PROVABLE");
       await writeFile(artifactPath, titleArtifact);
 
+      const finalCandidate = "CANDIDATE_A after bounded review.";
+      const finalCandidateSha = createHash("sha256").update(finalCandidate).digest("hex");
+      const terminalReceiptPath = join(evidenceDir, "preserved-review-resume-001.json");
+      const terminalCandidatePath = join(evidenceDir, "preserved-review-resume-001-revision_1.md");
+      const terminalChapterPath = join(bookDir, "chapters", "0006_Generic_Six.md");
+      const terminalIndex = [...index, {
+        number: 6, title: "Generic Six", status: "approved", wordCount: finalCandidate.length,
+        createdAt: "2026-08-27T00:00:00.000Z", updatedAt: "2026-08-27T00:00:03.000Z", auditIssues: [], lengthWarnings: [],
+      }];
+      const terminalManifest = JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 6 });
+      await Promise.all([
+        writeFile(join(bookDir, "book.json"), JSON.stringify({ id: "book", language: "en" })),
+        writeFile(terminalCandidatePath, finalCandidate),
+        writeFile(terminalReceiptPath, JSON.stringify({
+          schema_version: "1.0", chapter_number: 6, status: "APPROVED", grade: "A", revision_count: 1,
+          hold_reason: null, invalid_reviewer_role: null,
+          best_candidate: { label: "REVISION_1", sha256: finalCandidateSha, combined_score: 94 },
+          candidates: [
+            { label: "INITIAL", sha256: candidateSha, combined_score: 81, reviews: [logic, invalidCommercial] },
+            { label: "REVISION_1", sha256: finalCandidateSha, combined_score: 94, reviews: [] },
+          ],
+          usage_by_role: {},
+        }, null, 2)),
+        writeFile(terminalChapterPath, `# Chapter 6: Generic Six\n\n${finalCandidate}`),
+        writeFile(join(bookDir, "chapters", "index.json"), JSON.stringify(terminalIndex)),
+        mkdir(join(bookDir, "story", "snapshots", "6", "state"), { recursive: true }),
+      ]);
+      await Promise.all([
+        writeFile(join(bookDir, "story", "state", "manifest.json"), terminalManifest),
+        writeFile(join(bookDir, "story", "snapshots", "6", "state", "manifest.json"), terminalManifest),
+        writeFile(runtimePath, JSON.stringify({
+          ...originalRuntime, status: "RUNNING", nextChapter: 6,
+          recoveryOwnership: {
+            kind: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME", recoveryClass: "PRESERVED_BOUNDED_REVIEW",
+            bookId: "book", jobId, pendingChapterNumber: 6,
+          },
+        })),
+      ]);
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .resolves.toMatchObject({
+          kind: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME",
+          terminalReconciliation: { status: "approved", chapterFile: "0006_Generic_Six.md", candidateSha256: finalCandidateSha },
+        });
+      await writeFile(terminalChapterPath, "# Chapter 6: Generic Six\n\nTAMPERED");
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("PRESERVED_CANDIDATE_TERMINAL_RECONCILIATION_CONFLICT");
+      await Promise.all([
+        rm(terminalReceiptPath), rm(terminalCandidatePath), rm(terminalChapterPath), rm(join(bookDir, "story", "snapshots", "6"), { recursive: true }),
+        writeFile(join(bookDir, "chapters", "index.json"), JSON.stringify(index)),
+        writeFile(join(bookDir, "story", "state", "manifest.json"), manifest),
+        writeFile(runtimePath, JSON.stringify(originalRuntime)),
+      ]);
+
       const runtimeEvidence = JSON.parse(await readFile(runtimePath, "utf-8"));
       await writeFile(runtimePath, JSON.stringify({ ...runtimeEvidence, providerAttemptHistory: [{
         transportAttemptId: "ambiguous", logicalStepId: `provider-step-${"9".repeat(64)}`, chapterNumber: 6,
@@ -235,7 +288,13 @@ describe("bounded autonomous production controller", () => {
       },
       pipeline: {
         resumeAuditFailedChapterBounded: async () => { calls.push("resume:4"); return { status: "approved", chapterNumber: 4 }; },
-        writeNextChapter: async () => { calls.push(`write:${next}`); const chapterNumber = next; next += 1; return { status: "ready-for-review", chapterNumber }; },
+        writeNextChapter: async () => {
+          calls.push(`write:${next}`);
+          const chapterNumber = next;
+          chapters.push({ number: chapterNumber, title: `Chapter ${chapterNumber}`, status: "ready-for-review", wordCount: 1, createdAt: "now", updatedAt: "now", auditIssues: [], lengthWarnings: [] });
+          next += 1;
+          return { status: "ready-for-review", chapterNumber };
+        },
       },
     });
     const result = await runBoundedAutonomousScope({
@@ -266,6 +325,24 @@ describe("bounded autonomous production controller", () => {
     });
     expect(calls).toEqual(["write:5", "write:6"]);
     expect(result.status).toBe("BOOK_COMPLETE");
+  });
+
+  it("refuses scope completion when a recovered chapter remains non-terminal", async () => {
+    let next = 7;
+    await expect(runBoundedAutonomousScope({
+      map: {
+        ...map,
+        totalChapters: 6,
+        volumes: [{ volumeId: "volume-001", volumeNumber: 1, title: "One", startChapter: 1, endChapter: 6, chapterCount: 6 }],
+      },
+      mode: "current-volume",
+      getNextChapter: async () => next,
+      pendingChapterNumber: 6,
+      resumePendingChapter: async () => ({ status: "ready-for-review", chapterNumber: 6 }),
+      runChapter: async () => { next += 1; return { status: "ready-for-review" }; },
+      shouldStop: () => false,
+      persistProgress: async () => undefined,
+    })).rejects.toThrow("AUTONOMOUS_RECOVERED_CHAPTER_NOT_TERMINAL");
   });
 
   it("uses the pending chapter identity for recovery while preserving the next cursor", async () => {

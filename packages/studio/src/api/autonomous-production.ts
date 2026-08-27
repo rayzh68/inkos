@@ -42,8 +42,12 @@ export async function resolveOfflineFinalizationPlan(params: {
     && ownership.jobId === params.runtime?.jobId
     && ownership.pendingChapterNumber === params.pendingChapter
     && ["RUNNING", "WAITING_PROVIDER_RETRY", "PAUSED_PROVIDER_UNAVAILABLE", "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", "PAUSED_DETERMINISTIC_PROVIDER_ERROR"].includes(params.runtime?.status ?? "");
+  const terminalPreservedRestartWindow = ownedReentry
+    && ownership?.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
+    && params.runtime?.nextChapter === params.pendingChapter
+    && params.nextChapter === params.pendingChapter + 1;
   if (!params.runtime?.jobId || (!ownedReentry && !["REVIEW_EXHAUSTED", "BLOCKED_CRITICAL_FINDINGS", "REVIEW_OUTPUT_INVALID", "HELD_AFTER_TWO_REVISIONS"].includes(params.runtime.status))
-    || params.runtime.nextChapter !== params.nextChapter) return null;
+    || (params.runtime.nextChapter !== params.nextChapter && !terminalPreservedRestartWindow)) return null;
   return resolveFormalPendingChapterRecoveryPlan({
     projectRoot: params.projectRoot,
     bookId: params.bookId,
