@@ -2760,8 +2760,9 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       loadProductionRoleModels(),
     ]);
     const pending = chapters.find((chapter) => chapter.status === "audit-failed");
-    const offlineFinalizationPlan = pending
-      ? await resolveOfflineFinalizationPlan({ projectRoot: root, bookId, pendingChapter: pending.number, nextChapter, runtime }).catch(() => null)
+    const recoveryChapter = pending?.number ?? runtime?.nextChapter;
+    const offlineFinalizationPlan = recoveryChapter
+      ? await resolveOfflineFinalizationPlan({ projectRoot: root, bookId, pendingChapter: recoveryChapter, nextChapter, runtime }).catch(() => null)
       : null;
     const view = projectAutonomousProductionView({
       map,
@@ -3031,7 +3032,9 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       map: productionMap,
       mode,
       getNextChapter: () => state.getNextChapterNumber(bookId),
-      ...(actions.pendingChapterNumber !== undefined ? { pendingChapterNumber: actions.pendingChapterNumber } : {}),
+      ...(admittedOfflineFinalizationPlan?.pendingChapterNumber !== undefined
+        ? { pendingChapterNumber: admittedOfflineFinalizationPlan.pendingChapterNumber }
+        : actions.pendingChapterNumber !== undefined ? { pendingChapterNumber: actions.pendingChapterNumber } : {}),
       shouldStop: () => autonomousJobs.shouldStop(bookId),
       ...(admittedOfflineFinalizationPlan?.kind === "FORMAL_BOUNDED_STATE_REBASELINE"
         ? { resumePendingChapter: async () => {
@@ -3048,6 +3051,19 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           });
           return result;
         } }
+        : admittedOfflineFinalizationPlan?.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
+          ? { resumePendingChapter: async () => {
+            if (durableClaimFailure) throw durableClaimFailure;
+            const result = await pipeline.resumePreservedBoundedCandidateReview(admittedOfflineFinalizationPlan);
+            if (durableClaimFailure) throw durableClaimFailure;
+            if (result.status === "ready-for-review" || result.status === "accepted-with-findings") {
+              await saveAutonomousRuntime(root, bookId, {
+                jobId, status: "RUNNING", mode, nextChapter: startedNextChapter + 1,
+                updatedAt: new Date().toISOString(), recoveryOwnership: null,
+              });
+            }
+            return result;
+          } }
         : actions.resumePendingChapter ? { resumePendingChapter: async (options?: { readonly safeReplayStage?: string }) => {
         if (durableClaimFailure) throw durableClaimFailure;
         const result = await actions.resumePendingChapter!(options);
@@ -3116,6 +3132,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         const paused = result.status.startsWith("PAUSED_")
           || result.status === "REVIEW_EXHAUSTED"
           || result.status === "HELD_AFTER_TWO_REVISIONS"
+          || result.status === "REVIEW_OUTPUT_INVALID"
           || result.status === "REVIEW_DECISION_CONTRADICTORY"
           || result.status === "BLOCKED_CRITICAL_FINDINGS";
         broadcast(paused ? "autonomous:paused" : "autonomous:complete", { bookId, status: result.status, nextChapter: result.nextChapter });

@@ -31,7 +31,7 @@ import {
   readChapterVersion,
   saveChapterUserBrief,
 } from "../state/chapter-workspace.js";
-import { correctLegacyPendingChapterArtifactBindings, createAutonomousProviderExecution, deriveAutonomousJobIdentity, resolveFormalPendingChapterRecoveryPlan } from "../production/bounded-autonomous-controller.js";
+import { correctLegacyPendingChapterArtifactBindings, createAutonomousProviderExecution, deriveAutonomousJobIdentity, resolveFormalPendingChapterRecoveryPlan, type FormalPreservedBoundedReviewResumePlan } from "../production/bounded-autonomous-controller.js";
 import type { BoundedReviewResult } from "../pipeline/bounded-review.js";
 
 const require = createRequire(import.meta.url);
@@ -393,6 +393,99 @@ describe("PipelineRunner", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
+
+  it("persists a generic Chapter 6 from preserved review evidence without creative Writer generation", async () => {
+    const { root, runner, state, bookId } = await createRunnerFixture({ boundedAutonomousReview: true });
+    const bookDir = state.bookDir(bookId);
+    const storyDir = join(bookDir, "story");
+    const chaptersDir = join(bookDir, "chapters");
+    const candidate = "CANDIDATE_A requires one bounded repair.";
+    const revised = "CANDIDATE_A after the bounded repair.";
+    const candidateSha = createHash("sha256").update(candidate).digest("hex");
+    const logicDimensions = {
+      blueprint_transition: 80, causal_logic: 70, canon_continuity: 90, character_motivation: 90,
+      state_inheritance: 90, hooks_disclosure: 90, narrative_clarity: 90,
+    };
+    const plan: FormalPreservedBoundedReviewResumePlan = {
+      kind: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME", recoveryClass: "PRESERVED_BOUNDED_REVIEW",
+      bookId, jobId: "generic-job", pendingChapterNumber: 6, baselineChapterNumber: 5,
+      productionMapSha256: "a".repeat(64),
+      candidate: { content: candidate, sha256: candidateSha, title: "Generic Six", titleAuthorityLogicalStepId: `provider-step-${"b".repeat(64)}`, titleAuthorityArtifactSha256: "c".repeat(64) },
+      reviewEvidence: { relativePath: "story/runtime/bounded-autonomous/chapter-0006/review.json", sha256: "d".repeat(64), runRelativePath: "story/runtime/chapter-0006.run.json", runSha256: "e".repeat(64) },
+      initialReviews: {
+        "logic-canon-auditor": {
+          reviewerRole: "logic-canon-auditor", provider: "test", model: "logic", totalScore: 81,
+          dimensionScores: logicDimensions, decision: "REVISION_REQUIRED",
+          findings: [{ findingId: "logic-1", severity: "MAJOR", evidence: "repair", impact: "causal_logic", requiredOutcome: "fix" }],
+          reviewedCandidateSha: candidateSha, reviewedAt: "2026-08-27T00:00:00.000Z", tokenUsage: ZERO_USAGE,
+        },
+      },
+      invalidReviewerRoles: ["commercial-reader"], historicalRoleUsage: {},
+    };
+    try {
+      await Promise.all([
+        writeFile(join(storyDir, "current_state.md"), createStateCard({ chapter: 5, location: "Gate", protagonistState: "Ready", goal: "Proceed", conflict: "Delay" })),
+        writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n"),
+        ...Array.from({ length: 5 }, (_, index) => writeFile(join(chaptersDir, `${String(index + 1).padStart(4, "0")}_Chapter_${index + 1}.md`), `# Chapter ${index + 1}\n\nSettled.`)),
+      ]);
+      await state.saveChapterIndex(bookId, Array.from({ length: 5 }, (_, index) => ({
+        number: index + 1, title: `Chapter ${index + 1}`, status: "approved" as const, wordCount: 8,
+        createdAt: "2026-08-27T00:00:00.000Z", updatedAt: "2026-08-27T00:00:00.000Z", auditIssues: [], lengthWarnings: [],
+      })));
+      const writeChapter = vi.spyOn(WriterAgent.prototype, "writeChapter");
+      const invalidCommercial = {
+        reviewerRole: "commercial-reader" as const, provider: "test", model: "reader", totalScore: 0,
+        dimensionScores: {}, decision: "INVALID_OUTPUT" as const,
+        findings: [{ findingId: "commercial-invalid", severity: "CRITICAL" as const, evidence: "invalid", impact: "contract", requiredOutcome: "retry" }],
+        reviewedCandidateSha: candidateSha, reviewedAt: "2026-08-27T00:00:00.000Z", tokenUsage: ZERO_USAGE,
+      };
+      const commercial = vi.spyOn(CommercialReaderAgent.prototype, "reviewChapter").mockResolvedValue(invalidCommercial);
+      const validCommercial = {
+        reviewerRole: "commercial-reader" as const, provider: "test", model: "reader", totalScore: 90,
+        dimensionScores: { opening_hook: 90, pacing_tension: 90, emotional_investment: 90, plot_clarity: 90, dialogue_appeal: 90, western_cultural_naturalness: 90, commercial_appeal: 90, ending_hook: 90 },
+        decision: "APPROVED" as const, findings: [], reviewedCandidateSha: candidateSha, reviewedAt: "2026-08-27T00:00:00.000Z", tokenUsage: ZERO_USAGE,
+      };
+      const logic = vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockResolvedValue(createAuditResult({
+        passed: true, overallScore: 92,
+        dimensionScores: { blueprint_transition: 92, causal_logic: 92, canon_continuity: 92, character_motivation: 92, state_inheritance: 92, hooks_disclosure: 92, narrative_clarity: 92 },
+      }));
+      const reviser = vi.spyOn(ReviserAgent.prototype, "reviseChapter").mockResolvedValue(createReviseOutput({ revisedContent: revised, wordCount: revised.length }));
+      vi.spyOn(ChapterAnalyzerAgent.prototype, "analyzeChapter").mockResolvedValue(createAnalyzedOutput({
+        chapterNumber: 6, title: "Generic Six", content: revised, wordCount: revised.length,
+        chapterSummary: "| 6 | Generic Six | Hero | Repaired | State advances | hook | tense | mainline |",
+      }));
+
+      const executePreserved = () => (runner as unknown as {
+        _executeNextChapterLocked: (book: string, words: number | undefined, temperature: number | undefined, context: string | undefined, recovery: FormalPreservedBoundedReviewResumePlan) => Promise<Awaited<ReturnType<PipelineRunner["writeNextChapter"]>>>;
+      })._executeNextChapterLocked(bookId, undefined, undefined, undefined, plan);
+
+      const invalidResult = await executePreserved();
+      expect(invalidResult.status).toBe("review-output-invalid");
+      expect(commercial).toHaveBeenCalledTimes(2);
+      expect(writeChapter).not.toHaveBeenCalled();
+      expect((await state.loadChapterIndex(bookId))).toHaveLength(5);
+      expect((await readdir(chaptersDir)).some((name) => name.startsWith("0006_"))).toBe(false);
+      await expect(stat(join(storyDir, "snapshots", "6"))).rejects.toMatchObject({ code: "ENOENT" });
+
+      commercial.mockReset().mockResolvedValue(validCommercial);
+      const result = await executePreserved();
+
+      expect(result.status).toBe("ready-for-review");
+      expect(writeChapter).not.toHaveBeenCalled();
+      expect(commercial).toHaveBeenCalledTimes(1);
+      expect(reviser).toHaveBeenCalledWith(bookDir, candidate, 6, expect.any(Array), "auto", expect.any(String), expect.any(Object));
+      expect(logic).toHaveBeenCalledTimes(1);
+      expect((await state.loadChapterIndex(bookId)).at(-1)).toMatchObject({ number: 6, title: "Generic Six", status: "ready-for-review" });
+      const chapterName = (await readdir(chaptersDir)).find((name) => name.startsWith("0006_"));
+      expect(await readFile(join(chaptersDir, chapterName!), "utf-8")).toContain(revised);
+      expect(await stat(join(storyDir, "snapshots", "6"))).toBeTruthy();
+      expect((await readdir(join(storyDir, "runtime", "bounded-autonomous", "chapter-0006"))).filter((name) => /^preserved-review-resume-\d{3}\.json$/u.test(name))).toEqual([
+        "preserved-review-resume-001.json", "preserved-review-resume-002.json",
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
 
   it("resets Chapter 7 preparation telemetry and emits APPROVED exactly once only after terminal approval", async () => {
     const stages: Array<{ stage: string; role: string }> = [];
@@ -5473,13 +5566,14 @@ describe("PipelineRunner", () => {
         stateSettlement: { snapshotId: "chapter-4-state-b" },
         provenance: { revisionCount: 2, logicReviewCount: 2, commercialReviewCount: 1 },
       });
-      expect(plan?.rescue.candidateBodySha256).toBe(createHash("sha256").update(candidateBody).digest("hex"));
+      if (!plan || plan.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME") throw new Error("expected offline recovery plan");
+      expect(plan.rescue.candidateBodySha256).toBe(createHash("sha256").update(candidateBody).digest("hex"));
       const runtimePath = join(target.bookDir, "story", "runtime", "bounded-autonomous", "production-state.json");
       const mapPath = join(target.bookDir, "story", "outline", "book-production-map.json");
       const indexPath = join(target.bookDir, "chapters", "index.json");
       const evidencePath = join(target.evidenceDir, "resume-review.json");
-      const bindingPath = join(responseDir, `${plan!.bindings[0]!.logicalStepId}.binding.json`);
-      const finalBindingPath = join(responseDir, `${plan!.bindings[1]!.logicalStepId}.binding.json`);
+      const bindingPath = join(responseDir, `${plan.bindings[0]!.logicalStepId}.binding.json`);
+      const finalBindingPath = join(responseDir, `${plan.bindings[1]!.logicalStepId}.binding.json`);
       const [runtimeBytes, mapBytes, indexBytes, evidenceBytes, bindingBytes, finalBindingBytes] = await Promise.all([
         readFile(runtimePath), readFile(mapPath), readFile(indexPath), readFile(evidencePath), readFile(bindingPath), readFile(finalBindingPath),
       ]);

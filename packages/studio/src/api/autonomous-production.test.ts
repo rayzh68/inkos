@@ -28,6 +28,42 @@ const catalog = [
 ];
 
 describe("autonomous production Studio projection", () => {
+  it("projects an unindexed preserved candidate as resumable without prose regeneration", () => {
+    const runtime = {
+      jobId: "generic-job", status: "HELD_AFTER_TWO_REVISIONS", mode: "current-volume" as const,
+      nextChapter: 6, updatedAt: "now",
+    };
+    const view = projectAutonomousProductionView({
+      map, targetChapters: 156, nextChapter: 6,
+      chapters: [1, 2, 3, 4, 5].map((number) => ({ number, status: "approved" })),
+      config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini", reviser: "gpt", "observer-reflector": "flash" } },
+      catalog, runtime,
+      offlineFinalizationPlan: {
+        kind: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME", recoveryClass: "PRESERVED_BOUNDED_REVIEW",
+        bookId: "book", jobId: "generic-job", pendingChapterNumber: 6, baselineChapterNumber: 5,
+        productionMapSha256: "a".repeat(64),
+        candidate: { content: "CANDIDATE_A", sha256: "b".repeat(64), title: "Generic Six", titleAuthorityLogicalStepId: `provider-step-${"c".repeat(64)}`, titleAuthorityArtifactSha256: "d".repeat(64) },
+        reviewEvidence: { relativePath: "review.json", sha256: "e".repeat(64), runRelativePath: "run.json", runSha256: "f".repeat(64) },
+        initialReviews: { "logic-canon-auditor": {
+          reviewerRole: "logic-canon-auditor", provider: "test", model: "logic", totalScore: 80,
+          dimensionScores: {}, decision: "REVISION_REQUIRED", findings: [], reviewedCandidateSha: "b".repeat(64), reviewedAt: "now",
+        } },
+        invalidReviewerRoles: ["commercial-reader"], historicalRoleUsage: {},
+      },
+      active: false, budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
+    });
+
+    expect(view.runtimeStatus).toBe("RECOVERY_READY_PRESERVED_BOUNDED_REVIEW");
+    expect(view.startEnabled).toBe(true);
+    expect(view.runtimeBlockers).not.toContain("REVIEW_EXHAUSTED");
+    expect(view.finalReviewRecovery).toMatchObject({
+      chapter: 6, recoveryMode: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME",
+      rescueCandidate: "PRESERVED", existingValidReviewers: ["logic-canon-auditor"],
+      invalidReviewerRoles: ["commercial-reader"], writerRegeneration: false,
+      additionalWriterCalls: 0, additionalRevisionAllowed: true,
+    });
+  });
+
   it("verifies preserved rescue and passed final-review artifacts without changing them", async () => {
     const root = await mkdtemp(join(tmpdir(), "inkos-offline-finalization-view-"));
     const bookDir = join(root, "books", "book");

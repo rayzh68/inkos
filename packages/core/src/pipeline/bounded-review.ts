@@ -178,6 +178,8 @@ function usageAdd(left: RoleTokenUsage | undefined, right: RoleTokenUsage | unde
 
 export async function runBoundedReviewCycle(params: {
   readonly initialContent: string;
+  /** Formally validated reviews bound to the exact INITIAL candidate. */
+  readonly initialReviews?: Partial<Readonly<Record<ReviewerRole, ScoredReview>>>;
   readonly reviewLogic: Reviewer;
   readonly reviewCommercial: Reviewer;
   readonly revise: (
@@ -215,8 +217,10 @@ export async function runBoundedReviewCycle(params: {
       : commercial.decision === "INVALID_OUTPUT" ? "commercial-reader" : undefined;
 
   const initialSha = sha256(content);
-  let logic = await reviewCandidate("LOGIC_REVIEW", params.reviewLogic, initialSha);
-  let commercial = await reviewCandidate("READER_REVIEW", params.reviewCommercial, initialSha);
+  let logic = params.initialReviews?.["logic-canon-auditor"]
+    ?? await reviewCandidate("LOGIC_REVIEW", params.reviewLogic, initialSha);
+  let commercial = params.initialReviews?.["commercial-reader"]
+    ?? await reviewCandidate("READER_REVIEW", params.reviewCommercial, initialSha);
 
   const appendCandidate = (label: BoundedCandidate["label"]) => {
     const candidate: BoundedCandidate = {

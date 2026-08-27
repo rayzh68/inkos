@@ -23,8 +23,8 @@ import {
 export const AUTONOMOUS_BUDGET_NOT_CONFIGURED = { status: "BUDGET_NOT_CONFIGURED" } as const;
 
 interface AutonomousRecoveryOwnershipProjection {
-  readonly kind: "FORMAL_OFFLINE_FINALIZATION" | "FORMAL_BOUNDED_STATE_REBASELINE";
-  readonly recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED" | "FAILED_REENTRY";
+  readonly kind: "FORMAL_OFFLINE_FINALIZATION" | "FORMAL_BOUNDED_STATE_REBASELINE" | "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME";
+  readonly recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED" | "FAILED_REENTRY" | "PRESERVED_BOUNDED_REVIEW";
   readonly bookId: string;
   readonly jobId: string;
   readonly pendingChapterNumber: number;
@@ -42,8 +42,8 @@ export async function resolveOfflineFinalizationPlan(params: {
     && ownership.jobId === params.runtime?.jobId
     && ownership.pendingChapterNumber === params.pendingChapter
     && ["RUNNING", "WAITING_PROVIDER_RETRY", "PAUSED_PROVIDER_UNAVAILABLE", "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", "PAUSED_DETERMINISTIC_PROVIDER_ERROR"].includes(params.runtime?.status ?? "");
-  if (!params.runtime?.jobId || (!ownedReentry && !["REVIEW_EXHAUSTED", "BLOCKED_CRITICAL_FINDINGS"].includes(params.runtime.status))
-    || params.nextChapter !== params.pendingChapter + 1 || params.runtime.nextChapter !== params.nextChapter) return null;
+  if (!params.runtime?.jobId || (!ownedReentry && !["REVIEW_EXHAUSTED", "BLOCKED_CRITICAL_FINDINGS", "REVIEW_OUTPUT_INVALID", "HELD_AFTER_TWO_REVISIONS"].includes(params.runtime.status))
+    || params.runtime.nextChapter !== params.nextChapter) return null;
   return resolveFormalPendingChapterRecoveryPlan({
     projectRoot: params.projectRoot,
     bookId: params.bookId,
@@ -241,34 +241,41 @@ export function projectAutonomousProductionView(params: {
   if (repairNeedsReconciliation) blockers.push("STATE_REPAIR_RECONCILIATION_REQUIRED");
   const auditFailed = params.chapters.find((chapter) => chapter.status === "audit-failed");
   const recoveryOwnership = params.runtime?.recoveryOwnership;
-  const formalRecoveryPlan = auditFailed
-    && params.offlineFinalizationPlan
+  const formalRecoveryPlan = params.offlineFinalizationPlan
     && params.offlineFinalizationPlan.bookId === params.map.bookId
     && params.offlineFinalizationPlan.jobId === params.runtime?.jobId
-    && params.offlineFinalizationPlan.pendingChapterNumber === auditFailed.number
+    && (params.offlineFinalizationPlan.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
+      ? params.offlineFinalizationPlan.pendingChapterNumber === params.nextChapter
+      : params.offlineFinalizationPlan.pendingChapterNumber === auditFailed?.number)
       ? params.offlineFinalizationPlan
       : undefined;
-  const finalReviewRecovery = auditFailed && formalRecoveryPlan
+  const finalReviewRecovery = formalRecoveryPlan
       ? {
           recoveryMode: formalRecoveryPlan.kind,
-          chapter: auditFailed.number,
+          chapter: formalRecoveryPlan.pendingChapterNumber,
           rescueCandidate: "PRESERVED" as const,
           rescueGeneration: "REUSED" as const,
-          rescueArtifactIdentity: `VERIFIED_CHAPTER_${String(auditFailed.number).padStart(3, "0")}` as const,
-          finalReview: "PRESERVED" as const,
-          finalReviewDecision: formalRecoveryPlan.finalReview.decision,
+          rescueArtifactIdentity: `VERIFIED_CHAPTER_${String(formalRecoveryPlan.pendingChapterNumber).padStart(3, "0")}` as const,
+          finalReview: formalRecoveryPlan.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME" ? "RESUME_REQUIRED" as const : "PRESERVED" as const,
+          finalReviewDecision: formalRecoveryPlan.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME" ? null : formalRecoveryPlan.finalReview.decision,
+          ...(formalRecoveryPlan.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME" ? {
+            existingValidReviewers: Object.keys(formalRecoveryPlan.initialReviews),
+            invalidReviewerRoles: formalRecoveryPlan.invalidReviewerRoles.map((role) => String(role)),
+          } : {}),
           writerRegeneration: false as const,
           normalRevisionRegeneration: false as const,
           rescueRevisionRegeneration: false as const,
           nextAction: formalRecoveryPlan.kind === "FORMAL_OFFLINE_FINALIZATION"
-            ? `FINALIZE_CHAPTER_${String(auditFailed.number).padStart(3, "0")}_AND_CONTINUE` as const
-            : `REBASELINE_CHAPTER_${String(auditFailed.number).padStart(3, "0")}_STATE_AND_CONTINUE` as const,
-          additionalWriterCalls: formalRecoveryPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : 2 as const,
-          additionalReviserCalls: 0 as const,
-          additionalReviewerCalls: formalRecoveryPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : 1 as const,
-          normalProviderCalls: formalRecoveryPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : 3 as const,
+            ? `FINALIZE_CHAPTER_${String(formalRecoveryPlan.pendingChapterNumber).padStart(3, "0")}_AND_CONTINUE` as const
+            : formalRecoveryPlan.kind === "FORMAL_BOUNDED_STATE_REBASELINE"
+              ? `REBASELINE_CHAPTER_${String(formalRecoveryPlan.pendingChapterNumber).padStart(3, "0")}_STATE_AND_CONTINUE` as const
+              : `RESUME_PRESERVED_CHAPTER_${String(formalRecoveryPlan.pendingChapterNumber).padStart(3, "0")}_REVIEW_AND_CONTINUE` as const,
+          additionalWriterCalls: formalRecoveryPlan.kind === "FORMAL_BOUNDED_STATE_REBASELINE" ? 2 as const : 0 as const,
+          additionalReviserCalls: formalRecoveryPlan.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME" ? 2 as const : 0 as const,
+          additionalReviewerCalls: formalRecoveryPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : formalRecoveryPlan.kind === "FORMAL_BOUNDED_STATE_REBASELINE" ? 1 as const : formalRecoveryPlan.invalidReviewerRoles.length as 1 | 2,
+          normalProviderCalls: formalRecoveryPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : formalRecoveryPlan.kind === "FORMAL_BOUNDED_STATE_REBASELINE" ? 3 as const : formalRecoveryPlan.invalidReviewerRoles.length,
           maximumProviderCalls: formalRecoveryPlan.kind === "FORMAL_OFFLINE_FINALIZATION" ? 0 as const : 6 as const,
-          additionalRevisionAllowed: false as const,
+          additionalRevisionAllowed: formalRecoveryPlan.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME",
           recoveryClass: formalRecoveryPlan.recoveryClass,
         }
       : undefined;
@@ -278,10 +285,10 @@ export function projectAutonomousProductionView(params: {
   if (!roles.reviser) blockers.push("REVISER_MODEL_NOT_CONFIGURED");
   if (!roles.observerReflector) blockers.push("OBSERVER_REFLECTOR_MODEL_NOT_CONFIGURED");
   if (params.active) blockers.push("AUTONOMOUS_JOB_ALREADY_RUNNING");
-  if ((params.runtime?.status === "REVIEW_EXHAUSTED" && !finalReviewRecovery) || params.runtime?.status === "HELD_AFTER_TWO_REVISIONS") {
+  if ((params.runtime?.status === "REVIEW_EXHAUSTED" && !finalReviewRecovery) || (params.runtime?.status === "HELD_AFTER_TWO_REVISIONS" && !finalReviewRecovery)) {
     blockers.push("REVIEW_EXHAUSTED");
   }
-  if (params.runtime?.status === "REVIEW_OUTPUT_INVALID") blockers.push("REVIEW_OUTPUT_INVALID");
+  if (params.runtime?.status === "REVIEW_OUTPUT_INVALID" && !finalReviewRecovery) blockers.push("REVIEW_OUTPUT_INVALID");
   if (params.runtime?.status === "REVIEW_DECISION_CONTRADICTORY") blockers.push("REVIEW_DECISION_CONTRADICTORY");
   if (params.runtime?.status === "BLOCKED_CRITICAL_FINDINGS" && !finalReviewRecovery) blockers.push("BLOCKED_CRITICAL_FINDINGS");
   if (recoveryOwnership?.kind === "FORMAL_BOUNDED_STATE_REBASELINE"
@@ -449,7 +456,9 @@ export function projectAutonomousProductionView(params: {
       chapter.number >= scope.currentVolume.startChapter && chapter.number <= scope.currentVolume.endChapter,
     ).length,
     runtimeStatus: finalReviewRecovery
-      ? finalReviewRecovery.recoveryMode === "FORMAL_BOUNDED_STATE_REBASELINE"
+      ? finalReviewRecovery.recoveryMode === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
+        ? "RECOVERY_READY_PRESERVED_BOUNDED_REVIEW"
+        : finalReviewRecovery.recoveryMode === "FORMAL_BOUNDED_STATE_REBASELINE"
         ? "RECOVERY_READY_BOUNDED_STATE_REBASELINE"
         : finalReviewRecovery.recoveryClass === "FAILED_REENTRY"
         ? "RECOVERY_READY_OFFLINE_FINALIZATION_AFTER_FAILED_REENTRY"

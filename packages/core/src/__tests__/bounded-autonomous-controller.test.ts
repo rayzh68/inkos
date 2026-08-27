@@ -43,6 +43,177 @@ function providerFailure(params: {
 }
 
 describe("bounded autonomous production controller", () => {
+  it("proves a generic unindexed Chapter 6 preserved-review recovery and excludes true exhaustion", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-preserved-review-"));
+    const { createHash } = await import("node:crypto");
+    try {
+      const bookDir = join(root, "books", "book");
+      const evidenceDir = join(bookDir, "story", "runtime", "bounded-autonomous", "chapter-0006");
+      const responseDir = join(bookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
+      await Promise.all([
+        mkdir(join(bookDir, "chapters"), { recursive: true }),
+        mkdir(join(bookDir, "story", "outline"), { recursive: true }),
+        mkdir(join(bookDir, "story", "state"), { recursive: true }),
+        mkdir(join(bookDir, "story", "snapshots", "5", "state"), { recursive: true }),
+        mkdir(evidenceDir, { recursive: true }),
+        mkdir(responseDir, { recursive: true }),
+      ]);
+      const recoveryMap: BookProductionMap = {
+        schemaVersion: "1.0", bookId: "book", authorityBookId: "authority", title: "Book", totalChapters: 8,
+        volumes: [{ volumeId: "volume-001", volumeNumber: 1, title: "One", startChapter: 1, endChapter: 8, chapterCount: 8 }],
+      };
+      const persistedMap = {
+        schema_version: recoveryMap.schemaVersion, book_id: recoveryMap.bookId, authority_book_id: recoveryMap.authorityBookId,
+        title: recoveryMap.title, total_chapters: recoveryMap.totalChapters,
+        volumes: recoveryMap.volumes.map((volume) => ({ volume_id: volume.volumeId, volume_number: volume.volumeNumber, title: volume.title, start_chapter: volume.startChapter, end_chapter: volume.endChapter, chapter_count: volume.chapterCount })),
+      };
+      await writeFile(join(bookDir, "story", "outline", "book-production-map.json"), JSON.stringify(persistedMap));
+      const index = Array.from({ length: 5 }, (_, offset) => ({
+        number: offset + 1, title: `Chapter ${offset + 1}`, status: "approved", wordCount: 10,
+        createdAt: "2026-08-27T00:00:00.000Z", updatedAt: "2026-08-27T00:00:00.000Z", auditIssues: [], lengthWarnings: [],
+      }));
+      await writeFile(join(bookDir, "chapters", "index.json"), JSON.stringify(index));
+      const manifest = JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 5 });
+      await writeFile(join(bookDir, "story", "state", "manifest.json"), manifest);
+      await writeFile(join(bookDir, "story", "snapshots", "5", "state", "manifest.json"), manifest);
+      const candidate = "CANDIDATE_A";
+      const candidateSha = createHash("sha256").update(candidate).digest("hex");
+      await writeFile(join(evidenceDir, "initial.md"), candidate);
+      const logicDimensions = {
+        blueprint_transition: 80, causal_logic: 70, canon_continuity: 90, character_motivation: 90,
+        state_inheritance: 90, hooks_disclosure: 90, narrative_clarity: 90,
+      };
+      const logic = {
+        reviewerRole: "logic-canon-auditor", provider: "openrouter", model: "logic", totalScore: 81,
+        dimensionScores: logicDimensions, decision: "REVISION_REQUIRED",
+        findings: [{ findingId: "logic-1", severity: "MAJOR", evidence: "fix", impact: "causal_logic", requiredOutcome: "repair" }],
+        reviewedCandidateSha: candidateSha, reviewedAt: "2026-08-27T00:00:00.000Z",
+      };
+      const invalidCommercial = {
+        reviewerRole: "commercial-reader", provider: "openrouter", model: "reader", totalScore: 0,
+        dimensionScores: {}, decision: "INVALID_OUTPUT",
+        findings: [{ findingId: "commercial-1", severity: "CRITICAL", evidence: "invalid", impact: "contract", requiredOutcome: "retry" }],
+        reviewedCandidateSha: candidateSha, reviewedAt: "2026-08-27T00:00:01.000Z",
+      };
+      const reviewPath = join(evidenceDir, "review.json");
+      const reviewEvidence = {
+        schema_version: "1.0", chapter_number: 6, status: "HELD_AFTER_TWO_REVISIONS", grade: "E",
+        revision_count: 0, hold_reason: "INVALID_OUTPUT",
+        best_candidate: { label: "INITIAL", sha256: candidateSha, combined_score: 81 },
+        candidates: [{ label: "INITIAL", sha256: candidateSha, combined_score: 81, reviews: [logic, invalidCommercial] }],
+        usage_by_role: {},
+      };
+      const originalReview = `${JSON.stringify(reviewEvidence, null, 2)}\n`;
+      await writeFile(reviewPath, originalReview);
+      await writeFile(join(bookDir, "story", "runtime", "chapter-0006.run.json"), JSON.stringify({
+        version: 1, kind: "long-fiction", id: "book:chapter-0006", stage: "chapter-6", model: "model", skillIds: ["inkos-long-writing"],
+        resumeCursor: "6", status: "needs-review", artifacts: ["story/runtime/bounded-autonomous/chapter-0006/review.json"], observations: [], updatedAt: "2026-08-27T00:00:02.000Z",
+      }));
+      const jobId = deriveAutonomousJobIdentity({ map: recoveryMap, mode: "current-volume", nextChapter: 6 });
+      const execution = createAutonomousProviderExecution({
+        projectRoot: root, bookId: "book", jobId,
+        getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "openrouter", model: "writer" }),
+      });
+      const fingerprint = "a".repeat(64);
+      const artifactPath = execution.responseArtifactPath(fingerprint, "openrouter", "writer", 6);
+      const logicalStepId = artifactPath.split(/[\\/]/u).at(-1)!.replace(/\.json$/u, "");
+      const content = `=== CHAPTER_TITLE ===\nGeneric Six\n=== CHAPTER_CONTENT ===\n${candidate}`;
+      await writeFile(artifactPath, JSON.stringify({
+        schema_version: "1.0", job_id: jobId, logical_step_id: logicalStepId, usage_identity: logicalStepId,
+        chapter_number: 6, role: "writer", stage: "WRITING", provider: "openrouter", requested_model: "writer",
+        input_fingerprint: fingerprint, response_artifact_status: "COMPLETE", content_sha256: createHash("sha256").update(content).digest("hex"),
+        response: { content }, completed_at: "2026-08-27T00:00:00.000Z",
+      }));
+      await writeFile(join(bookDir, "story", "runtime", "bounded-autonomous", "production-state.json"), JSON.stringify({
+        jobId, status: "HELD_AFTER_TWO_REVISIONS", mode: "current-volume", volumeId: "volume-001", startChapter: 6,
+        targetChapter: 8, nextChapter: 6, chapterNumber: 6, completedThisRun: 0, responseArtifactStatus: "COMPLETE",
+      }));
+
+      const plan = await resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 });
+      expect(plan).toMatchObject({
+        kind: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME", pendingChapterNumber: 6,
+        candidate: { content: candidate, sha256: candidateSha, title: "Generic Six" },
+        invalidReviewerRoles: ["commercial-reader"],
+        initialReviews: { "logic-canon-auditor": { decision: "REVISION_REQUIRED" } },
+      });
+      expect(await readFile(reviewPath, "utf-8")).toBe(originalReview);
+
+      const runtimePath = join(bookDir, "story", "runtime", "bounded-autonomous", "production-state.json");
+      const originalRuntime = JSON.parse(await readFile(runtimePath, "utf-8"));
+      for (const status of ["RUNNING", "WAITING_PROVIDER_RETRY", "PAUSED_PROVIDER_UNAVAILABLE", "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", "PAUSED_DETERMINISTIC_PROVIDER_ERROR"] as const) {
+        await writeFile(runtimePath, JSON.stringify({
+          ...originalRuntime, status,
+          recoveryOwnership: {
+            kind: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME", recoveryClass: "PRESERVED_BOUNDED_REVIEW",
+            bookId: "book", jobId, pendingChapterNumber: 6,
+          },
+        }));
+        await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+          .resolves.toMatchObject({ kind: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME", candidate: { sha256: candidateSha } });
+      }
+      await writeFile(runtimePath, JSON.stringify(originalRuntime));
+
+      const completedAttemptPath = join(evidenceDir, "preserved-review-resume-001.json");
+      await writeFile(completedAttemptPath, JSON.stringify({ status: "REVIEW_OUTPUT_INVALID" }));
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("PRESERVED_CANDIDATE_RECOVERY_ALREADY_ATTEMPTED");
+      await rm(completedAttemptPath);
+
+      await writeFile(reviewPath, JSON.stringify({ ...reviewEvidence, revision_count: 2, hold_reason: "REVISION_LIMIT_REACHED" }));
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 })).resolves.toBeNull();
+      await writeFile(reviewPath, originalReview);
+      await writeFile(join(evidenceDir, "initial.md"), "MISMATCH");
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("PRESERVED_CANDIDATE_SHA_AUTHORITY_MISMATCH");
+      await writeFile(join(evidenceDir, "initial.md"), candidate);
+
+      const formalChapterPath = join(bookDir, "chapters", "0006_Unexpected.md");
+      await writeFile(formalChapterPath, "unexpected");
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("PRESERVED_CANDIDATE_FORMAL_CHAPTER_ALREADY_EXISTS");
+      await rm(formalChapterPath);
+
+      await writeFile(join(bookDir, "chapters", "index.json"), JSON.stringify([...index, { ...index[0], number: 6 }]));
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("PRESERVED_CANDIDATE_INDEX_ALREADY_EXISTS");
+      await writeFile(join(bookDir, "chapters", "index.json"), JSON.stringify(index));
+
+      const snapshotSix = join(bookDir, "story", "snapshots", "6");
+      await mkdir(snapshotSix, { recursive: true });
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("PRESERVED_CANDIDATE_TERMINAL_SNAPSHOT_CONFLICT");
+      await rm(snapshotSix, { recursive: true });
+
+      await writeFile(join(bookDir, "story", "state", "manifest.json"), JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 4 }));
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("PRESERVED_CANDIDATE_BASELINE_NOT_PROVABLE");
+      await writeFile(join(bookDir, "story", "state", "manifest.json"), manifest);
+
+      await writeFile(reviewPath, JSON.stringify({ ...reviewEvidence, chapter_number: 7 }));
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("PRESERVED_CANDIDATE_REVIEW_EVIDENCE_INVALID");
+      await writeFile(reviewPath, originalReview);
+
+      const titleArtifact = await readFile(artifactPath);
+      await rm(artifactPath);
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("PRESERVED_CANDIDATE_TITLE_AUTHORITY_NOT_PROVABLE");
+      await writeFile(artifactPath, titleArtifact);
+
+      const runtimeEvidence = JSON.parse(await readFile(runtimePath, "utf-8"));
+      await writeFile(runtimePath, JSON.stringify({ ...runtimeEvidence, providerAttemptHistory: [{
+        transportAttemptId: "ambiguous", logicalStepId: `provider-step-${"9".repeat(64)}`, chapterNumber: 6,
+        role: "commercial-reader", provider: "openrouter", requestedModel: "reader", attempt: 1,
+        classification: "AMBIGUOUS_PROVIDER_OUTCOME", transportStarted: true, transportReturned: false,
+        recordedAt: "2026-08-27T00:00:03.000Z",
+      }] }));
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("PRESERVED_CANDIDATE_AMBIGUOUS_PROVIDER_OUTCOME");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("derives one stable job identity for the same book, mode, and dynamic volume", () => {
     const first = deriveAutonomousJobIdentity({ map, mode: "current-volume", nextChapter: 1 });
     const resumed = deriveAutonomousJobIdentity({ map, mode: "current-volume", nextChapter: 3 });
@@ -927,7 +1098,9 @@ describe("bounded autonomous production controller", () => {
       await writeFile(bindingPath, bindingBytes);
       const plan = await resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 4 });
       expect(plan).toMatchObject({ recoveryClass: "FAILED_REENTRY" });
-      expect(plan?.failedReentryArtifacts.map((artifact) => artifact.logicalStepId)).toEqual(failedIds);
+      expect(plan?.kind).not.toBe("FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME");
+      if (!plan || plan.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME") throw new Error("expected offline recovery plan");
+      expect(plan.failedReentryArtifacts.map((artifact) => artifact.logicalStepId)).toEqual(failedIds);
       const supersessionPath = join(evidenceDir, "offline-finalization-supersession.json");
       await writeFile(supersessionPath, JSON.stringify({ schema_version: "1.0", evidence_type: "CONFLICT" }), "utf-8");
       await expect(finalizePendingChapterOfflinePlan({ projectRoot: root, plan: plan! }))
