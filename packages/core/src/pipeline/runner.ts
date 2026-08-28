@@ -83,6 +83,7 @@ import {
   verifyFormalPendingChapterRecoveryEvidence,
   type AutonomousRunProgress,
   type FormalPendingChapterRecoveryPlan,
+  type FormalPreservedBoundedReviewResumePlan,
 } from "../production/bounded-autonomous-controller.js";
 
 const SEQUENCE_LEVEL_CATEGORIES = new Set([
@@ -2208,6 +2209,50 @@ export class PipelineRunner {
     }
   }
 
+  /** Re-verifies a fully terminal preserved recovery without invoking review, revision, state generation, or Writer generation. */
+  async reconcilePreservedBoundedCandidateTerminal(plan: FormalPreservedBoundedReviewResumePlan): Promise<{
+    readonly chapterNumber: number;
+    readonly status: "approved" | "accepted-with-findings";
+  }> {
+    const releaseLock = await this.state.acquireBookLock(plan.bookId);
+    try {
+      const verified = await resolveFormalPendingChapterRecoveryPlan({
+        projectRoot: this.config.projectRoot,
+        bookId: plan.bookId,
+        jobId: plan.jobId,
+        pendingChapterNumber: plan.pendingChapterNumber,
+      });
+      if (!plan.terminalReconciliation || !verified || verified.kind !== "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
+        || !verified.terminalReconciliation || JSON.stringify(verified) !== JSON.stringify(plan)) {
+        throw new Error("PRESERVED_CANDIDATE_TERMINAL_RECONCILIATION_CHANGED");
+      }
+      return { chapterNumber: plan.pendingChapterNumber, status: plan.terminalReconciliation.status };
+    } finally {
+      await releaseLock();
+    }
+  }
+
+  /** Resumes bounded review from a formally proven, unindexed prose candidate without invoking Writer generation. */
+  async resumePreservedBoundedCandidateReview(plan: FormalPreservedBoundedReviewResumePlan): Promise<ChapterPipelineResult> {
+    if (plan.terminalReconciliation) throw new Error("PRESERVED_CANDIDATE_TERMINAL_RECONCILIATION_REQUIRED");
+    const releaseLock = await this.state.acquireBookLock(plan.bookId);
+    try {
+      const verified = await resolveFormalPendingChapterRecoveryPlan({
+        projectRoot: this.config.projectRoot,
+        bookId: plan.bookId,
+        jobId: plan.jobId,
+        pendingChapterNumber: plan.pendingChapterNumber,
+      });
+      if (!verified || verified.kind !== "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
+        || JSON.stringify(verified) !== JSON.stringify(plan)) {
+        throw new Error("PRESERVED_CANDIDATE_RECOVERY_PLAN_CHANGED");
+      }
+      return await this._writeNextChapterLocked(plan.bookId, undefined, undefined, this.config.externalContext, plan);
+    } finally {
+      await releaseLock();
+    }
+  }
+
   /** Resume a settled audit-failed chapter without invoking the Writer generation path. */
   async resumeAuditFailedChapterBounded(
     bookId: string,
@@ -2780,9 +2825,10 @@ export class PipelineRunner {
     wordCount?: number,
     temperatureOverride?: number,
     externalContext?: string,
+    preservedReviewPlan?: FormalPreservedBoundedReviewResumePlan,
   ): Promise<ChapterPipelineResult> {
     const book = await this.state.loadBookConfig(bookId);
-    if (this.config.boundedAutonomousReview) {
+    if (this.config.boundedAutonomousReview && !preservedReviewPlan) {
       const identity = this.resolveOverride("writer");
       await this.config.onAutonomousStage?.({
         stage: "PREPARING",
@@ -2794,7 +2840,12 @@ export class PipelineRunner {
     const bookDir = this.state.bookDir(bookId);
     const chapterNumber = await this.state.getNextChapterNumber(bookId);
     const paddedChapter = String(chapterNumber).padStart(4, "0");
-    const runPath = join("story", "runtime", `chapter-${paddedChapter}.run.json`);
+    if (preservedReviewPlan && chapterNumber !== preservedReviewPlan.pendingChapterNumber) {
+      throw new Error("PRESERVED_CANDIDATE_CURSOR_CHANGED");
+    }
+    const runPath = preservedReviewPlan
+      ? join("story", "runtime", `chapter-${paddedChapter}.preserved-review-resume.run.json`)
+      : join("story", "runtime", `chapter-${paddedChapter}.run.json`);
     const runId = `${bookId}:chapter-${paddedChapter}`;
     const baseRun = {
       kind: "long-fiction" as const,
@@ -2822,6 +2873,7 @@ export class PipelineRunner {
         wordCount,
         temperatureOverride,
         externalContext,
+        preservedReviewPlan,
       );
       if (result.status === "held-after-two-revisions" || result.status === "blocked-critical-findings" || result.status === "review-output-invalid") {
         await writeProductionRunSnapshot({
@@ -2896,6 +2948,7 @@ export class PipelineRunner {
     wordCount?: number,
     temperatureOverride?: number,
     externalContext?: string,
+    preservedReviewPlan?: FormalPreservedBoundedReviewResumePlan,
   ): Promise<ChapterPipelineResult> {
     this.throwIfOperationAborted();
     await this.state.ensureControlDocuments(bookId);
@@ -2934,7 +2987,7 @@ export class PipelineRunner {
 
     // 1. Write chapter
     const writer = new WriterAgent(this.agentCtxFor("writer", bookId));
-    if (this.config.boundedAutonomousReview) {
+    if (this.config.boundedAutonomousReview && !preservedReviewPlan) {
       const identity = this.resolveOverride("writer");
       await this.config.onAutonomousStage?.({
         stage: "WRITING",
@@ -2943,16 +2996,30 @@ export class PipelineRunner {
         model: identity.model,
       });
     }
-    this.logStage(stageLanguage, { zh: "撰写章节草稿", en: "writing chapter draft" });
-    const output = await writer.writeChapter({
-      book,
-      bookDir,
-      chapterNumber,
-      ...writeInput,
-      lengthSpec,
-      ...(wordCount ? { wordCountOverride: wordCount } : {}),
-      ...(temperatureOverride ? { temperatureOverride } : {}),
-    });
+    this.logStage(stageLanguage, preservedReviewPlan
+      ? { zh: "恢复已保留章节候选", en: "resuming preserved chapter candidate" }
+      : { zh: "撰写章节草稿", en: "writing chapter draft" });
+    const output: WriteChapterOutput = preservedReviewPlan
+      ? {
+          chapterNumber,
+          title: preservedReviewPlan.candidate.title,
+          content: preservedReviewPlan.candidate.content,
+          wordCount: countChapterLength(preservedReviewPlan.candidate.content, lengthSpec.countingMode),
+          preWriteCheck: "PRESERVED_BOUNDED_CANDIDATE",
+          postSettlement: "",
+          updatedState: "", updatedLedger: "", updatedHooks: "", chapterSummary: "",
+          updatedSubplots: "", updatedEmotionalArcs: "", updatedCharacterMatrix: "",
+          postWriteErrors: [], postWriteWarnings: [],
+        }
+      : await writer.writeChapter({
+          book,
+          bookDir,
+          chapterNumber,
+          ...writeInput,
+          lengthSpec,
+          ...(wordCount ? { wordCountOverride: wordCount } : {}),
+          ...(temperatureOverride ? { temperatureOverride } : {}),
+        });
     this.throwIfOperationAborted();
     const writerCount = countChapterLength(output.content, lengthSpec.countingMode);
 
@@ -2965,6 +3032,7 @@ export class PipelineRunner {
     let postReviseCount: number;
     let repairApplied: boolean;
     let autonomousReviewResult: BoundedReviewResult | undefined;
+    let preservedTerminalReviewResult: BoundedReviewResult | undefined;
     let roleUsage: Record<string, RoleTokenUsage> | undefined;
 
     if ((this.config.chapterReviewMode ?? "auto") === "manual") {
@@ -2992,6 +3060,7 @@ export class PipelineRunner {
       const commercialReader = new CommercialReaderAgent(this.agentCtxFor("commercial-reader", bookId));
       autonomousReviewResult = await runBoundedReviewCycle({
         initialContent: output.content,
+        ...(preservedReviewPlan ? { initialReviews: preservedReviewPlan.initialReviews } : {}),
         reviewLogic: async (content, candidateSha) => scoredLogicReviewFromAudit(
           await auditor.auditChapter(
             bookDir,
@@ -3042,10 +3111,11 @@ export class PipelineRunner {
           });
         },
       });
-      roleUsage = {
-        writer: output.tokenUsage ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
-        ...autonomousReviewResult.usageByRole,
-      };
+      roleUsage = { ...(preservedReviewPlan?.historicalRoleUsage ?? {}) };
+      if (!preservedReviewPlan) roleUsage.writer = output.tokenUsage ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+      for (const [role, usage] of Object.entries(autonomousReviewResult.usageByRole)) {
+        roleUsage[role] = PipelineRunner.addUsage(roleUsage[role] ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 }, usage);
+      }
       totalUsage = Object.values(roleUsage).reduce(
         (sum, usage) => PipelineRunner.addUsage(sum, usage),
         { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
@@ -3073,9 +3143,8 @@ export class PipelineRunner {
         || autonomousReviewResult.status === "BLOCKED_CRITICAL_FINDINGS"
         || autonomousReviewResult.status === "REVIEW_OUTPUT_INVALID") {
         const candidateEvidencePath = await this.persistBoundedReviewEvidence(
-          bookDir,
-          chapterNumber,
-          autonomousReviewResult,
+          bookDir, chapterNumber, autonomousReviewResult,
+          preservedReviewPlan ? "preserved-review-resume" : undefined,
         );
         return {
           chapterNumber,
@@ -3095,6 +3164,7 @@ export class PipelineRunner {
           ...(writeInput.contextTrace ? { contextTrace: writeInput.contextTrace } : {}),
         };
       }
+      if (preservedReviewPlan) preservedTerminalReviewResult = autonomousReviewResult;
     } else {
       const auditor = new ContinuityAuditor(this.agentCtxFor("auditor", bookId));
       const reviewResult = await runChapterReviewCycle({
@@ -3176,6 +3246,7 @@ export class PipelineRunner {
       finalContent,
       lengthSpec.countingMode,
       reducedControlInput,
+      preservedReviewPlan !== undefined,
     );
     const finalTitleResolution = resolveDuplicateTitle(
       persistenceOutput.title,
@@ -3376,6 +3447,9 @@ export class PipelineRunner {
       logSnapshotStage: () =>
         this.logStage(stageLanguage, { zh: "更新章节索引与快照", en: "updating chapter index and snapshots" }),
     });
+    if (preservedTerminalReviewResult) {
+      await this.persistBoundedReviewEvidence(bookDir, chapterNumber, preservedTerminalReviewResult, "preserved-review-resume");
+    }
 
     if (autonomousReviewResult?.status === "APPROVED") {
       await this.config.onAutonomousStage?.({
@@ -4270,6 +4344,7 @@ ${matrix}`,
     bookDir: string,
     chapterNumber: number,
     result: BoundedReviewResult,
+    appendOnlyStem?: string,
   ): Promise<string> {
     const chapter = String(chapterNumber).padStart(4, "0");
     const base = join("story", "runtime", "bounded-autonomous", `chapter-${chapter}`);
@@ -4294,20 +4369,28 @@ ${matrix}`,
       })),
       usage_by_role: result.usageByRole,
     };
+    let suffix = "";
+    if (appendOnlyStem) {
+      const existing = await readdir(join(bookDir, base)).catch(() => [] as string[]);
+      const sequence = existing.filter((name) => new RegExp(`^${appendOnlyStem}-\\d{3}\\.json$`, "u").test(name)).length + 1;
+      suffix = `-${String(sequence).padStart(3, "0")}`;
+    }
+    const candidatePrefix = appendOnlyStem ? `${appendOnlyStem}${suffix}-` : "";
+    const reviewName = appendOnlyStem ? `${appendOnlyStem}${suffix}.json` : "review.json";
     await commitAtomicFileSet({
       rootDir: bookDir,
       writes: [
         ...result.candidates.map((candidate) => ({
-          relativePath: join(base, `${candidate.label.toLowerCase()}.md`),
+          relativePath: join(base, `${candidatePrefix}${candidate.label.toLowerCase()}.md`),
           content: candidate.content,
         })),
         {
-          relativePath: join(base, "review.json"),
+          relativePath: join(base, reviewName),
           content: `${JSON.stringify(reviewPayload, null, 2)}\n`,
         },
       ],
     });
-    return toPosixPath(join(base, "review.json"));
+    return toPosixPath(join(base, reviewName));
   }
 
   private static addUsage(
@@ -4340,8 +4423,9 @@ ${matrix}`,
       contextPackage: ContextPackage;
       ruleStack: RuleStack;
     },
+    forceAnalyze = false,
   ): Promise<WriteChapterOutput> {
-    if (finalContent === output.content) {
+    if (!forceAnalyze && finalContent === output.content) {
       return output;
     }
 

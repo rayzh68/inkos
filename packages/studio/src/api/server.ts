@@ -2760,8 +2760,9 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       loadProductionRoleModels(),
     ]);
     const pending = chapters.find((chapter) => chapter.status === "audit-failed");
-    const offlineFinalizationPlan = pending
-      ? await resolveOfflineFinalizationPlan({ projectRoot: root, bookId, pendingChapter: pending.number, nextChapter, runtime }).catch(() => null)
+    const recoveryChapter = pending?.number ?? runtime?.nextChapter;
+    const offlineFinalizationPlan = recoveryChapter
+      ? await resolveOfflineFinalizationPlan({ projectRoot: root, bookId, pendingChapter: recoveryChapter, nextChapter, runtime }).catch(() => null)
       : null;
     const view = projectAutonomousProductionView({
       map,
@@ -2957,7 +2958,11 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         },
       });
       productionMap = await requireBookProductionMap(root, bookId);
-      jobId = deriveAutonomousJobIdentity({ map: productionMap, mode, nextChapter: startedNextChapter });
+      const identityNextChapter = admittedOfflineFinalizationPlan?.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
+        && admittedOfflineFinalizationPlan.terminalReconciliation
+        ? admittedOfflineFinalizationPlan.pendingChapterNumber
+        : startedNextChapter;
+      jobId = deriveAutonomousJobIdentity({ map: productionMap, mode, nextChapter: identityNextChapter });
       if ((recoveringProviderWait || recoveringOwnedFormalRecovery) && persistedRuntime?.jobId !== jobId) {
         throw new Error("AUTONOMOUS_WAITING_JOB_IDENTITY_MISMATCH");
       }
@@ -3031,7 +3036,13 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       map: productionMap,
       mode,
       getNextChapter: () => state.getNextChapterNumber(bookId),
-      ...(actions.pendingChapterNumber !== undefined ? { pendingChapterNumber: actions.pendingChapterNumber } : {}),
+      ...(admittedOfflineFinalizationPlan?.pendingChapterNumber !== undefined
+        ? { pendingChapterNumber: admittedOfflineFinalizationPlan.pendingChapterNumber }
+        : actions.pendingChapterNumber !== undefined ? { pendingChapterNumber: actions.pendingChapterNumber } : {}),
+      ...(admittedOfflineFinalizationPlan?.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
+        && admittedOfflineFinalizationPlan.terminalReconciliation
+        ? { recoveryScopeChapterNumber: admittedOfflineFinalizationPlan.pendingChapterNumber }
+        : {}),
       shouldStop: () => autonomousJobs.shouldStop(bookId),
       ...(admittedOfflineFinalizationPlan?.kind === "FORMAL_BOUNDED_STATE_REBASELINE"
         ? { resumePendingChapter: async () => {
@@ -3048,6 +3059,30 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           });
           return result;
         } }
+        : admittedOfflineFinalizationPlan?.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
+          ? { resumePendingChapter: async () => {
+            if (durableClaimFailure) throw durableClaimFailure;
+            const terminalReconciliation = admittedOfflineFinalizationPlan.terminalReconciliation;
+            const result = terminalReconciliation
+              ? await pipeline.reconcilePreservedBoundedCandidateTerminal(admittedOfflineFinalizationPlan)
+              : await pipeline.resumePreservedBoundedCandidateReview(admittedOfflineFinalizationPlan);
+            if (durableClaimFailure) throw durableClaimFailure;
+            const terminalStatus = result.status === "accepted-with-findings"
+              ? "accepted-with-findings" as const
+              : result.status === "approved" || (!terminalReconciliation && result.status === "ready-for-review"
+                && result.autonomousReview?.status === "APPROVED")
+                ? "approved" as const
+                : null;
+            if (!terminalStatus) return result;
+            if (terminalReconciliation) await actions.verifyChapterTerminal(result.chapterNumber, terminalStatus);
+            else await actions.promoteChapterTerminal(result.chapterNumber, terminalStatus);
+            const nextChapter = await state.getNextChapterNumber(bookId);
+            await saveAutonomousRuntime(root, bookId, {
+              jobId, status: "RUNNING", mode, nextChapter,
+              updatedAt: new Date().toISOString(), recoveryOwnership: null,
+            });
+            return { ...result, status: terminalStatus };
+          } }
         : actions.resumePendingChapter ? { resumePendingChapter: async (options?: { readonly safeReplayStage?: string }) => {
         if (durableClaimFailure) throw durableClaimFailure;
         const result = await actions.resumePendingChapter!(options);
@@ -3116,6 +3151,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         const paused = result.status.startsWith("PAUSED_")
           || result.status === "REVIEW_EXHAUSTED"
           || result.status === "HELD_AFTER_TWO_REVISIONS"
+          || result.status === "REVIEW_OUTPUT_INVALID"
           || result.status === "REVIEW_DECISION_CONTRADICTORY"
           || result.status === "BLOCKED_CRITICAL_FINDINGS";
         broadcast(paused ? "autonomous:paused" : "autonomous:complete", { bookId, status: result.status, nextChapter: result.nextChapter });

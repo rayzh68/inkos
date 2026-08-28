@@ -12,7 +12,7 @@ import {
   type LLMCallExecutionPolicy,
   type LLMResponse,
 } from "../llm/provider.js";
-import { classifyFinalAuditDecision } from "../pipeline/bounded-review.js";
+import { classifyFinalAuditDecision, type ReviewerRole, type ScoredReview } from "../pipeline/bounded-review.js";
 import { commitAtomicFileSet } from "../utils/atomic-file-set.js";
 import { countChapterLength, resolveLengthCountingMode } from "../utils/length-metrics.js";
 
@@ -31,13 +31,19 @@ export type AutonomousRunStatus =
   | "HELD_AFTER_TWO_REVISIONS"
   | "REVIEW_OUTPUT_INVALID";
 
-export interface AutonomousRecoveryOwnership {
-  readonly kind: "FORMAL_OFFLINE_FINALIZATION" | "FORMAL_BOUNDED_STATE_REBASELINE";
-  readonly recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED" | "FAILED_REENTRY";
+interface AutonomousRecoveryOwnershipIdentity {
   readonly bookId: string;
   readonly jobId: string;
   readonly pendingChapterNumber: number;
 }
+
+export type AutonomousRecoveryOwnership = AutonomousRecoveryOwnershipIdentity & ({
+  readonly kind: "FORMAL_OFFLINE_FINALIZATION" | "FORMAL_BOUNDED_STATE_REBASELINE";
+  readonly recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED" | "FAILED_REENTRY";
+} | {
+  readonly kind: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME";
+  readonly recoveryClass: "PRESERVED_BOUNDED_REVIEW";
+});
 
 export interface AutonomousRunProgress {
   readonly jobId: string;
@@ -802,7 +808,42 @@ export interface FormalBoundedStateRebaselinePlan extends FormalPendingChapterRe
   readonly baselineChapterNumber: number;
 }
 
-export type FormalPendingChapterRecoveryPlan = FormalOfflineFinalizationPlan | FormalBoundedStateRebaselinePlan;
+export interface FormalPreservedBoundedReviewResumePlan {
+  readonly kind: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME";
+  readonly recoveryClass: "PRESERVED_BOUNDED_REVIEW";
+  readonly bookId: string;
+  readonly jobId: string;
+  readonly pendingChapterNumber: number;
+  readonly baselineChapterNumber: number;
+  readonly productionMapSha256: string;
+  readonly candidate: {
+    readonly content: string;
+    readonly sha256: string;
+    readonly title: string;
+    readonly titleAuthorityLogicalStepId: string;
+    readonly titleAuthorityArtifactSha256: string;
+  };
+  readonly reviewEvidence: {
+    readonly relativePath: string;
+    readonly sha256: string;
+    readonly runRelativePath: string;
+    readonly runSha256: string;
+  };
+  readonly initialReviews: Partial<Readonly<Record<ReviewerRole, ScoredReview>>>;
+  readonly invalidReviewerRoles: ReadonlyArray<ReviewerRole>;
+  readonly historicalRoleUsage: Readonly<Record<string, RecoveryUsage>>;
+  readonly terminalReconciliation?: {
+    readonly status: "approved" | "accepted-with-findings";
+    readonly chapterFile: string;
+    readonly candidateSha256: string;
+    readonly receiptRelativePath: string;
+    readonly receiptSha256: string;
+    readonly snapshotManifestSha256: string;
+    readonly stateManifestSha256: string;
+  };
+}
+
+export type FormalPendingChapterRecoveryPlan = FormalOfflineFinalizationPlan | FormalBoundedStateRebaselinePlan | FormalPreservedBoundedReviewResumePlan;
 
 interface RecoveryBindingAuthority {
   readonly schema_version: "1.0";
@@ -941,7 +982,7 @@ function parseRecoveryUsage(value: unknown, label: string): Record<string, Recov
   return result;
 }
 
-function resolveRecoveryProvenance(evidence: Record<string, unknown>): FormalPendingChapterRecoveryPlan["provenance"] {
+function resolveRecoveryProvenance(evidence: Record<string, unknown>): FormalPendingChapterRecoveryAuthority["provenance"] {
   const revisionCount = evidence.revisionCount;
   const logicReviewCount = evidence.logicReviewCount;
   const commercialReviewCount = evidence.commercialReviewCount;
@@ -970,6 +1011,293 @@ function resolveRecoveryProvenance(evidence: Record<string, unknown>): FormalPen
     commercialReviewCount: commercialReviewCount as number,
     roleUsage,
   };
+}
+
+const PERSISTED_REVIEW_DIMENSIONS: Readonly<Record<ReviewerRole, ReadonlyArray<string>>> = {
+  "logic-canon-auditor": [
+    "blueprint_transition", "causal_logic", "canon_continuity", "character_motivation",
+    "state_inheritance", "hooks_disclosure", "narrative_clarity",
+  ],
+  "commercial-reader": [
+    "opening_hook", "pacing_tension", "emotional_investment", "plot_clarity",
+    "dialogue_appeal", "western_cultural_naturalness", "commercial_appeal", "ending_hook",
+  ],
+};
+
+function parsePersistedInitialReview(raw: unknown, candidateSha: string): ScoredReview {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("PRESERVED_CANDIDATE_REVIEW_EVIDENCE_INVALID");
+  const review = raw as Partial<ScoredReview>;
+  const roles: readonly ReviewerRole[] = ["logic-canon-auditor", "commercial-reader"];
+  const decisions: readonly ScoredReview["decision"][] = ["APPROVED", "APPROVED_WITH_NOTES", "REVISION_REQUIRED", "HELD", "INVALID_OUTPUT"];
+  if (!roles.includes(review.reviewerRole as ReviewerRole) || !decisions.includes(review.decision as ScoredReview["decision"])
+    || review.reviewedCandidateSha !== candidateSha || typeof review.reviewedAt !== "string"
+    || (review.provider !== null && typeof review.provider !== "string")
+    || (review.model !== null && typeof review.model !== "string")
+    || typeof review.totalScore !== "number" || review.totalScore < 0 || review.totalScore > 100
+    || !review.dimensionScores || typeof review.dimensionScores !== "object" || Array.isArray(review.dimensionScores)
+    || !Array.isArray(review.findings)) {
+    throw new Error("PRESERVED_CANDIDATE_REVIEW_EVIDENCE_INVALID");
+  }
+  if (review.decision !== "INVALID_OUTPUT" && PERSISTED_REVIEW_DIMENSIONS[review.reviewerRole!].some((dimension) => {
+    const value = review.dimensionScores?.[dimension];
+    return typeof value !== "number" || value < 0 || value > 100;
+  })) {
+    throw new Error("PRESERVED_CANDIDATE_REVIEW_EVIDENCE_INVALID");
+  }
+  for (const finding of review.findings) {
+    if (!finding || typeof finding !== "object"
+      || !["CRITICAL", "MAJOR", "MINOR", "NOTE"].includes(String((finding as { severity?: unknown }).severity ?? ""))
+      || ["findingId", "evidence", "impact", "requiredOutcome"].some((key) => typeof (finding as Record<string, unknown>)[key] !== "string")) {
+      throw new Error("PRESERVED_CANDIDATE_REVIEW_EVIDENCE_INVALID");
+    }
+  }
+  if (review.tokenUsage) parseRecoveryUsage({ [review.reviewerRole!]: review.tokenUsage }, "persistedReviewUsage");
+  return review as ScoredReview;
+}
+
+function parseChapterTitleAuthority(content: string, candidate: string): { readonly title: string; readonly body: string } | null {
+  const titleMatch = content.match(/=== CHAPTER_TITLE ===\s*\r?\n([^\r\n]+)\s*[\r\n]+=== CHAPTER_CONTENT ===\s*\r?\n([\s\S]*?)(?=\r?\n=== [A-Z_ ]+ ===|$)/u);
+  if (!titleMatch) return null;
+  const body = titleMatch[2]!.trim();
+  return body === candidate.trim() ? { title: titleMatch[1]!.trim(), body } : null;
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try { await stat(path); return true; } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function attachPreservedTerminalReconciliation(params: {
+  readonly bookDir: string;
+  readonly evidenceDir: string;
+  readonly chapterFile: string;
+  readonly indexEntry: ChapterMeta;
+  readonly plan: FormalPreservedBoundedReviewResumePlan;
+}): Promise<FormalPreservedBoundedReviewResumePlan> {
+  try {
+    const receiptNames = (await readdir(params.evidenceDir))
+      .filter((name) => /^preserved-review-resume-\d{3}\.json$/u.test(name))
+      .sort();
+    const receipts = await Promise.all(receiptNames.map(async (name) => {
+      const bytes = await readFile(join(params.evidenceDir, name));
+      return { name, bytes, value: JSON.parse(bytes.toString("utf-8")) as {
+        readonly schema_version?: unknown;
+        readonly chapter_number?: unknown;
+        readonly status?: unknown;
+        readonly best_candidate?: { readonly label?: unknown; readonly sha256?: unknown };
+        readonly candidates?: ReadonlyArray<{ readonly label?: unknown; readonly sha256?: unknown }>;
+      } };
+    }));
+    const terminalReceipts = receipts.filter(({ value }) => value.status === "APPROVED" || value.status === "ACCEPTED_WITH_FINDINGS");
+    if (terminalReceipts.length !== 1 || terminalReceipts[0]!.name !== receiptNames.at(-1)) throw new Error("terminal receipt mismatch");
+    const receipt = terminalReceipts[0]!;
+    const expectedStatus = receipt.value.status === "APPROVED" ? "approved" as const : "accepted-with-findings" as const;
+    if (receipt.value.schema_version !== "1.0" || receipt.value.chapter_number !== params.plan.pendingChapterNumber
+      || params.indexEntry.status !== expectedStatus || typeof params.indexEntry.title !== "string" || !params.indexEntry.title.trim()
+      || !Array.isArray(receipt.value.candidates)) {
+      throw new Error("terminal identity mismatch");
+    }
+    const initialAuthorities = receipt.value.candidates.filter((candidate) => candidate.label === "INITIAL" && candidate.sha256 === params.plan.candidate.sha256);
+    const finalAuthorities = receipt.value.candidates.filter((candidate) => candidate.label === receipt.value.best_candidate?.label
+      && candidate.sha256 === receipt.value.best_candidate?.sha256);
+    if (initialAuthorities.length !== 1 || finalAuthorities.length !== 1 || typeof receipt.value.best_candidate?.label !== "string"
+      || !["INITIAL", "REVISION_1", "REVISION_2"].includes(receipt.value.best_candidate.label)
+      || !/^[a-f0-9]{64}$/u.test(String(receipt.value.best_candidate.sha256 ?? ""))) {
+      throw new Error("terminal candidate authority mismatch");
+    }
+    const candidateName = `preserved-review-resume-${receipt.name.match(/(\d{3})/u)![1]}-${receipt.value.best_candidate.label.toLowerCase()}.md`;
+    const finalCandidateBytes = await readFile(join(params.evidenceDir, candidateName));
+    if (sha256(finalCandidateBytes) !== receipt.value.best_candidate.sha256) throw new Error("terminal candidate hash mismatch");
+    const finalCandidate = finalCandidateBytes.toString("utf-8");
+    if (!Buffer.from(finalCandidate, "utf-8").equals(finalCandidateBytes)) throw new Error("terminal candidate encoding mismatch");
+
+    const book = JSON.parse(await readFile(join(params.bookDir, "book.json"), "utf-8")) as { readonly language?: unknown };
+    const heading = book.language === "en"
+      ? `# Chapter ${params.plan.pendingChapterNumber}: ${params.indexEntry.title}`
+      : `# 第${params.plan.pendingChapterNumber}章 ${params.indexEntry.title}`;
+    const formalChapterBytes = await readFile(join(params.bookDir, "chapters", params.chapterFile));
+    if (formalChapterBytes.toString("utf-8") !== `${heading}\n\n${finalCandidate}`) throw new Error("formal chapter mismatch");
+
+    const stateManifestBytes = await readFile(join(params.bookDir, "story", "state", "manifest.json"));
+    const snapshotManifestBytes = await readFile(join(params.bookDir, "story", "snapshots", String(params.plan.pendingChapterNumber), "state", "manifest.json"));
+    for (const bytes of [stateManifestBytes, snapshotManifestBytes]) {
+      const manifest = JSON.parse(bytes.toString("utf-8")) as { readonly schemaVersion?: unknown; readonly lastAppliedChapter?: unknown };
+      if (manifest.schemaVersion !== 2 || manifest.lastAppliedChapter !== params.plan.pendingChapterNumber) throw new Error("terminal state mismatch");
+    }
+    return {
+      ...params.plan,
+      terminalReconciliation: {
+        status: expectedStatus,
+        chapterFile: params.chapterFile,
+        candidateSha256: receipt.value.best_candidate.sha256 as string,
+        receiptRelativePath: join("story", "runtime", "bounded-autonomous", `chapter-${String(params.plan.pendingChapterNumber).padStart(4, "0")}`, receipt.name).replace(/\\/gu, "/"),
+        receiptSha256: sha256(receipt.bytes),
+        snapshotManifestSha256: sha256(snapshotManifestBytes),
+        stateManifestSha256: sha256(stateManifestBytes),
+      },
+    };
+  } catch (error) {
+    throw new Error("PRESERVED_CANDIDATE_TERMINAL_RECONCILIATION_CONFLICT", { cause: error });
+  }
+}
+
+async function resolvePreservedBoundedReviewResumePlan(params: {
+  readonly projectRoot: string;
+  readonly bookId: string;
+  readonly jobId: string;
+  readonly pendingChapterNumber: number;
+  readonly runtime: AutonomousRunProgress | null;
+}): Promise<FormalPreservedBoundedReviewResumePlan | null> {
+  const runtime = params.runtime;
+  if (!runtime) return null;
+  const ownership = runtime.recoveryOwnership;
+  const ownedReentry = ownership?.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
+    && ownership.bookId === params.bookId && ownership.jobId === params.jobId
+    && ownership.pendingChapterNumber === params.pendingChapterNumber
+    && ["RUNNING", "WAITING_PROVIDER_RETRY", "PAUSED_PROVIDER_UNAVAILABLE", "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", "PAUSED_DETERMINISTIC_PROVIDER_ERROR"].includes(runtime.status);
+  if (!ownedReentry && runtime.status !== "REVIEW_OUTPUT_INVALID" && runtime.status !== "HELD_AFTER_TWO_REVISIONS") return null;
+  if (runtime.jobId !== params.jobId) {
+    throw new Error("PRESERVED_CANDIDATE_RUNTIME_IDENTITY_MISMATCH");
+  }
+  if ((runtime.providerAttemptHistory ?? []).some((attempt) => attempt.chapterNumber === params.pendingChapterNumber
+    && attempt.transportStarted && !attempt.transportReturned)) {
+    throw new Error("PRESERVED_CANDIDATE_AMBIGUOUS_PROVIDER_OUTCOME");
+  }
+
+  const bookDir = join(params.projectRoot, "books", params.bookId);
+  const mapBytes = await readFile(join(bookDir, "story", "outline", "book-production-map.json"));
+  const productionMap = parseBookProductionMap(JSON.parse(mapBytes.toString("utf-8")), params.bookId);
+  if (params.pendingChapterNumber > productionMap.totalChapters
+    || (runtime.mode !== "current-volume" && runtime.mode !== "full-book")
+    || deriveAutonomousJobIdentity({ map: productionMap, mode: runtime.mode, nextChapter: params.pendingChapterNumber }) !== params.jobId) {
+    throw new Error("PRESERVED_CANDIDATE_PRODUCTION_JOB_IDENTITY_MISMATCH");
+  }
+  const chapterPrefix = new RegExp(`^${String(params.pendingChapterNumber).padStart(4, "0")}[_-].*\\.md$`, "u");
+  const formalChapterFiles = (await readdir(join(bookDir, "chapters"))).filter((name) => chapterPrefix.test(name));
+  const index = JSON.parse(await readFile(join(bookDir, "chapters", "index.json"), "utf-8")) as ChapterMeta[];
+  const terminalIndexEntries = index.filter((entry) => entry.number === params.pendingChapterNumber);
+  const terminalSnapshotExists = await pathExists(join(bookDir, "story", "snapshots", String(params.pendingChapterNumber)));
+  const hasTerminalArtifacts = formalChapterFiles.length > 0 || terminalIndexEntries.length > 0 || terminalSnapshotExists;
+  if (runtime.nextChapter !== params.pendingChapterNumber
+    && !(ownedReentry && hasTerminalArtifacts && runtime.nextChapter === params.pendingChapterNumber + 1)) {
+    throw new Error("PRESERVED_CANDIDATE_RUNTIME_IDENTITY_MISMATCH");
+  }
+  if (hasTerminalArtifacts && !ownedReentry) {
+    if (formalChapterFiles.length > 0) throw new Error("PRESERVED_CANDIDATE_FORMAL_CHAPTER_ALREADY_EXISTS");
+    if (terminalIndexEntries.length > 0) throw new Error("PRESERVED_CANDIDATE_INDEX_ALREADY_EXISTS");
+    throw new Error("PRESERVED_CANDIDATE_TERMINAL_SNAPSHOT_CONFLICT");
+  }
+  if (hasTerminalArtifacts && (formalChapterFiles.length !== 1 || terminalIndexEntries.length !== 1 || !terminalSnapshotExists)) {
+    throw new Error("PRESERVED_CANDIDATE_TERMINAL_RECONCILIATION_CONFLICT");
+  }
+  const baselineChapterNumber = params.pendingChapterNumber - 1;
+  const terminalBaselineStatuses = new Set<ChapterMeta["status"]>(["approved", "accepted-with-findings", "published", "imported"]);
+  const orderedIndex = index.filter((entry) => entry.number !== params.pendingChapterNumber).sort((left, right) => left.number - right.number);
+  if (baselineChapterNumber < 0 || orderedIndex.length !== baselineChapterNumber
+    || orderedIndex.some((entry, offset) => entry.number !== offset + 1 || !terminalBaselineStatuses.has(entry.status))) {
+    throw new Error("PRESERVED_CANDIDATE_BASELINE_NOT_PROVABLE");
+  }
+  const [baselineManifest, currentManifest] = await Promise.all([
+    readFile(join(bookDir, "story", "snapshots", String(baselineChapterNumber), "state", "manifest.json"), "utf-8"),
+    readFile(join(bookDir, "story", "state", "manifest.json"), "utf-8"),
+  ]).then((values) => values.map((value) => JSON.parse(value) as { readonly lastAppliedChapter?: unknown }));
+  if (baselineManifest.lastAppliedChapter !== baselineChapterNumber
+    || currentManifest.lastAppliedChapter !== (hasTerminalArtifacts ? params.pendingChapterNumber : baselineChapterNumber)) {
+    throw new Error("PRESERVED_CANDIDATE_BASELINE_NOT_PROVABLE");
+  }
+
+  const padded = String(params.pendingChapterNumber).padStart(4, "0");
+  const evidenceDir = join(bookDir, "story", "runtime", "bounded-autonomous", `chapter-${padded}`);
+  if (!hasTerminalArtifacts && (await readdir(evidenceDir)).some((name) => /^preserved-review-resume-\d{3}\.json$/u.test(name))) {
+    throw new Error("PRESERVED_CANDIDATE_RECOVERY_ALREADY_ATTEMPTED");
+  }
+  const initialBytes = await readFile(join(evidenceDir, "initial.md"));
+  const candidateSha = sha256(initialBytes);
+  const reviewBytes = await readFile(join(evidenceDir, "review.json"));
+  const evidence = JSON.parse(reviewBytes.toString("utf-8")) as {
+    readonly schema_version?: unknown; readonly chapter_number?: unknown; readonly status?: unknown;
+    readonly revision_count?: unknown; readonly hold_reason?: unknown;
+    readonly best_candidate?: { readonly label?: unknown; readonly sha256?: unknown };
+    readonly candidates?: ReadonlyArray<{ readonly label?: unknown; readonly sha256?: unknown; readonly reviews?: ReadonlyArray<unknown> }>;
+    readonly usage_by_role?: unknown;
+  };
+  const supported = evidence.status === "REVIEW_OUTPUT_INVALID" && evidence.revision_count === 0 && evidence.hold_reason === "INVALID_OUTPUT"
+    || evidence.status === "HELD_AFTER_TWO_REVISIONS" && evidence.revision_count === 0 && evidence.hold_reason === "INVALID_OUTPUT";
+  if (evidence.schema_version !== "1.0" || evidence.chapter_number !== params.pendingChapterNumber || !supported) {
+    if (evidence.status === "HELD_AFTER_TWO_REVISIONS" && evidence.revision_count === 2 && evidence.hold_reason === "REVISION_LIMIT_REACHED") {
+      if (ownedReentry) throw new Error("PRESERVED_CANDIDATE_RECOVERY_AUTHORITY_CHANGED");
+      return null;
+    }
+    throw new Error("PRESERVED_CANDIDATE_REVIEW_EVIDENCE_INVALID");
+  }
+  const initialCandidates = (evidence.candidates ?? []).filter((candidate) => candidate.label === "INITIAL");
+  if (evidence.candidates?.length !== 1 || initialCandidates.length !== 1 || initialCandidates[0]!.sha256 !== candidateSha
+    || evidence.best_candidate?.label !== "INITIAL" || evidence.best_candidate.sha256 !== candidateSha
+    || !Array.isArray(initialCandidates[0]!.reviews)) {
+    throw new Error("PRESERVED_CANDIDATE_SHA_AUTHORITY_MISMATCH");
+  }
+  const reviews = initialCandidates[0]!.reviews!.map((review) => parsePersistedInitialReview(review, candidateSha));
+  if (reviews.length !== 2 || new Set(reviews.map((review) => review.reviewerRole)).size !== 2) {
+    throw new Error("PRESERVED_CANDIDATE_REVIEW_EVIDENCE_INVALID");
+  }
+  const initialReviews: Partial<Record<ReviewerRole, ScoredReview>> = {};
+  const invalidReviewerRoles: ReviewerRole[] = [];
+  for (const review of reviews) {
+    if (review.decision === "INVALID_OUTPUT") invalidReviewerRoles.push(review.reviewerRole);
+    else initialReviews[review.reviewerRole] = review;
+  }
+  if (invalidReviewerRoles.length === 0) throw new Error("PRESERVED_CANDIDATE_INVALID_REVIEWER_MISSING");
+
+  const runRelativePath = join("story", "runtime", `chapter-${padded}.run.json`);
+  const runBytes = await readFile(join(bookDir, runRelativePath));
+  const run = JSON.parse(runBytes.toString("utf-8")) as { readonly id?: unknown; readonly stage?: unknown; readonly resumeCursor?: unknown; readonly status?: unknown; readonly artifacts?: ReadonlyArray<unknown> };
+  const reviewRelativePath = join("story", "runtime", "bounded-autonomous", `chapter-${padded}`, "review.json").replace(/\\/gu, "/");
+  if (run.id !== `${params.bookId}:chapter-${padded}` || run.stage !== `chapter-${params.pendingChapterNumber}`
+    || run.resumeCursor !== String(params.pendingChapterNumber) || run.status !== "needs-review"
+    || !run.artifacts?.includes(reviewRelativePath)) {
+    throw new Error("PRESERVED_CANDIDATE_RUN_EVIDENCE_INVALID");
+  }
+
+  const candidate = initialBytes.toString("utf-8");
+  const responseDir = providerResponseArtifactDir(params.projectRoot, params.bookId);
+  const titleAuthorities: Array<{ readonly title: string; readonly logicalStepId: string; readonly artifactSha256: string; readonly usage?: RecoveryUsage }> = [];
+  for (const name of (await readdir(responseDir)).filter((entry) => /^provider-step-[a-f0-9]{64}\.json$/u.test(entry))) {
+    const logicalStepId = name.replace(/\.json$/u, "");
+    let source: { readonly artifact: PersistedProviderResponseArtifact; readonly bytes: Buffer };
+    try { source = await readRecoveryArtifact(responseDir, logicalStepId, { jobId: params.jobId, chapterNumber: params.pendingChapterNumber }); }
+    catch { continue; }
+    if (source.artifact.role !== "writer" || source.artifact.stage !== "WRITING") continue;
+    const parsed = parseChapterTitleAuthority(source.artifact.response.content, candidate);
+    if (parsed) titleAuthorities.push({
+      title: parsed.title, logicalStepId, artifactSha256: sha256(source.bytes),
+      ...(source.artifact.response.usage ? { usage: source.artifact.response.usage } : {}),
+    });
+  }
+  const uniqueTitles = new Set(titleAuthorities.map((authority) => authority.title));
+  if (titleAuthorities.length === 0 || uniqueTitles.size !== 1) throw new Error("PRESERVED_CANDIDATE_TITLE_AUTHORITY_NOT_PROVABLE");
+  const titleAuthority = titleAuthorities[0]!;
+  const historicalRoleUsage = parseRecoveryUsage(evidence.usage_by_role ?? {}, "usage_by_role");
+  if (titleAuthority.usage) historicalRoleUsage.writer = parseRecoveryUsage({ writer: titleAuthority.usage }, "titleAuthorityUsage").writer!;
+  const plan: FormalPreservedBoundedReviewResumePlan = {
+    kind: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME", recoveryClass: "PRESERVED_BOUNDED_REVIEW",
+    bookId: params.bookId, jobId: params.jobId, pendingChapterNumber: params.pendingChapterNumber,
+    baselineChapterNumber, productionMapSha256: sha256(mapBytes),
+    candidate: { content: candidate, sha256: candidateSha, title: titleAuthority.title, titleAuthorityLogicalStepId: titleAuthority.logicalStepId, titleAuthorityArtifactSha256: titleAuthority.artifactSha256 },
+    reviewEvidence: { relativePath: reviewRelativePath, sha256: sha256(reviewBytes), runRelativePath: runRelativePath.replace(/\\/gu, "/"), runSha256: sha256(runBytes) },
+    initialReviews, invalidReviewerRoles,
+    historicalRoleUsage,
+  };
+  return hasTerminalArtifacts
+    ? attachPreservedTerminalReconciliation({
+        bookDir,
+        evidenceDir,
+        chapterFile: formalChapterFiles[0]!,
+        indexEntry: terminalIndexEntries[0]!,
+        plan,
+      })
+    : plan;
 }
 
 async function resolveStateSettlementProof(params: {
@@ -1054,8 +1382,11 @@ async function resolveFormalPendingChapterRecoveryPlanUnsafe(params: {
   readonly pendingChapterNumber: number;
 }): Promise<FormalPendingChapterRecoveryPlan | null> {
   const runtime = await loadAutonomousProductionState<AutonomousRunProgress>(params.projectRoot, params.bookId);
+  const preserved = await resolvePreservedBoundedReviewResumePlan({ ...params, runtime });
+  if (preserved) return preserved;
   const ownership = runtime?.recoveryOwnership;
-  const ownedReentry = ownership?.bookId === params.bookId
+  const ownedReentry = ownership?.kind !== "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
+    && ownership?.bookId === params.bookId
     && ownership.jobId === params.jobId
     && ownership.pendingChapterNumber === params.pendingChapterNumber
     && [
@@ -1293,6 +1624,7 @@ export async function resolveFormalPendingChapterRecoveryPlan(params: {
   try {
     return await resolveFormalPendingChapterRecoveryPlanUnsafe(params);
   } catch (error) {
+    if (error instanceof Error && error.message.startsWith("PRESERVED_CANDIDATE_")) throw error;
     if (error instanceof Error && error.message === "OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE") {
       throw new Error("OFFLINE_FINALIZATION_STATE_EVIDENCE_NOT_PROVABLE", { cause: error });
     }
@@ -1309,7 +1641,7 @@ export async function finalizePendingChapterOfflinePlan(params: {
   readonly revisionCount: number;
   readonly logicReviewCount: number;
   readonly commercialReviewCount: number;
-  readonly roleUsage: FormalPendingChapterRecoveryPlan["provenance"]["roleUsage"];
+  readonly roleUsage: FormalPendingChapterRecoveryAuthority["provenance"]["roleUsage"];
 }> {
   const plan = params.plan;
   if (plan.kind !== "FORMAL_OFFLINE_FINALIZATION") throw new Error("OFFLINE_FINALIZATION_MODE_MISMATCH");
@@ -1744,27 +2076,49 @@ export async function createAutonomousPipelineActions<
   if (pending && pending.number !== latest) {
     throw new Error("AUTONOMOUS_AUDIT_FAILED_CHAPTER_NOT_LATEST");
   }
-  const approve = async (chapterNumber: number) => {
+  const verifyChapterTerminal = async (chapterNumber: number, status: "approved" | "accepted-with-findings") => {
     const latest = await params.state.loadChapterIndex(params.bookId);
+    const matches = latest.filter((chapter) => chapter.number === chapterNumber);
+    if (matches.length !== 1 || matches[0]!.status !== status) {
+      throw new Error("AUTONOMOUS_CHAPTER_TERMINAL_PROMOTION_FAILED");
+    }
+    return { chapterNumber, status } as const;
+  };
+  const promoteChapterTerminal = async (chapterNumber: number, status: "approved" | "accepted-with-findings") => {
+    const latest = await params.state.loadChapterIndex(params.bookId);
+    const matches = latest.filter((chapter) => chapter.number === chapterNumber);
+    if (matches.length !== 1) throw new Error("AUTONOMOUS_CHAPTER_TERMINAL_PROMOTION_FAILED");
+    const current = matches[0]!;
+    const promotable = status === "approved"
+      ? current.status === "ready-for-review" || current.status === "audit-failed" || current.status === "approved"
+      : current.status === "ready-for-review" || current.status === "audit-failed" || current.status === "accepted-with-findings";
+    if (!promotable) throw new Error("AUTONOMOUS_CHAPTER_TERMINAL_PROMOTION_CONFLICT");
+    if (current.status === status) return verifyChapterTerminal(chapterNumber, status);
     const now = new Date().toISOString();
     await params.state.saveChapterIndex(params.bookId, latest.map((chapter) => chapter.number === chapterNumber
-      ? { ...chapter, status: "approved" as const, updatedAt: now }
+      ? { ...chapter, status, updatedAt: now }
       : chapter));
+    return verifyChapterTerminal(chapterNumber, status);
   };
   return {
     ...(pending ? { pendingChapterNumber: pending.number } : {}),
     ...(pending ? {
       resumePendingChapter: async (options?: { readonly safeReplayStage?: string }) => {
         const result = await params.pipeline.resumeAuditFailedChapterBounded(params.bookId, pending.number, options);
-        if (result.status === "approved") await approve(pending.number);
+        if (result.status === "approved" || result.status === "accepted-with-findings") {
+          await promoteChapterTerminal(pending.number, result.status);
+        }
         return result;
       },
     } : {}),
     runChapter: async (wordCount?: number) => {
       const result = await params.pipeline.writeNextChapter(params.bookId, wordCount);
-      if (result.status === "ready-for-review") await approve(result.chapterNumber);
+      if (result.status === "ready-for-review") await promoteChapterTerminal(result.chapterNumber, "approved");
+      if (result.status === "accepted-with-findings") await promoteChapterTerminal(result.chapterNumber, "accepted-with-findings");
       return result;
     },
+    promoteChapterTerminal,
+    verifyChapterTerminal,
   };
 }
 
@@ -1773,6 +2127,7 @@ export async function runBoundedAutonomousScope(params: {
   readonly mode: ProductionMode;
   readonly getNextChapter: () => Promise<number>;
   readonly pendingChapterNumber?: number;
+  readonly recoveryScopeChapterNumber?: number;
   readonly resumePendingChapter?: (options?: { readonly safeReplayStage?: string }) => Promise<{
     readonly status: string;
     readonly chapterNumber: number;
@@ -1792,8 +2147,9 @@ export async function runBoundedAutonomousScope(params: {
   readonly providerRecovery?: AutonomousProviderRecovery;
 }): Promise<AutonomousRunProgress> {
   const initialNext = await params.getNextChapter();
-  const scope = resolveProductionScope(params.map, initialNext, params.mode);
-  const jobId = deriveAutonomousJobIdentity({ map: params.map, mode: params.mode, nextChapter: initialNext });
+  const scopeChapterNumber = params.recoveryScopeChapterNumber ?? initialNext;
+  const scope = resolveProductionScope(params.map, scopeChapterNumber, params.mode);
+  const jobId = deriveAutonomousJobIdentity({ map: params.map, mode: params.mode, nextChapter: scopeChapterNumber });
   let completedThisRun = 0;
 
   const project = (
@@ -1942,7 +2298,7 @@ export async function runBoundedAutonomousScope(params: {
     }
   };
 
-  if (scope.complete) {
+  if (scope.complete && !params.resumePendingChapter) {
     const complete = project("BOOK_COMPLETE", initialNext);
     await params.persistProgress(complete);
     return complete;
@@ -1976,6 +2332,9 @@ export async function runBoundedAutonomousScope(params: {
       const blocked = project("REVIEW_DECISION_CONTRADICTORY", initialNext, "FINAL_REVIEW_DECISION_CONTRADICTORY", { chapterNumber: params.pendingChapterNumber ?? initialNext });
       await params.persistProgress(blocked);
       return blocked;
+    }
+    if (resumed.status !== "approved" && resumed.status !== "accepted-with-findings") {
+      throw new Error("AUTONOMOUS_RECOVERED_CHAPTER_NOT_TERMINAL");
     }
     await params.persistProgress(project("RUNNING", initialNext));
   }
