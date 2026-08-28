@@ -33,6 +33,7 @@ import {
 } from "../state/chapter-workspace.js";
 import { correctLegacyPendingChapterArtifactBindings, createAutonomousProviderExecution, deriveAutonomousJobIdentity, resolveFormalPendingChapterRecoveryPlan, type FormalPreservedBoundedReviewResumePlan } from "../production/bounded-autonomous-controller.js";
 import type { BoundedReviewResult } from "../pipeline/bounded-review.js";
+import { createChapterGenesis, verifyChapterCommit } from "../production/chapter-transaction.js";
 
 const require = createRequire(import.meta.url);
 const hasNodeSqlite = (() => {
@@ -397,6 +398,61 @@ describe("PipelineRunner", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
+
+  it("stages a transaction-enabled chapter and promotes one verified commit before cursor advance", async () => {
+    const { root, runner, state, bookId } = await createRunnerFixture({ boundedAutonomousReview: true });
+    const bookDir = state.bookDir(bookId);
+    const storyDir = join(bookDir, "story");
+    const body = englishWords(2200, "chapter");
+    const dimensions = {
+      blueprint_transition: 92, causal_logic: 92, canon_continuity: 92, character_motivation: 92,
+      state_inheritance: 92, hooks_disclosure: 92, narrative_clarity: 92,
+    };
+    try {
+      await state.saveBookConfig(bookId, { ...(await state.loadBookConfig(bookId)), language: "en", chapterWordCount: 2200 });
+      await Promise.all([
+        writeFile(join(storyDir, "current_state.md"), createStateCard({ chapter: 0, location: "Gate", protagonistState: "Ready", goal: "Begin", conflict: "Clock" })),
+        writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n"),
+      ]);
+      await state.snapshotState(bookId, 0);
+      await createChapterGenesis({ bookDir, bookId, lastTrustedChapter: 0, trustedSnapshotDir: join(storyDir, "snapshots", "0"), createdAt: "2026-08-28T00:00:00.000Z" });
+      vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(createWriterOutput({
+        chapterNumber: 1, title: "Transaction One", content: body, wordCount: 2200,
+        updatedState: createStateCard({ chapter: 1, location: "Gate", protagonistState: "Moving", goal: "Proceed", conflict: "Clock" }),
+        updatedHooks: "# Pending Hooks\n",
+      }));
+      vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockResolvedValue(createAuditResult({ passed: true, overallScore: 92, dimensionScores: dimensions }));
+      vi.spyOn(CommercialReaderAgent.prototype, "reviewChapter").mockImplementation(async (input) => ({
+        reviewerRole: "commercial-reader", provider: "test", model: "test", totalScore: 90,
+        dimensionScores: { opening_hook: 90, pacing_tension: 90, emotional_investment: 90, plot_clarity: 90, dialogue_appeal: 90, western_cultural_naturalness: 90, commercial_appeal: 90, ending_hook: 90 },
+        decision: "APPROVED", findings: [], reviewedCandidateSha: input.candidateSha,
+        reviewedAt: "2026-08-28T00:00:00.000Z", tokenUsage: ZERO_USAGE,
+      }));
+      vi.spyOn(ChapterAnalyzerAgent.prototype, "analyzeChapter").mockResolvedValue(createAnalyzedOutput({
+        chapterNumber: 1, title: "Transaction One", content: body, wordCount: 2200,
+        updatedState: createStateCard({ chapter: 1, location: "Gate", protagonistState: "Moving", goal: "Proceed", conflict: "Clock" }),
+        updatedHooks: "# Pending Hooks\n",
+      }));
+
+      const result = await runner.writeNextChapter(bookId, 2200);
+      expect(result.status).toBe("ready-for-review");
+      const commit = await verifyChapterCommit({ bookDir, chapterNumber: 1 });
+      expect(commit.finalLengthCount).toBe(2200);
+      const logicEvidenceDir = join(
+        bookDir, "story", "runtime", "chapter-transactions", "chapter-0001", "staging", "evidence",
+        "reviews", commit.finalBodySha256, "logic-canon-auditor",
+      );
+      const logicEvidenceFiles = await readdir(logicEvidenceDir);
+      expect(logicEvidenceFiles).toHaveLength(1);
+      await expect(readFile(join(logicEvidenceDir, logicEvidenceFiles[0]!), "utf-8")).resolves.toContain(commit.finalBodySha256);
+      await expect(readFile(join(
+        bookDir, "story", "runtime", "chapter-transactions", "chapter-0001", "staging", "evidence", "review-result.json",
+      ), "utf-8")).resolves.toContain('"status": "APPROVED"');
+      expect(await state.getNextChapterNumber(bookId)).toBe(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
 
   it("persists a generic Chapter 6 from preserved review evidence without creative Writer generation", async () => {
     const { root, runner, state, bookId } = await createRunnerFixture({ boundedAutonomousReview: true });

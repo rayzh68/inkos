@@ -65,6 +65,7 @@ import {
   type BoundedReviewResult,
   type ReviewFinding,
   type RoleTokenUsage,
+  type ScoredReview,
 } from "./bounded-review.js";
 import { validateChapterTruthPersistence } from "./chapter-truth-validation.js";
 import { loadPersistedPlan, relativeToBookDir, savePersistedPlan } from "./persisted-governed-plan.js";
@@ -86,6 +87,19 @@ import {
   type FormalPendingChapterRecoveryPlan,
   type FormalPreservedBoundedReviewResumePlan,
 } from "../production/bounded-autonomous-controller.js";
+import {
+  beginChapterTransaction,
+  chapterTransactionStagingBookDir,
+  finalizeChapterTransaction,
+  isChapterTransactionEnabled,
+  reconcileChapterProjections,
+  recordChapterTransactionCandidate,
+  recordChapterTransactionReviewEvidence,
+  recordChapterTransactionReviewResult,
+  stageChapterCommitFromProjection,
+  verifyChapterCommitChain,
+  type ChapterTransactionHandle,
+} from "../production/chapter-transaction.js";
 
 const SEQUENCE_LEVEL_CATEGORIES = new Set([
   "Pacing Monotony", "节奏单调",
@@ -291,6 +305,7 @@ export interface PipelineConfig {
     readonly provider: string | null;
     readonly model: string | null;
     readonly reviewRound?: number;
+    readonly transactionId?: string;
   }) => Promise<void> | void;
 }
 
@@ -2841,6 +2856,14 @@ export class PipelineRunner {
     preservedReviewPlan?: FormalPreservedBoundedReviewResumePlan,
   ): Promise<ChapterPipelineResult> {
     const book = await this.state.loadBookConfig(bookId);
+    const bookDir = this.state.bookDir(bookId);
+    if (await isChapterTransactionEnabled(bookDir)) {
+      if (preservedReviewPlan) throw new Error("TRANSACTION_BOOK_LEGACY_RECOVERY_FORBIDDEN");
+      const chain = await verifyChapterCommitChain({ bookDir });
+      await reconcileChapterProjections({ bookDir });
+      await this.syncNarrativeMemoryIndex(bookId);
+      await this.syncCurrentStateFactHistory(bookId, chain.latestChapter);
+    }
     if (this.config.boundedAutonomousReview && !preservedReviewPlan) {
       const identity = this.resolveOverride("writer");
       await this.config.onAutonomousStage?.({
@@ -2850,7 +2873,6 @@ export class PipelineRunner {
         model: identity.model,
       });
     }
-    const bookDir = this.state.bookDir(bookId);
     const chapterNumber = await this.state.getNextChapterNumber(bookId);
     const paddedChapter = String(chapterNumber).padStart(4, "0");
     if (preservedReviewPlan && chapterNumber !== preservedReviewPlan.pendingChapterNumber) {
@@ -2969,6 +2991,23 @@ export class PipelineRunner {
     const bookDir = this.state.bookDir(bookId);
     await this.assertNoPendingStateRepair(bookId);
     const chapterNumber = await this.state.getNextChapterNumber(bookId);
+    let chapterTransaction: ChapterTransactionHandle | undefined;
+    if (await isChapterTransactionEnabled(bookDir)) {
+      if (!this.config.boundedAutonomousReview || (this.config.chapterReviewMode ?? "auto") !== "auto") {
+        throw new Error("TRANSACTION_BOOK_REQUIRES_BOUNDED_AUTONOMOUS_REVIEW");
+      }
+      chapterTransaction = await beginChapterTransaction({
+        bookDir,
+        bookId,
+        chapterNumber,
+        productionAuthority: `pipeline:${createHash("sha256").update(JSON.stringify({
+          bookId,
+          genre: book.genre,
+          targetChapters: book.targetChapters,
+          chapterWordCount: book.chapterWordCount,
+        })).digest("hex")}`,
+      });
+    }
     const stageLanguage = await this.resolveBookLanguage(book);
     this.logStage(stageLanguage, { zh: "准备章节输入", en: "preparing chapter inputs" });
     const writeInput = await this.prepareWriteInput(
@@ -3007,6 +3046,7 @@ export class PipelineRunner {
         role: "writer",
         provider: identity.client.service ?? identity.client.provider,
         model: identity.model,
+        ...(chapterTransaction ? { transactionId: chapterTransaction.transactionId } : {}),
       });
     }
     this.logStage(stageLanguage, preservedReviewPlan
@@ -3035,6 +3075,15 @@ export class PipelineRunner {
         });
     this.throwIfOperationAborted();
     const writerCount = countChapterLength(output.content, lengthSpec.countingMode);
+    if (chapterTransaction) {
+      await recordChapterTransactionCandidate({
+        bookDir,
+        transactionId: chapterTransaction.transactionId,
+        label: "INITIAL",
+        content: output.content,
+        sha256: createHash("sha256").update(output.content, "utf-8").digest("hex"),
+      });
+    }
 
     // Token usage accumulator
     let totalUsage: TokenUsageSummary = output.tokenUsage ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
@@ -3075,26 +3124,37 @@ export class PipelineRunner {
         initialContent: output.content,
         lengthSpec,
         ...(preservedReviewPlan ? { initialReviews: preservedReviewPlan.initialReviews } : {}),
-        reviewLogic: async (content, candidateSha) => scoredLogicReviewFromAudit(
-          await auditor.auditChapter(
+        reviewLogic: async (content, candidateSha) => {
+          const review = scoredLogicReviewFromAudit(await auditor.auditChapter(
             bookDir,
             content,
             chapterNumber,
             book.genre,
             reducedControlInput,
-          ),
-          {
+          ), {
             candidateSha,
             provider: logicIdentity.client.service ?? logicIdentity.client.provider,
             model: logicIdentity.model,
-          },
-        ),
-        reviewCommercial: (content, candidateSha) => commercialReader.reviewChapter({
-          chapterNumber,
-          content,
-          candidateSha,
-          chapterIntent: reducedControlInput.chapterIntent,
-        }),
+          });
+          if (chapterTransaction) await recordChapterTransactionReviewEvidence({
+            bookDir, transactionId: chapterTransaction.transactionId, candidateSha256: candidateSha,
+            reviewerRole: review.reviewerRole, evidence: this.stableChapterTransactionReview(review),
+          });
+          return review;
+        },
+        reviewCommercial: async (content, candidateSha) => {
+          const review = await commercialReader.reviewChapter({
+            chapterNumber,
+            content,
+            candidateSha,
+            chapterIntent: reducedControlInput.chapterIntent,
+          });
+          if (chapterTransaction) await recordChapterTransactionReviewEvidence({
+            bookDir, transactionId: chapterTransaction.transactionId, candidateSha256: candidateSha,
+            reviewerRole: review.reviewerRole, evidence: this.stableChapterTransactionReview(review),
+          });
+          return review;
+        },
         revise: async (content, findings, round) => {
           this.logStage(stageLanguage, round === 1
             ? { zh: "执行定向修订 1/2", en: "running targeted revision 1/2" }
@@ -3109,6 +3169,13 @@ export class PipelineRunner {
             book.genre,
             { ...reducedControlInput, lengthSpec },
           );
+          if (chapterTransaction) await recordChapterTransactionCandidate({
+            bookDir,
+            transactionId: chapterTransaction.transactionId,
+            label: round === 1 ? "REVISION_1" : "REVISION_2",
+            content: revised.revisedContent,
+            sha256: createHash("sha256").update(revised.revisedContent, "utf-8").digest("hex"),
+          });
           return { content: revised.revisedContent, tokenUsage: revised.tokenUsage };
         },
         onStage: async (stage, detail) => {
@@ -3122,6 +3189,7 @@ export class PipelineRunner {
             provider: identity.client.service ?? identity.client.provider,
             model: identity.model,
             ...(detail?.semanticRetry === 1 ? { reviewRound: 0 } : {}),
+            ...(chapterTransaction ? { transactionId: chapterTransaction.transactionId } : {}),
           });
         },
       });
@@ -3134,6 +3202,28 @@ export class PipelineRunner {
         (sum, usage) => PipelineRunner.addUsage(sum, usage),
         { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
       );
+      const transactionReviewEvidencePath = chapterTransaction
+        ? await recordChapterTransactionReviewResult({
+            bookDir,
+            transactionId: chapterTransaction.transactionId,
+            result: {
+              status: autonomousReviewResult.status,
+              grade: autonomousReviewResult.grade,
+              revisionCount: autonomousReviewResult.revisionCount,
+              holdReason: autonomousReviewResult.holdReason ?? null,
+              invalidReviewerRole: autonomousReviewResult.invalidReviewerRole ?? null,
+              bestCandidateSha256: autonomousReviewResult.bestCandidate.sha256,
+              candidates: autonomousReviewResult.candidates.map((candidate) => ({
+                label: candidate.label,
+                sha256: candidate.sha256,
+                combinedScore: candidate.combinedScore,
+                lengthCount: candidate.lengthCount,
+                lengthInHardRange: candidate.lengthInHardRange,
+                reviews: candidate.reviews.map((review) => this.stableChapterTransactionReview(review)),
+              })),
+            },
+          })
+        : undefined;
       finalContent = autonomousReviewResult.finalContent;
       finalWordCount = countChapterLength(finalContent, lengthSpec.countingMode);
       revised = autonomousReviewResult.revisionCount > 0;
@@ -3165,7 +3255,7 @@ export class PipelineRunner {
       if (autonomousReviewResult.status === "HELD_AFTER_TWO_REVISIONS"
         || autonomousReviewResult.status === "BLOCKED_CRITICAL_FINDINGS"
         || autonomousReviewResult.status === "REVIEW_OUTPUT_INVALID") {
-        const candidateEvidencePath = await this.persistBoundedReviewEvidence(
+        const candidateEvidencePath = transactionReviewEvidencePath ?? await this.persistBoundedReviewEvidence(
           bookDir, chapterNumber, autonomousReviewResult,
           preservedReviewPlan ? "preserved-review-resume" : undefined,
         );
@@ -3245,6 +3335,7 @@ export class PipelineRunner {
         role: "observer-reflector",
         provider: identity.client.service ?? identity.client.provider,
         model: identity.model,
+        ...(chapterTransaction ? { transactionId: chapterTransaction.transactionId } : {}),
       });
     }
     // 4. Save the final chapter and truth files from a single persistence source
@@ -3435,7 +3526,43 @@ export class PipelineRunner {
     if (autonomousReviewResult) {
       assertBoundedReviewTerminalLength(autonomousReviewResult, finalWordCount, lengthSpec);
     }
-    await persistChapterArtifacts({
+    if (chapterTransaction) {
+      if (resolvedStatus === "state-degraded") throw new Error("STATE_SETTLEMENT_FAILED_BEFORE_CHAPTER_COMMIT");
+      if (!autonomousReviewResult) throw new Error("CHAPTER_COMMIT_REQUIRES_BOUNDED_REVIEW_EVIDENCE");
+      const stagingBookDir = chapterTransactionStagingBookDir(bookDir, chapterNumber);
+      await rm(stagingBookDir, { recursive: true, force: true });
+      await writer.saveChapter(stagingBookDir, persistenceOutput, gp.numericalSystem, pipelineLang);
+      await this.syncLegacyStructuredStateFromMarkdown(stagingBookDir, chapterNumber, persistenceOutput);
+      await this.state.snapshotStateAt(stagingBookDir, chapterNumber);
+      await stageChapterCommitFromProjection({
+        bookDir,
+        stagingBookDir,
+        transactionId: chapterTransaction.transactionId,
+        chapterNumber,
+        title: persistenceOutput.title,
+        language: pipelineLang,
+        body: finalContent,
+        lengthSpec,
+        review: {
+          status: autonomousReviewResult.status,
+          finalCandidateSha256: createHash("sha256").update(finalContent, "utf-8").digest("hex"),
+          findings: autonomousReviewResult.bestCandidate.reviews.flatMap((review) => review.findings).map((finding) => ({
+            severity: finding.severity,
+          })),
+          reviewerEvidence: autonomousReviewResult.bestCandidate.reviews.map((review) => ({
+            reviewerRole: review.reviewerRole,
+            reviewedCandidateSha: review.reviewedCandidateSha,
+            decision: review.decision,
+          })),
+        },
+        usage: { totalUsage, roleUsage: roleUsage ?? {} },
+      });
+      await finalizeChapterTransaction({ bookDir, transactionId: chapterTransaction.transactionId });
+      await reconcileChapterProjections({ bookDir });
+      await this.markBookActiveIfNeeded(bookId);
+      await this.syncNarrativeMemoryIndex(bookId);
+      await this.syncCurrentStateFactHistory(bookId, chapterNumber);
+    } else await persistChapterArtifacts({
       chapterNumber,
       chapterTitle: persistenceOutput.title,
       status: resolvedStatus,
@@ -3483,6 +3610,7 @@ export class PipelineRunner {
         role: "state-manager",
         provider: null,
         model: null,
+        ...(chapterTransaction ? { transactionId: chapterTransaction.transactionId } : {}),
       });
     }
 
@@ -4347,6 +4475,11 @@ ${matrix}`,
       suggestion: finding.requiredOutcome,
       repairScope: finding.severity === "CRITICAL" || finding.severity === "MAJOR" ? "structural" : "local",
     }));
+  }
+
+  private stableChapterTransactionReview(review: ScoredReview): Omit<ScoredReview, "reviewedAt" | "tokenUsage"> {
+    const { reviewedAt: _reviewedAt, tokenUsage: _tokenUsage, ...stable } = review;
+    return stable;
   }
 
   private projectBoundedReview(result: BoundedReviewResult): NonNullable<ChapterPipelineResult["autonomousReview"]> {

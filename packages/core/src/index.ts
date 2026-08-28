@@ -582,6 +582,32 @@ export { analyzeHookHealth } from "./utils/hook-health.js";
 export { PipelineRunner, type PipelineConfig, type ChapterPipelineResult, type WriteChaptersOptions, type DraftResult, type PlanChapterResult, type ComposeChapterResult, type ReviseResult, type ExistingChapterReviewStatus, type ExistingChapterReviewResult, type ResumeAuditFailedChapterResult, type ReviseDraftOptions, type TruthFiles, type BookStatusInfo, type ImportChaptersInput, type ImportChaptersResult, type TokenUsageSummary } from "./pipeline/runner.js";
 export { parseBookProductionMap, loadBookProductionMap, resolveProductionScope, type BookProductionMap, type ProductionVolume, type ProductionMode, type ProductionScope } from "./production/book-production-map.js";
 export { autonomousProductionStatePath, claimAutonomousJob, correctLegacyPendingChapterArtifactBindings, createAutonomousPipelineActions, createAutonomousProviderExecution, deriveAutonomousJobIdentity, loadAutonomousProductionState, refreshAutonomousJobClaim, releaseAutonomousJob, resolveFormalPendingChapterRecoveryPlan, runBoundedAutonomousScope, saveAutonomousProductionState, startAutonomousJobHeartbeat, verifyFormalPendingChapterRecoveryEvidence, type AutonomousJobClaim, type AutonomousProviderRecovery, type AutonomousRecoveryOwnership, type AutonomousRunProgress, type AutonomousRunStatus, type AutonomousStageMetadata, type FormalOfflineFinalizationPlan, type FormalBoundedStateRebaselinePlan, type FormalPendingChapterRecoveryPlan } from "./production/bounded-autonomous-controller.js";
+export {
+  beginChapterTransaction,
+  assertChapterWriterStartAllowed,
+  chapterTransactionStagingBookDir,
+  createChapterGenesis,
+  finalizeChapterTransaction,
+  inspectChapterAuthority,
+  isChapterTransactionEnabled,
+  loadChapterGenesis,
+  reconcileChapterProjections,
+  recordChapterTransactionCandidate,
+  recordChapterTransactionOperation,
+  recordChapterTransactionReviewEvidence,
+  recordChapterTransactionReviewResult,
+  resolveChapterProviderOperation,
+  stageChapterCommitCandidate,
+  stageChapterCommitFromProjection,
+  verifyChapterCommit,
+  verifyChapterCommitChain,
+  type ChapterAuthorityState,
+  type ChapterCommit,
+  type ChapterCommitReviewStatus,
+  type ChapterGenesis,
+  type ChapterTransactionHandle,
+  type ChapterTransactionRecord,
+} from "./production/chapter-transaction.js";
 export { projectAutonomousEconomics, type AutonomousUsageRecord, type ForecastRange } from "./production/autonomous-economics.js";
 export { classifyFinalAuditDecision, type FinalAuditDecision } from "./pipeline/bounded-review.js";
 export { runBoundedReviewCycle, scoredLogicReviewFromAudit, type BoundedReviewResult, type BoundedCandidate, type ScoredReview, type ReviewFinding, type RoleTokenUsage } from "./pipeline/bounded-review.js";

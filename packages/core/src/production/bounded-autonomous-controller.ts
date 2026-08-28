@@ -100,6 +100,7 @@ export interface AutonomousStageMetadata {
   readonly model: string | null;
   readonly revisionRound?: number;
   readonly reviewRound?: number;
+  readonly transactionId?: string;
 }
 
 export interface AutonomousProviderRecovery {
@@ -464,6 +465,7 @@ interface PersistedProviderResponseArtifact {
   readonly content_sha256: string;
   readonly response: LLMResponse;
   readonly completed_at: string;
+  readonly transaction_id?: string;
 }
 
 interface CorrectedProviderArtifactBinding {
@@ -1776,8 +1778,8 @@ function logicalProviderStepId(params: {
   readonly inputFingerprint: string;
 }): string {
   const raw = [
-    "inkos-autonomous-provider-step-v1",
-    params.jobId,
+    params.stage.transactionId ? "inkos-autonomous-provider-step-v2" : "inkos-autonomous-provider-step-v1",
+    params.stage.transactionId ?? params.jobId,
     params.chapterNumber,
     params.stage.stage,
     params.stage.role,
@@ -1904,6 +1906,7 @@ export function createAutonomousProviderExecution(params: {
       || artifact.requested_model !== identity.model
       || artifact.input_fingerprint !== identity.inputFingerprint
       || artifact.response_artifact_status !== "COMPLETE"
+      || (identity.stage && params.getActiveStage().transactionId !== undefined && artifact.transaction_id !== params.getActiveStage().transactionId)
       || artifact.content_sha256 !== contentSha
     ) {
       throw new Error("AUTONOMOUS_PROVIDER_RESPONSE_ARTIFACT_IDENTITY_MISMATCH");
@@ -1988,6 +1991,7 @@ export function createAutonomousProviderExecution(params: {
       content_sha256: createHash("sha256").update(response.content, "utf-8").digest("hex"),
       response,
       completed_at: new Date(params.now?.() ?? Date.now()).toISOString(),
+      ...(params.getActiveStage().transactionId ? { transaction_id: params.getActiveStage().transactionId } : {}),
     };
     await mkdir(dirname(path), { recursive: true });
     const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
@@ -2145,6 +2149,7 @@ export async function runBoundedAutonomousScope(params: {
   readonly shouldStop: () => boolean;
   readonly persistProgress: (progress: AutonomousRunProgress) => Promise<void>;
   readonly providerRecovery?: AutonomousProviderRecovery;
+  readonly verifyChapterStartAuthority?: (chapterNumber: number) => Promise<void>;
 }): Promise<AutonomousRunProgress> {
   const initialNext = await params.getNextChapter();
   const scopeChapterNumber = params.recoveryScopeChapterNumber ?? initialNext;
@@ -2351,6 +2356,7 @@ export async function runBoundedAutonomousScope(params: {
       await params.persistProgress(paused);
       return paused;
     }
+    await params.verifyChapterStartAuthority?.(nextChapter);
     const result = await executeRecoverably(nextChapter, () => params.runChapter());
     if ("mode" in result) return result;
     if (result.status === "state-degraded") {

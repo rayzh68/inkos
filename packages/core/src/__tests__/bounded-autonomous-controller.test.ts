@@ -274,6 +274,44 @@ describe("bounded autonomous production controller", () => {
     expect(deriveAutonomousJobIdentity({ map, mode: "full-book", nextChapter: 3 })).not.toBe(first);
   });
 
+  it("namespaces exact Provider replay by chapter transaction identity", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-transaction-"));
+    try {
+      const base = { projectRoot: root, bookId: "book", jobId: "same-job" };
+      const first = createAutonomousProviderExecution({ ...base, getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId: "chapter-txn-one" }) });
+      const second = createAutonomousProviderExecution({ ...base, getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId: "chapter-txn-two" }) });
+      const firstPath = first.responseArtifactPath("a".repeat(64), "test", "model", 5);
+      const secondPath = second.responseArtifactPath("a".repeat(64), "test", "model", 5);
+      expect(firstPath).not.toBe(secondPath);
+      await first.runProviderCall(5, async () => ({ content: "first", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } }), { provider: "test", model: "model", inputFingerprint: "a".repeat(64) });
+      expect(JSON.parse(await readFile(firstPath, "utf-8"))).toMatchObject({ transaction_id: "chapter-txn-one", response_artifact_status: "COMPLETE" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("checks Chapter N predecessor authority before entering Provider execution for Writer N", async () => {
+    const runChapter = vi.fn(async () => ({ status: "ready-for-review" }));
+    let providerExecuteCalls = 0;
+    await expect(runBoundedAutonomousScope({
+      map,
+      mode: "current-volume",
+      getNextChapter: async () => 5,
+      runChapter,
+      verifyChapterStartAuthority: async () => { throw new Error("CHAPTER_4_COMMIT_TAMPERED"); },
+      shouldStop: () => false,
+      persistProgress: async () => undefined,
+      providerRecovery: {
+        execute: async <T>(_chapter: number, task: () => Promise<T>) => { providerExecuteCalls += 1; return task(); },
+        loadPersistedProgress: async () => null,
+        now: () => 0,
+        sleep: async () => undefined,
+      },
+    })).rejects.toThrow("CHAPTER_4_COMMIT_TAMPERED");
+    expect(providerExecuteCalls).toBe(0);
+    expect(runChapter).not.toHaveBeenCalled();
+  });
+
   it("resumes a settled audit-failed draft before generating the next chapter", async () => {
     let next = 5;
     const calls: string[] = [];

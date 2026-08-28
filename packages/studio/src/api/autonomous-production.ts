@@ -220,8 +220,17 @@ export function projectAutonomousProductionView(params: {
   readonly offlineFinalizationPlan?: FormalPendingChapterRecoveryPlan | null;
   readonly active: boolean;
   readonly budget?: { readonly status: "BUDGET_NOT_CONFIGURED" };
+  readonly transactionAuthority?: {
+    readonly state: "NOT_STARTED" | "STAGING" | "COMMITTED";
+    readonly latestChapter: number;
+    readonly nextChapter: number;
+    readonly latestAuthoritySha256: string;
+    readonly activeTransactionId?: string;
+  } | null;
 }) {
-  const scope = resolveProductionScope(params.map, params.nextChapter, "current-volume");
+  const transactionEnabled = params.transactionAuthority !== null && params.transactionAuthority !== undefined;
+  const authoritativeNextChapter = params.transactionAuthority?.nextChapter ?? params.nextChapter;
+  const scope = resolveProductionScope(params.map, authoritativeNextChapter, "current-volume");
   const overrides = params.config.modelOverrides;
   const roles = {
     writer: params.config.defaultModel,
@@ -239,13 +248,13 @@ export function projectAutonomousProductionView(params: {
   } satisfies ProductionRoleSelection, params.catalog ?? []);
   const blockers: string[] = [];
   if (params.targetChapters !== params.map.totalChapters) blockers.push("BOOK_TARGET_CHAPTERS_MISMATCH");
-  const degraded = params.chapters.find((chapter) => chapter.status === "state-degraded");
+  const degraded = transactionEnabled ? undefined : params.chapters.find((chapter) => chapter.status === "state-degraded");
   if (degraded) blockers.push(`PENDING_STATE_REPAIR_CHAPTER_${degraded.number}`);
   const repairNeedsReconciliation = !params.active && params.runtime?.status === "REPAIRING";
   if (repairNeedsReconciliation) blockers.push("STATE_REPAIR_RECONCILIATION_REQUIRED");
-  const auditFailed = params.chapters.find((chapter) => chapter.status === "audit-failed");
+  const auditFailed = transactionEnabled ? undefined : params.chapters.find((chapter) => chapter.status === "audit-failed");
   const recoveryOwnership = params.runtime?.recoveryOwnership;
-  const formalRecoveryPlan = params.offlineFinalizationPlan
+  const formalRecoveryPlan = !transactionEnabled && params.offlineFinalizationPlan
     && params.offlineFinalizationPlan.bookId === params.map.bookId
     && params.offlineFinalizationPlan.jobId === params.runtime?.jobId
     && (params.offlineFinalizationPlan.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
@@ -289,18 +298,18 @@ export function projectAutonomousProductionView(params: {
   if (!roles.reviser) blockers.push("REVISER_MODEL_NOT_CONFIGURED");
   if (!roles.observerReflector) blockers.push("OBSERVER_REFLECTOR_MODEL_NOT_CONFIGURED");
   if (params.active) blockers.push("AUTONOMOUS_JOB_ALREADY_RUNNING");
-  if ((params.runtime?.status === "REVIEW_EXHAUSTED" && !finalReviewRecovery) || (params.runtime?.status === "HELD_AFTER_TWO_REVISIONS" && !finalReviewRecovery)) {
+  if (!transactionEnabled && ((params.runtime?.status === "REVIEW_EXHAUSTED" && !finalReviewRecovery) || (params.runtime?.status === "HELD_AFTER_TWO_REVISIONS" && !finalReviewRecovery))) {
     blockers.push("REVIEW_EXHAUSTED");
   }
-  if (params.runtime?.status === "REVIEW_OUTPUT_INVALID" && !finalReviewRecovery) blockers.push("REVIEW_OUTPUT_INVALID");
-  if (params.runtime?.status === "REVIEW_DECISION_CONTRADICTORY") blockers.push("REVIEW_DECISION_CONTRADICTORY");
-  if (params.runtime?.status === "BLOCKED_CRITICAL_FINDINGS" && !finalReviewRecovery) blockers.push("BLOCKED_CRITICAL_FINDINGS");
+  if (!transactionEnabled && params.runtime?.status === "REVIEW_OUTPUT_INVALID" && !finalReviewRecovery) blockers.push("REVIEW_OUTPUT_INVALID");
+  if (!transactionEnabled && params.runtime?.status === "REVIEW_DECISION_CONTRADICTORY") blockers.push("REVIEW_DECISION_CONTRADICTORY");
+  if (!transactionEnabled && params.runtime?.status === "BLOCKED_CRITICAL_FINDINGS" && !finalReviewRecovery) blockers.push("BLOCKED_CRITICAL_FINDINGS");
   if (recoveryOwnership?.kind === "FORMAL_BOUNDED_STATE_REBASELINE"
     && (params.runtime?.lastError === "STATE_REBASELINE_VALIDATION_FAILED" || params.runtime?.reason === "STATE_REBASELINE_VALIDATION_FAILED")) {
     blockers.push("STATE_REBASELINE_VALIDATION_FAILED");
   }
   const orderedChapterNumbers = params.chapters.map((chapter) => chapter.number).sort((left, right) => left - right);
-  if (orderedChapterNumbers.some((number, index) => number !== index + 1) || params.nextChapter !== orderedChapterNumbers.length + 1) {
+  if (!transactionEnabled && (orderedChapterNumbers.some((number, index) => number !== index + 1) || authoritativeNextChapter !== orderedChapterNumbers.length + 1)) {
     blockers.push("CHAPTER_CURSOR_INTEGRITY_MISMATCH");
   }
 
@@ -389,8 +398,8 @@ export function projectAutonomousProductionView(params: {
   const nextCallConservativeUsd = observedChapterMaximumUsd ?? undefined;
   const economics = projectAutonomousEconomics({
     completedChapters: params.chapters.length,
-    currentVolumeRemaining: Math.max(0, scope.currentVolume.endChapter - params.nextChapter + 1),
-    fullBookRemaining: Math.max(0, params.map.totalChapters - params.nextChapter + 1),
+    currentVolumeRemaining: Math.max(0, scope.currentVolume.endChapter - authoritativeNextChapter + 1),
+    fullBookRemaining: Math.max(0, params.map.totalChapters - authoritativeNextChapter + 1),
     preferredBudgetUsd: null,
     hardCapUsd: null,
     records: usageRecords,
@@ -402,8 +411,8 @@ export function projectAutonomousProductionView(params: {
     completedChapters: params.chapters.filter((chapter) =>
       chapter.number >= scope.currentVolume.startChapter && chapter.number <= scope.currentVolume.endChapter,
     ).length,
-    currentVolumeRemaining: Math.max(0, scope.currentVolume.endChapter - params.nextChapter + 1),
-    fullBookRemaining: Math.max(0, scope.currentVolume.endChapter - params.nextChapter + 1),
+    currentVolumeRemaining: Math.max(0, scope.currentVolume.endChapter - authoritativeNextChapter + 1),
+    fullBookRemaining: Math.max(0, scope.currentVolume.endChapter - authoritativeNextChapter + 1),
     preferredBudgetUsd: null,
     hardCapUsd: null,
     records: currentVolumeUsageRecords,
@@ -454,7 +463,12 @@ export function projectAutonomousProductionView(params: {
     title: params.map.title,
     totalChapters: params.map.totalChapters,
     completedChapters: params.chapters.length,
-    nextChapter: params.nextChapter,
+    nextChapter: authoritativeNextChapter,
+    chapterTransaction: params.transactionAuthority ? {
+      ...params.transactionAuthority,
+      currentStage: params.runtime?.phase ?? null,
+      blockedReason: params.runtime?.reason ?? params.runtime?.lastError ?? null,
+    } : null,
     currentVolume: scope.currentVolume,
     currentVolumeCompleted: params.chapters.filter((chapter) =>
       chapter.number >= scope.currentVolume.startChapter && chapter.number <= scope.currentVolume.endChapter,

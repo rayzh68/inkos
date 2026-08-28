@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import type { BookConfig } from "../models/book.js";
 import type { ChapterMeta } from "../models/chapter.js";
 import { bootstrapStructuredStateFromMarkdown, resolveDurableStoryProgress } from "./state-bootstrap.js";
+import { inspectChapterAuthority, isChapterTransactionEnabled } from "../production/chapter-transaction.js";
 
 const BOOK_LOCK_HEARTBEAT_MS = 30_000;
 const BOOK_LOCK_LEASE_MS = 3 * 60_000;
@@ -439,14 +440,18 @@ export class StateManager {
   }
 
   async getNextChapterNumber(bookId: string): Promise<number> {
+    const bookDir = this.bookDir(bookId);
+    if (await isChapterTransactionEnabled(bookDir)) {
+      return (await inspectChapterAuthority({ bookDir })).nextChapter;
+    }
     const durableChapter = await resolveDurableStoryProgress({
-      bookDir: this.bookDir(bookId),
+      bookDir,
     });
     // Ensure structured state is bootstrapped (side-effect: creates missing
     // JSON files), but do NOT trust its chapter number for progress — only
     // the contiguous durable artifact chain is authoritative.
     await bootstrapStructuredStateFromMarkdown({
-      bookDir: this.bookDir(bookId),
+      bookDir,
       fallbackChapter: durableChapter,
     });
     return durableChapter + 1;
