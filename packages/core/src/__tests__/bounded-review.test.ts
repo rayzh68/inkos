@@ -1,5 +1,20 @@
 import { describe, expect, it, vi } from "vitest";
-import { classifyFinalAuditDecision, runBoundedReviewCycle, scoredLogicReviewFromAudit, type ScoredReview } from "../pipeline/bounded-review.js";
+import * as boundedReviewModule from "../pipeline/bounded-review.js";
+import { classifyFinalAuditDecision, runBoundedReviewCycle, scoredLogicReviewFromAudit, type BoundedReviewResult, type ScoredReview } from "../pipeline/bounded-review.js";
+import { buildLengthSpec } from "../utils/length-metrics.js";
+
+const TEST_LENGTH_SPEC = {
+  target: 1,
+  softMin: 1,
+  softMax: 100,
+  hardMin: 1,
+  hardMax: 100,
+  countingMode: "en_words" as const,
+};
+
+function englishWords(count: number, word = "word"): string {
+  return Array.from({ length: count }, () => word).join(" ");
+}
 
 function review(role: "logic-canon-auditor" | "commercial-reader", score: number, severity?: "CRITICAL" | "MAJOR" | "MINOR" | "NOTE"): ScoredReview {
   return {
@@ -109,6 +124,7 @@ describe("bounded autonomous chapter review", () => {
     const stages: string[] = [];
     const result = await runBoundedReviewCycle({
       initialContent: "draft",
+      lengthSpec: TEST_LENGTH_SPEC,
       reviewLogic: vi.fn().mockResolvedValue(review("logic-canon-auditor", 92)),
       reviewCommercial: vi.fn().mockResolvedValue(review("commercial-reader", 86)),
       revise,
@@ -130,6 +146,7 @@ describe("bounded autonomous chapter review", () => {
 
     const result = await runBoundedReviewCycle({
       initialContent: "draft",
+      lengthSpec: TEST_LENGTH_SPEC,
       reviewLogic: vi.fn().mockResolvedValue(review("logic-canon-auditor", 92)),
       reviewCommercial: commercial,
       revise,
@@ -157,6 +174,7 @@ describe("bounded autonomous chapter review", () => {
 
     const result = await runBoundedReviewCycle({
       initialContent: "draft",
+      lengthSpec: TEST_LENGTH_SPEC,
       reviewLogic: logic,
       reviewCommercial: vi.fn().mockResolvedValue(review("commercial-reader", 86)),
       revise,
@@ -174,6 +192,7 @@ describe("bounded autonomous chapter review", () => {
 
     const result = await runBoundedReviewCycle({
       initialContent: "draft",
+      lengthSpec: TEST_LENGTH_SPEC,
       reviewLogic: vi.fn().mockResolvedValue(review("logic-canon-auditor", 92)),
       reviewCommercial: commercial,
       revise,
@@ -196,26 +215,27 @@ describe("bounded autonomous chapter review", () => {
     const revise = vi.fn()
       .mockResolvedValueOnce({ content: "revision one", tokenUsage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } })
       .mockResolvedValueOnce({ content: "revision two", tokenUsage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } });
-    const result = await runBoundedReviewCycle({ initialContent: "draft", reviewLogic: logic, reviewCommercial: commercial, revise });
+    const result = await runBoundedReviewCycle({ initialContent: "draft", lengthSpec: TEST_LENGTH_SPEC, reviewLogic: logic, reviewCommercial: commercial, revise });
     expect(result.status).toBe("HELD_AFTER_TWO_REVISIONS");
     expect(result.revisionCount).toBe(2);
     expect(result.holdReason).toBe("REVISION_LIMIT_REACHED");
     expect(result.candidates.map((candidate) => candidate.label)).toEqual(["INITIAL", "REVISION_1", "REVISION_2"]);
     expect(revise).toHaveBeenCalledTimes(2);
     expect(logic).toHaveBeenCalledTimes(3);
-    expect(commercial).toHaveBeenCalledTimes(1);
+    expect(commercial).toHaveBeenCalledTimes(3);
   });
 
   it("accepts only noncritical findings after the final rescue review without a third revision", async () => {
     const logic = vi.fn()
       .mockResolvedValueOnce(review("logic-canon-auditor", 72, "MINOR"))
       .mockResolvedValueOnce(review("logic-canon-auditor", 78, "MINOR"))
-      .mockResolvedValueOnce(review("logic-canon-auditor", 81, "MINOR"));
+      .mockResolvedValueOnce({ ...review("logic-canon-auditor", 81, "MINOR"), decision: "APPROVED_WITH_NOTES" });
     const revise = vi.fn()
       .mockResolvedValueOnce({ content: "revision one" })
       .mockResolvedValueOnce({ content: "revision two" });
     const result = await runBoundedReviewCycle({
       initialContent: "draft",
+      lengthSpec: TEST_LENGTH_SPEC,
       reviewLogic: logic,
       reviewCommercial: vi.fn().mockResolvedValue(review("commercial-reader", 90)),
       revise,
@@ -235,6 +255,7 @@ describe("bounded autonomous chapter review", () => {
       .mockResolvedValueOnce(review("commercial-reader", 90));
     const result = await runBoundedReviewCycle({
       initialContent: "draft",
+      lengthSpec: TEST_LENGTH_SPEC,
       reviewLogic: logic,
       reviewCommercial: commercial,
       revise: vi.fn().mockResolvedValue({ content: "fixed", tokenUsage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } }),
@@ -249,12 +270,164 @@ describe("bounded autonomous chapter review", () => {
     const revise = vi.fn();
     const result = await runBoundedReviewCycle({
       initialContent: "draft",
-      reviewLogic: vi.fn().mockResolvedValue({ ...review("logic-canon-auditor", 40, "CRITICAL"), authorityBlocker: true }),
+      lengthSpec: TEST_LENGTH_SPEC,
+      reviewLogic: vi.fn().mockResolvedValue({
+        ...review("logic-canon-auditor", 40, "CRITICAL"),
+        decision: "HELD",
+        authorityBlocker: true,
+      }),
       reviewCommercial: vi.fn().mockResolvedValue(review("commercial-reader", 90)),
       revise,
     });
     expect(result.status).toBe("BLOCKED_CRITICAL_FINDINGS");
     expect(result.holdReason).toBe("AUTHORITY_BLOCKER");
     expect(revise).not.toHaveBeenCalled();
+  });
+
+  it("does not approve a high-scoring review that explicitly says HELD", async () => {
+    const revise = vi.fn();
+    const result = await runBoundedReviewCycle({
+      initialContent: "draft",
+      lengthSpec: TEST_LENGTH_SPEC,
+      reviewLogic: vi.fn().mockResolvedValue({ ...review("logic-canon-auditor", 92), decision: "HELD" }),
+      reviewCommercial: vi.fn().mockResolvedValue(review("commercial-reader", 90)),
+      revise,
+    });
+
+    expect(result.status).toBe("BLOCKED_CRITICAL_FINDINGS");
+    expect(revise).not.toHaveBeenCalled();
+  });
+
+  it("binds both terminal reviews to the exact revised candidate SHA", async () => {
+    const logic = vi.fn()
+      .mockResolvedValueOnce(review("logic-canon-auditor", 72, "MAJOR"))
+      .mockResolvedValueOnce(review("logic-canon-auditor", 92));
+    const commercial = vi.fn().mockResolvedValue(review("commercial-reader", 90));
+    const result = await runBoundedReviewCycle({
+      initialContent: "draft",
+      lengthSpec: TEST_LENGTH_SPEC,
+      reviewLogic: logic,
+      reviewCommercial: commercial,
+      revise: vi.fn().mockResolvedValue({ content: "revised candidate" }),
+    });
+
+    expect(result.status).toBe("APPROVED");
+    expect(result.bestCandidate.label).toBe("REVISION_1");
+    expect(result.bestCandidate.reviews.every((candidateReview) =>
+      candidateReview.reviewedCandidateSha === result.bestCandidate.sha256)).toBe(true);
+    expect(commercial).toHaveBeenCalledTimes(2);
+  });
+
+  it("approves an initially valid 2200-word English candidate", async () => {
+    const result = await runBoundedReviewCycle({
+      initialContent: englishWords(2200, "initial"),
+      lengthSpec: buildLengthSpec(2200, "en"),
+      reviewLogic: vi.fn().mockResolvedValue(review("logic-canon-auditor", 92)),
+      reviewCommercial: vi.fn().mockResolvedValue(review("commercial-reader", 90)),
+      revise: vi.fn(),
+    });
+
+    expect(result.status).toBe("APPROVED");
+    expect(result.bestCandidate).toMatchObject({ label: "INITIAL", lengthCount: 2200, lengthInHardRange: true });
+  });
+
+  it("keeps a viable in-range candidate ahead of an approved 700-word revision", async () => {
+    const result = await runBoundedReviewCycle({
+      initialContent: englishWords(2200, "initial"),
+      lengthSpec: buildLengthSpec(2200, "en"),
+      reviewLogic: vi.fn()
+        .mockResolvedValueOnce({ ...review("logic-canon-auditor", 81, "MINOR"), decision: "APPROVED_WITH_NOTES" })
+        .mockResolvedValue(review("logic-canon-auditor", 92)),
+      reviewCommercial: vi.fn().mockResolvedValue(review("commercial-reader", 90)),
+      revise: vi.fn().mockResolvedValue({ content: englishWords(700, "short") }),
+    });
+
+    expect(result.status).toBe("ACCEPTED_WITH_FINDINGS");
+    expect(result.candidates.find((candidate) => candidate.label === "REVISION_1")).toMatchObject({
+      lengthCount: 700,
+      lengthInHardRange: false,
+    });
+    expect(result.bestCandidate).toMatchObject({ label: "INITIAL", lengthCount: 2200, lengthInHardRange: true });
+  });
+
+  it("approves revision two when a short first revision is repaired into hard range", async () => {
+    const revise = vi.fn()
+      .mockResolvedValueOnce({ content: englishWords(700, "short") })
+      .mockResolvedValueOnce({ content: englishWords(1900, "recovered") });
+    const result = await runBoundedReviewCycle({
+      initialContent: englishWords(2200, "initial"),
+      lengthSpec: buildLengthSpec(2200, "en"),
+      reviewLogic: vi.fn()
+        .mockResolvedValueOnce(review("logic-canon-auditor", 72, "MAJOR"))
+        .mockResolvedValue(review("logic-canon-auditor", 92)),
+      reviewCommercial: vi.fn().mockResolvedValue(review("commercial-reader", 90)),
+      revise,
+    });
+
+    expect(result.status).toBe("APPROVED");
+    expect(result.revisionCount).toBe(2);
+    expect(result.bestCandidate).toMatchObject({ label: "REVISION_2", lengthCount: 1900, lengthInHardRange: true });
+    expect(revise).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails closed when both bounded revisions remain below hard minimum", async () => {
+    const result = await runBoundedReviewCycle({
+      initialContent: englishWords(2200, "initial"),
+      lengthSpec: buildLengthSpec(2200, "en"),
+      reviewLogic: vi.fn()
+        .mockResolvedValueOnce(review("logic-canon-auditor", 72, "MAJOR"))
+        .mockResolvedValue(review("logic-canon-auditor", 92)),
+      reviewCommercial: vi.fn().mockResolvedValue(review("commercial-reader", 90)),
+      revise: vi.fn()
+        .mockResolvedValueOnce({ content: englishWords(700, "short") })
+        .mockResolvedValueOnce({ content: englishWords(900, "stillshort") }),
+    });
+
+    expect(result.status).toBe("BLOCKED_CRITICAL_FINDINGS");
+    expect(result.holdReason).toBe("LENGTH_BUDGET_VIOLATION");
+    expect(result.candidates.map((candidate) => candidate.lengthCount)).toEqual([2200, 700, 900]);
+  });
+
+  it("does not accept a 1500-word candidate with only nonblocking findings", async () => {
+    const result = await runBoundedReviewCycle({
+      initialContent: englishWords(1500, "initial"),
+      lengthSpec: buildLengthSpec(2200, "en"),
+      reviewLogic: vi.fn().mockResolvedValue({
+        ...review("logic-canon-auditor", 81, "MINOR"),
+        decision: "APPROVED_WITH_NOTES",
+      }),
+      reviewCommercial: vi.fn().mockResolvedValue(review("commercial-reader", 90)),
+      revise: vi.fn().mockResolvedValue({ content: englishWords(1500, "short") }),
+    });
+
+    expect(result.status).toBe("BLOCKED_CRITICAL_FINDINGS");
+    expect(result.holdReason).toBe("LENGTH_BUDGET_VIOLATION");
+  });
+
+  it("rejects a synthetic terminal result whose final count is outside the hard range", () => {
+    const finalContent = englishWords(702, "short");
+    const candidate = {
+      label: "REVISION_2" as const,
+      content: finalContent,
+      sha256: "a".repeat(64),
+      reviews: [],
+      combinedScore: 190,
+      lengthCount: 702,
+      lengthInHardRange: false,
+    };
+    const result: BoundedReviewResult = {
+      status: "APPROVED", grade: "A", finalContent, revisionCount: 2,
+      candidates: [candidate], bestCandidate: candidate, usageByRole: {},
+    };
+    const assertTerminalLength = (boundedReviewModule as unknown as {
+      assertBoundedReviewTerminalLength: (
+        result: BoundedReviewResult,
+        finalCount: number,
+        lengthSpec: ReturnType<typeof buildLengthSpec>,
+      ) => void;
+    }).assertBoundedReviewTerminalLength;
+
+    expect(() => assertTerminalLength(result, 702, buildLengthSpec(2200, "en")))
+      .toThrow("BOUNDED_AUTONOMOUS_LENGTH_BUDGET_VIOLATION");
   });
 });

@@ -100,6 +100,50 @@ describe("ReviserAgent", () => {
     }
   });
 
+  it("states the deterministic English hard range without inviting scene collapse", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-reviser-hard-length-test-"));
+    const bookDir = join(root, "book");
+    await mkdir(join(bookDir, "story"), { recursive: true });
+    await writeFile(join(bookDir, "book.json"), JSON.stringify({
+      id: "english-book", title: "English Book", genre: "xuanhuan", platform: "royalroad",
+      chapterWordCount: 2200, targetChapters: 60, status: "active", language: "en",
+      createdAt: "2026-08-28T00:00:00.000Z", updatedAt: "2026-08-28T00:00:00.000Z",
+    }), "utf-8");
+    const agent = new ReviserAgent({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model",
+      projectRoot: root,
+    });
+    const chatSpy = vi.spyOn(ReviserAgent.prototype as never, "chat" as never).mockResolvedValue({
+      content: "=== FIXED_ISSUES ===\n- repaired\n\n=== REVISED_CONTENT ===\nRevised chapter content.",
+      usage: ZERO_USAGE,
+    });
+
+    try {
+      await agent.reviseChapter(
+        bookDir,
+        "Original chapter content.",
+        1,
+        [CRITICAL_ISSUE],
+        "auto",
+        "xuanhuan",
+        { lengthSpec: buildLengthSpec(2200, "en") },
+      );
+      const systemPrompt = (chatSpy.mock.calls[0]?.[0] as ReadonlyArray<{ content: string }> | undefined)?.[0]?.content ?? "";
+
+      expect(systemPrompt).toContain("target near 2200 words");
+      expect(systemPrompt).toContain("MUST remain within 1600-2800 words");
+      expect(systemPrompt).toContain("must not collapse scenes or delete necessary narrative substance");
+      expect(systemPrompt).not.toContain("1900-2500");
+      expect(systemPrompt).not.toContain("1600-2800 characters");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("keeps rewrite mode local-first instead of encouraging full-chapter replacement", async () => {
     const root = await mkdtemp(join(tmpdir(), "inkos-reviser-rewrite-guardrail-test-"));
     const bookDir = join(root, "book");

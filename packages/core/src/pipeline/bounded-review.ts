@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import type { AuditResult } from "../agents/continuity.js";
+import type { LengthSpec } from "../models/length-governance.js";
+import { countChapterLength, isOutsideHardRange } from "../utils/length-metrics.js";
 
 export type ReviewSeverity = "CRITICAL" | "MAJOR" | "MINOR" | "NOTE";
 export type ReviewerRole = "logic-canon-auditor" | "commercial-reader";
@@ -78,6 +80,8 @@ export interface BoundedCandidate {
   readonly sha256: string;
   readonly reviews: ReadonlyArray<ScoredReview>;
   readonly combinedScore: number;
+  readonly lengthCount: number;
+  readonly lengthInHardRange: boolean;
 }
 
 export interface BoundedReviewResult {
@@ -87,7 +91,7 @@ export interface BoundedReviewResult {
   readonly revisionCount: 0 | 1 | 2;
   readonly candidates: ReadonlyArray<BoundedCandidate>;
   readonly bestCandidate: BoundedCandidate;
-  readonly holdReason?: "AUTHORITY_BLOCKER" | "INVALID_OUTPUT" | "REVISION_LIMIT_REACHED";
+  readonly holdReason?: "AUTHORITY_BLOCKER" | "INVALID_OUTPUT" | "REVISION_LIMIT_REACHED" | "LENGTH_BUDGET_VIOLATION";
   readonly invalidReviewerRole?: ReviewerRole;
   readonly usageByRole: Readonly<Record<string, RoleTokenUsage>>;
 }
@@ -176,8 +180,53 @@ function usageAdd(left: RoleTokenUsage | undefined, right: RoleTokenUsage | unde
   };
 }
 
+function lengthBudgetFinding(lengthCount: number, lengthSpec: LengthSpec): ReviewFinding {
+  const unit = lengthSpec.countingMode === "en_words" ? "words" : "characters";
+  return {
+    findingId: "length-budget",
+    severity: "CRITICAL",
+    evidence: `Candidate length ${lengthCount} ${unit} is outside the hard range ${lengthSpec.hardMin}-${lengthSpec.hardMax}.`,
+    impact: "length-budget",
+    requiredOutcome: `Revise near ${lengthSpec.target} ${unit} and keep the final chapter within ${lengthSpec.hardMin}-${lengthSpec.hardMax} ${unit} without collapsing required scenes or narrative substance.`,
+  };
+}
+
+function hasLiteraryBlocker(candidate: BoundedCandidate): boolean {
+  return candidate.reviews.some((review) => review.authorityBlocker === true
+    || review.decision === "HELD" || review.decision === "INVALID_OUTPUT" || review.decision === "REVISION_REQUIRED"
+    || has(review, "CRITICAL", "MAJOR"));
+}
+
+function hasCompleteBoundReviews(candidate: BoundedCandidate): boolean {
+  return candidate.reviews.length === 2
+    && candidate.reviews.every((review) => review.reviewedCandidateSha === candidate.sha256);
+}
+
+function isApprovedCandidate(candidate: BoundedCandidate, candidateGrade: ReturnType<typeof grade>): boolean {
+  return (candidateGrade === "A" || candidateGrade === "B")
+    && candidate.lengthInHardRange
+    && hasCompleteBoundReviews(candidate)
+    && !hasLiteraryBlocker(candidate);
+}
+
+export function assertBoundedReviewTerminalLength(
+  result: BoundedReviewResult,
+  finalCount: number,
+  lengthSpec: LengthSpec,
+): void {
+  if (result.status !== "APPROVED" && result.status !== "ACCEPTED_WITH_FINDINGS") return;
+  const deterministicCount = countChapterLength(result.finalContent, lengthSpec.countingMode);
+  if (finalCount !== deterministicCount
+    || result.bestCandidate.lengthCount !== deterministicCount
+    || !result.bestCandidate.lengthInHardRange
+    || isOutsideHardRange(deterministicCount, lengthSpec)) {
+    throw new Error("BOUNDED_AUTONOMOUS_LENGTH_BUDGET_VIOLATION");
+  }
+}
+
 export async function runBoundedReviewCycle(params: {
   readonly initialContent: string;
+  readonly lengthSpec: LengthSpec;
   /** Formally validated reviews bound to the exact INITIAL candidate. */
   readonly initialReviews?: Partial<Readonly<Record<ReviewerRole, ScoredReview>>>;
   readonly reviewLogic: Reviewer;
@@ -223,12 +272,15 @@ export async function runBoundedReviewCycle(params: {
     ?? await reviewCandidate("READER_REVIEW", params.reviewCommercial, initialSha);
 
   const appendCandidate = (label: BoundedCandidate["label"]) => {
+    const lengthCount = countChapterLength(content, params.lengthSpec.countingMode);
     const candidate: BoundedCandidate = {
       label,
       content,
       sha256: sha256(content),
       reviews: [logic, commercial],
       combinedScore: logic.totalScore + commercial.totalScore,
+      lengthCount,
+      lengthInHardRange: !isOutsideHardRange(lengthCount, params.lengthSpec),
     };
     candidates.push(candidate);
     return candidate;
@@ -243,42 +295,31 @@ export async function runBoundedReviewCycle(params: {
       candidates, bestCandidate: current, holdReason: "INVALID_OUTPUT", invalidReviewerRole: initialInvalidRole, usageByRole,
     };
   }
-  if (currentGrade === "A" || currentGrade === "B") {
-    return { status: "APPROVED", grade: currentGrade, finalContent: content, revisionCount: 0, candidates, bestCandidate: current, usageByRole };
-  }
   if (logic.authorityBlocker || commercial.authorityBlocker) {
     return { status: "BLOCKED_CRITICAL_FINDINGS", grade: "D", finalContent: content, revisionCount: 0, candidates, bestCandidate: current, holdReason: "AUTHORITY_BLOCKER", usageByRole };
+  }
+  if (logic.decision === "HELD" || commercial.decision === "HELD") {
+    return { status: "BLOCKED_CRITICAL_FINDINGS", grade: "D", finalContent: content, revisionCount: 0, candidates, bestCandidate: current, usageByRole };
+  }
+  if (isApprovedCandidate(current, currentGrade)) {
+    return { status: "APPROVED", grade: currentGrade, finalContent: content, revisionCount: 0, candidates, bestCandidate: current, usageByRole };
   }
 
   for (const round of [1, 2] as const) {
     const priorLogic = logic;
     const priorCommercial = commercial;
-    const logicNeedsReview = grade(priorLogic, {
-      ...priorCommercial,
-      totalScore: 100,
-      dimensionScores: { pass: 100 },
-      findings: [],
-      decision: "APPROVED",
-    }) !== "A" || priorLogic.findings.length > 0;
-    const commercialNeedsReview = grade({
-      ...priorLogic,
-      totalScore: 100,
-      dimensionScores: { pass: 100 },
-      findings: [],
-      decision: "APPROVED",
-    }, priorCommercial) !== "A" || priorCommercial.findings.length > 0;
-    const findings = [...priorLogic.findings, ...priorCommercial.findings];
+    const findings = [
+      ...priorLogic.findings,
+      ...priorCommercial.findings,
+      ...(!current.lengthInHardRange ? [lengthBudgetFinding(current.lengthCount, params.lengthSpec)] : []),
+    ];
     await params.onStage?.(round === 1 ? "REVISING_1" : "RESCUE_REVISING_2");
     const revised = await params.revise(content, findings, round);
     usageByRole.reviser = usageAdd(usageByRole.reviser, revised.tokenUsage);
     content = revised.content;
     const candidateSha = sha256(content);
-    if (logicNeedsReview) {
-      logic = await reviewCandidate("LOGIC_REVIEW", params.reviewLogic, candidateSha);
-    }
-    if (commercialNeedsReview) {
-      commercial = await reviewCandidate("READER_REVIEW", params.reviewCommercial, candidateSha);
-    }
+    logic = await reviewCandidate("LOGIC_REVIEW", params.reviewLogic, candidateSha);
+    commercial = await reviewCandidate("READER_REVIEW", params.reviewCommercial, candidateSha);
     current = appendCandidate(round === 1 ? "REVISION_1" : "REVISION_2");
     currentGrade = grade(logic, commercial);
     const invalidRole = invalidReviewerRole(logic, commercial);
@@ -288,27 +329,50 @@ export async function runBoundedReviewCycle(params: {
         candidates, bestCandidate: current, holdReason: "INVALID_OUTPUT", invalidReviewerRole: invalidRole, usageByRole,
       };
     }
-    if (currentGrade === "A" || currentGrade === "B") {
-      return { status: "APPROVED", grade: currentGrade, finalContent: content, revisionCount: round, candidates, bestCandidate: current, usageByRole };
-    }
     if (logic.authorityBlocker || commercial.authorityBlocker) {
       return {
         status: "BLOCKED_CRITICAL_FINDINGS", grade: "D", finalContent: content, revisionCount: round,
         candidates, bestCandidate: current, holdReason: "AUTHORITY_BLOCKER", usageByRole,
       };
     }
+    if (logic.decision === "HELD" || commercial.decision === "HELD") {
+      return {
+        status: "BLOCKED_CRITICAL_FINDINGS", grade: "D", finalContent: content, revisionCount: round,
+        candidates, bestCandidate: current, usageByRole,
+      };
+    }
+    if (isApprovedCandidate(current, currentGrade)) {
+      return { status: "APPROVED", grade: currentGrade, finalContent: content, revisionCount: round, candidates, bestCandidate: current, usageByRole };
+    }
   }
 
-  const finalFindings = current.reviews.flatMap((review) => review.findings);
-  const finalBlocking = finalFindings.some((finding) => finding.severity === "CRITICAL" || finding.severity === "MAJOR");
+  const terminalCandidates = candidates.filter((candidate) => candidate.lengthInHardRange
+    && hasCompleteBoundReviews(candidate) && !hasLiteraryBlocker(candidate));
+  const bestTerminalCandidate = terminalCandidates.reduce<BoundedCandidate | undefined>((best, candidate) => {
+    if (!best || candidate.combinedScore >= best.combinedScore) return candidate;
+    return best;
+  }, undefined);
+  if (bestTerminalCandidate) {
+    return {
+      status: "ACCEPTED_WITH_FINDINGS",
+      grade: "D",
+      finalContent: bestTerminalCandidate.content,
+      revisionCount: 2,
+      candidates,
+      bestCandidate: bestTerminalCandidate,
+      usageByRole,
+    };
+  }
+
+  const finalBlocking = hasLiteraryBlocker(current);
   return {
-    status: finalBlocking ? "HELD_AFTER_TWO_REVISIONS" : "ACCEPTED_WITH_FINDINGS",
+    status: finalBlocking ? "HELD_AFTER_TWO_REVISIONS" : "BLOCKED_CRITICAL_FINDINGS",
     grade: currentGrade === "E" ? "E" : "D",
     finalContent: current.content,
     revisionCount: 2,
     candidates,
     bestCandidate: current,
-    ...(finalBlocking ? { holdReason: "REVISION_LIMIT_REACHED" as const } : {}),
+    holdReason: finalBlocking ? "REVISION_LIMIT_REACHED" : "LENGTH_BUDGET_VIOLATION",
     usageByRole,
   };
 }

@@ -53,6 +53,10 @@ const ZERO_USAGE = {
   totalTokens: 0,
 } as const;
 
+function englishWords(count: number, word = "word"): string {
+  return Array.from({ length: count }, () => word).join(" ");
+}
+
 describe("buildImportFoundationSource", () => {
   it("selects complete opening, middle, and ending chapters without truncating their text", () => {
     const chapters = Array.from({ length: 36 }, (_, index) => {
@@ -399,8 +403,9 @@ describe("PipelineRunner", () => {
     const bookDir = state.bookDir(bookId);
     const storyDir = join(bookDir, "story");
     const chaptersDir = join(bookDir, "chapters");
-    const candidate = "CANDIDATE_A requires one bounded repair.";
-    const revised = "CANDIDATE_A after the bounded repair.";
+    const candidate = englishWords(2200, "initial");
+    const shortRevision = englishWords(700, "short");
+    const recoveredRevision = englishWords(1900, "recovered");
     const candidateSha = createHash("sha256").update(candidate).digest("hex");
     const logicDimensions = {
       blueprint_transition: 80, causal_logic: 70, canon_continuity: 90, character_motivation: 90,
@@ -423,6 +428,11 @@ describe("PipelineRunner", () => {
       invalidReviewerRoles: ["commercial-reader"], historicalRoleUsage: {},
     };
     try {
+      await state.saveBookConfig(bookId, {
+        ...(await state.loadBookConfig(bookId)),
+        language: "en",
+        chapterWordCount: 2200,
+      });
       await Promise.all([
         writeFile(join(storyDir, "current_state.md"), createStateCard({ chapter: 5, location: "Gate", protagonistState: "Ready", goal: "Proceed", conflict: "Delay" })),
         writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n"),
@@ -449,9 +459,9 @@ describe("PipelineRunner", () => {
         passed: true, overallScore: 92,
         dimensionScores: { blueprint_transition: 92, causal_logic: 92, canon_continuity: 92, character_motivation: 92, state_inheritance: 92, hooks_disclosure: 92, narrative_clarity: 92 },
       }));
-      const reviser = vi.spyOn(ReviserAgent.prototype, "reviseChapter").mockResolvedValue(createReviseOutput({ revisedContent: revised, wordCount: revised.length }));
+      const reviser = vi.spyOn(ReviserAgent.prototype, "reviseChapter");
       vi.spyOn(ChapterAnalyzerAgent.prototype, "analyzeChapter").mockResolvedValue(createAnalyzedOutput({
-        chapterNumber: 6, title: "Generic Six", content: revised, wordCount: revised.length,
+        chapterNumber: 6, title: "Generic Six", content: recoveredRevision, wordCount: 1900,
         chapterSummary: "| 6 | Generic Six | Hero | Repaired | State advances | hook | tense | mainline |",
       }));
 
@@ -468,19 +478,43 @@ describe("PipelineRunner", () => {
       await expect(stat(join(storyDir, "snapshots", "6"))).rejects.toMatchObject({ code: "ENOENT" });
 
       commercial.mockReset().mockResolvedValue(validCommercial);
+      logic.mockClear();
+      reviser.mockReset()
+        .mockResolvedValueOnce(createReviseOutput({ revisedContent: shortRevision, wordCount: 700 }))
+        .mockResolvedValueOnce(createReviseOutput({ revisedContent: shortRevision, wordCount: 700 }));
+      const shortResult = await executePreserved();
+
+      expect(shortResult.status).toBe("blocked-critical-findings");
+      expect(shortResult.autonomousReview?.holdReason).toBe("LENGTH_BUDGET_VIOLATION");
+      expect(writeChapter).not.toHaveBeenCalled();
+      expect((await state.loadChapterIndex(bookId))).toHaveLength(5);
+      expect((await readdir(chaptersDir)).some((name) => name.startsWith("0006_"))).toBe(false);
+      await expect(stat(join(storyDir, "snapshots", "6"))).rejects.toMatchObject({ code: "ENOENT" });
+
+      commercial.mockReset().mockResolvedValue(validCommercial);
+      logic.mockClear();
+      reviser.mockReset()
+        .mockResolvedValueOnce(createReviseOutput({ revisedContent: shortRevision, wordCount: 700 }))
+        .mockResolvedValueOnce(createReviseOutput({ revisedContent: recoveredRevision, wordCount: 1900 }));
       const result = await executePreserved();
 
       expect(result.status).toBe("ready-for-review");
+      expect(result.wordCount).toBe(1900);
+      expect(result.autonomousReview?.bestCandidate).toMatchObject({
+        label: "REVISION_2",
+        lengthCount: 1900,
+        lengthInHardRange: true,
+      });
       expect(writeChapter).not.toHaveBeenCalled();
-      expect(commercial).toHaveBeenCalledTimes(1);
+      expect(commercial).toHaveBeenCalledTimes(3);
       expect(reviser).toHaveBeenCalledWith(bookDir, candidate, 6, expect.any(Array), "auto", expect.any(String), expect.any(Object));
-      expect(logic).toHaveBeenCalledTimes(1);
-      expect((await state.loadChapterIndex(bookId)).at(-1)).toMatchObject({ number: 6, title: "Generic Six", status: "ready-for-review" });
+      expect(logic).toHaveBeenCalledTimes(2);
+      expect((await state.loadChapterIndex(bookId)).at(-1)).toMatchObject({ number: 6, title: "Generic Six", status: "ready-for-review", wordCount: 1900 });
       const chapterName = (await readdir(chaptersDir)).find((name) => name.startsWith("0006_"));
-      expect(await readFile(join(chaptersDir, chapterName!), "utf-8")).toContain(revised);
+      expect(countChapterLength(await readFile(join(chaptersDir, chapterName!), "utf-8"), "en_words")).toBe(1900);
       expect(await stat(join(storyDir, "snapshots", "6"))).toBeTruthy();
       expect((await readdir(join(storyDir, "runtime", "bounded-autonomous", "chapter-0006"))).filter((name) => /^preserved-review-resume-\d{3}\.json$/u.test(name))).toEqual([
-        "preserved-review-resume-001.json", "preserved-review-resume-002.json",
+        "preserved-review-resume-001.json", "preserved-review-resume-002.json", "preserved-review-resume-003.json",
       ]);
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -561,6 +595,8 @@ describe("PipelineRunner", () => {
       sha256: "a".repeat(64),
       reviews: [],
       combinedScore: 0,
+      lengthCount: 1,
+      lengthInHardRange: true,
     };
     const invalid: BoundedReviewResult = {
       status: "REVIEW_OUTPUT_INVALID", grade: "E", finalContent: "candidate", revisionCount: 0,
