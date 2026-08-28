@@ -24,7 +24,7 @@ export const AUTONOMOUS_BUDGET_NOT_CONFIGURED = { status: "BUDGET_NOT_CONFIGURED
 
 interface AutonomousRecoveryOwnershipProjection {
   readonly kind: "FORMAL_OFFLINE_FINALIZATION" | "FORMAL_BOUNDED_STATE_REBASELINE" | "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME";
-  readonly recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED" | "FAILED_REENTRY" | "PRESERVED_BOUNDED_REVIEW";
+  readonly recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED" | "FAILED_REENTRY" | "PRESERVED_BOUNDED_REVIEW" | "TERMINAL_LENGTH_VIOLATION";
   readonly bookId: string;
   readonly jobId: string;
   readonly pendingChapterNumber: number;
@@ -46,8 +46,17 @@ export async function resolveOfflineFinalizationPlan(params: {
     && ownership?.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
     && params.runtime?.nextChapter === params.pendingChapter
     && params.nextChapter === params.pendingChapter + 1;
-  if (!params.runtime?.jobId || (!ownedReentry && !["REVIEW_EXHAUSTED", "BLOCKED_CRITICAL_FINDINGS", "REVIEW_OUTPUT_INVALID", "HELD_AFTER_TWO_REVISIONS"].includes(params.runtime.status))
-    || (params.runtime.nextChapter !== params.nextChapter && !terminalPreservedRestartWindow)) return null;
+  const terminalLengthRestartWindow = ownedReentry
+    && ownership?.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
+    && ownership.recoveryClass === "TERMINAL_LENGTH_VIOLATION"
+    && params.nextChapter === params.pendingChapter
+    && (params.runtime?.nextChapter ?? 0) >= params.pendingChapter;
+  const terminalLengthDiscovery = (params.runtime?.status === "PAUSED_BY_USER" || params.runtime?.status === "PAUSED")
+    && params.runtime.nextChapter === params.nextChapter
+    && params.pendingChapter < params.nextChapter;
+  if (!params.runtime?.jobId || (!ownedReentry && !terminalLengthDiscovery
+    && !["REVIEW_EXHAUSTED", "BLOCKED_CRITICAL_FINDINGS", "REVIEW_OUTPUT_INVALID", "HELD_AFTER_TWO_REVISIONS"].includes(params.runtime.status))
+    || (params.runtime.nextChapter !== params.nextChapter && !terminalPreservedRestartWindow && !terminalLengthRestartWindow)) return null;
   return resolveFormalPendingChapterRecoveryPlan({
     projectRoot: params.projectRoot,
     bookId: params.bookId,
@@ -240,7 +249,6 @@ export function projectAutonomousProductionView(params: {
   const blockers: string[] = [];
   if (params.targetChapters !== params.map.totalChapters) blockers.push("BOOK_TARGET_CHAPTERS_MISMATCH");
   const degraded = params.chapters.find((chapter) => chapter.status === "state-degraded");
-  if (degraded) blockers.push(`PENDING_STATE_REPAIR_CHAPTER_${degraded.number}`);
   const repairNeedsReconciliation = !params.active && params.runtime?.status === "REPAIRING";
   if (repairNeedsReconciliation) blockers.push("STATE_REPAIR_RECONCILIATION_REQUIRED");
   const auditFailed = params.chapters.find((chapter) => chapter.status === "audit-failed");
@@ -249,10 +257,23 @@ export function projectAutonomousProductionView(params: {
     && params.offlineFinalizationPlan.bookId === params.map.bookId
     && params.offlineFinalizationPlan.jobId === params.runtime?.jobId
     && (params.offlineFinalizationPlan.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
-      ? params.offlineFinalizationPlan.pendingChapterNumber === params.nextChapter
+      ? params.offlineFinalizationPlan.recoveryClass === "TERMINAL_LENGTH_VIOLATION"
+        ? params.offlineFinalizationPlan.terminalLengthRecovery?.preparationStatus === "REQUIRED"
+          ? params.offlineFinalizationPlan.pendingChapterNumber < params.nextChapter
+            && (params.offlineFinalizationPlan.terminalLengthRecovery.downstreamChapters.at(-1)?.chapterNumber
+              ?? params.offlineFinalizationPlan.pendingChapterNumber) === params.nextChapter - 1
+          : params.offlineFinalizationPlan.pendingChapterNumber === params.nextChapter
+        : params.offlineFinalizationPlan.pendingChapterNumber === params.nextChapter
       : params.offlineFinalizationPlan.pendingChapterNumber === auditFailed?.number)
       ? params.offlineFinalizationPlan
       : undefined;
+  const terminalLengthRecovery = formalRecoveryPlan?.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
+    && formalRecoveryPlan.recoveryClass === "TERMINAL_LENGTH_VIOLATION"
+    ? formalRecoveryPlan.terminalLengthRecovery
+    : undefined;
+  if (degraded && !terminalLengthRecovery?.downstreamChapters.some((chapter) => chapter.chapterNumber === degraded.number)) {
+    blockers.push(`PENDING_STATE_REPAIR_CHAPTER_${degraded.number}`);
+  }
   const finalReviewRecovery = formalRecoveryPlan
       ? {
           recoveryMode: formalRecoveryPlan.kind,
@@ -265,6 +286,13 @@ export function projectAutonomousProductionView(params: {
           ...(formalRecoveryPlan.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME" ? {
             existingValidReviewers: Object.keys(formalRecoveryPlan.initialReviews),
             invalidReviewerRoles: formalRecoveryPlan.invalidReviewerRoles.map((role) => String(role)),
+            ...(formalRecoveryPlan.recoveryClass === "TERMINAL_LENGTH_VIOLATION" && formalRecoveryPlan.terminalLengthRecovery ? {
+              currentInvalidTerminalLength: formalRecoveryPlan.terminalLengthRecovery.currentLengthCount,
+              recoveryCandidateLength: formalRecoveryPlan.terminalLengthRecovery.candidateLengthCount,
+              downstreamAction: "DISCARD_AND_REGENERATE" as const,
+              downstreamChapters: formalRecoveryPlan.terminalLengthRecovery.downstreamChapters.map((chapter) => chapter.chapterNumber),
+              preparationStatus: formalRecoveryPlan.terminalLengthRecovery.preparationStatus,
+            } : {}),
           } : {}),
           writerRegeneration: false as const,
           normalRevisionRegeneration: false as const,

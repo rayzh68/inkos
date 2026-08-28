@@ -521,6 +521,135 @@ describe("PipelineRunner", () => {
     }
   }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
 
+  it("safely prunes only archived unchanged stale structured state while resuming a partial terminal-length rewind", async () => {
+    const { root, runner, state, bookId } = await createRunnerFixture({ boundedAutonomousReview: true });
+    const bookDir = state.bookDir(bookId);
+    const chaptersDir = join(bookDir, "chapters");
+    const storyDir = join(bookDir, "story");
+    const currentSix = `# Chapter 6: Generic Six\n\n${englishWords(700, "short")}`;
+    const currentSeven = `# Chapter 7: Generic Seven\n\n${englishWords(2100, "seven")}`;
+    const initial = englishWords(2200, "initial");
+    const candidateSha = createHash("sha256").update(initial).digest("hex");
+    const reviewEvidenceBytes = "REVIEW_EVIDENCE";
+    const runEvidenceBytes = "RUN_SIX";
+    const terminalReceiptBytes = "TERMINAL_RECEIPT";
+    const titleArtifactBytes = "TITLE_AUTHORITY";
+    const terminalCandidate = englishWords(700, "terminal");
+    const baselineFacts = JSON.stringify({ facts: ["chapter-5-authority"] });
+    const legacyExtra = JSON.stringify({ legacy: true });
+    const titleLogicalStepId = `provider-step-${"b".repeat(64)}`;
+    const plan: FormalPreservedBoundedReviewResumePlan = {
+      kind: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME", recoveryClass: "TERMINAL_LENGTH_VIOLATION",
+      bookId, jobId: "generic-job", pendingChapterNumber: 6, baselineChapterNumber: 5, productionMapSha256: "a".repeat(64),
+      candidate: { content: initial, sha256: candidateSha, title: "Generic Six", titleAuthorityLogicalStepId: titleLogicalStepId, titleAuthorityArtifactSha256: createHash("sha256").update(titleArtifactBytes).digest("hex") },
+      reviewEvidence: { relativePath: "story/runtime/bounded-autonomous/chapter-0006/review.json", sha256: createHash("sha256").update(reviewEvidenceBytes).digest("hex"), runRelativePath: "story/runtime/chapter-0006.run.json", runSha256: createHash("sha256").update(runEvidenceBytes).digest("hex") },
+      initialReviews: {}, invalidReviewerRoles: ["commercial-reader"], historicalRoleUsage: {},
+      terminalLengthRecovery: {
+        bookConfigSha256: createHash("sha256").update(await readFile(join(bookDir, "book.json"))).digest("hex"),
+        baselineSnapshotFiles: [
+          { relativePath: "story/snapshots/5/current_state.md", sha256: createHash("sha256").update("# Current State\n\nChapter 5").digest("hex") },
+          { relativePath: "story/snapshots/5/pending_hooks.md", sha256: createHash("sha256").update("# Pending Hooks\n").digest("hex") },
+          { relativePath: "story/snapshots/5/state/facts.json", sha256: createHash("sha256").update(baselineFacts).digest("hex") },
+          { relativePath: "story/snapshots/5/state/manifest.json", sha256: createHash("sha256").update(JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 5 })).digest("hex") },
+        ],
+        currentChapterFile: "0006_Generic_Six.md", currentChapterSha256: createHash("sha256").update(currentSix).digest("hex"),
+        currentLengthCount: 700, candidateLengthCount: 2200, hardMin: 1600, hardMax: 2800,
+        terminalReceiptRelativePath: "story/runtime/bounded-autonomous/chapter-0006/preserved-review-resume-001.json", terminalReceiptSha256: createHash("sha256").update(terminalReceiptBytes).digest("hex"), terminalCandidateSha256: createHash("sha256").update(terminalCandidate).digest("hex"),
+        downstreamChapters: [{ chapterNumber: 7, chapterFile: "0007_Generic_Seven.md", chapterSha256: createHash("sha256").update(currentSeven).digest("hex"), action: "DISCARD_AND_REGENERATE" }],
+        preparationStatus: "REQUIRED",
+      },
+    };
+    try {
+      await state.saveChapterIndex(bookId, Array.from({ length: 5 }, (_, index) => ({
+        number: index + 1, title: `Chapter ${index + 1}`, status: "approved" as const, wordCount: 2000,
+        createdAt: "2026-08-28T00:00:00.000Z", updatedAt: "2026-08-28T00:00:00.000Z", auditIssues: [], lengthWarnings: [],
+      })));
+      await mkdir(join(storyDir, "state"), { recursive: true });
+      await Promise.all([
+        writeFile(join(storyDir, "state", "manifest.json"), JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 5 })),
+        writeFile(join(storyDir, "state", "facts.json"), baselineFacts),
+        writeFile(join(storyDir, "current_state.md"), "# Current State\n\nChapter 5"),
+        writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n"),
+        writeFile(join(storyDir, "memory.db"), "MEMORY_DB"),
+      ]);
+      await state.snapshotState(bookId, 5);
+      await mkdir(join(storyDir, "runtime"), { recursive: true });
+      const boundedEvidenceDir = join(storyDir, "runtime", "bounded-autonomous", "chapter-0006");
+      const providerDir = join(storyDir, "runtime", "bounded-autonomous", "provider-responses");
+      await Promise.all([mkdir(boundedEvidenceDir, { recursive: true }), mkdir(providerDir, { recursive: true })]);
+      await Promise.all([
+        writeFile(join(chaptersDir, "0006_Generic_Six.md"), currentSix),
+        writeFile(join(chaptersDir, "0007_Generic_Seven.md"), currentSeven),
+        writeFile(join(storyDir, "state", "manifest.json"), JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 7 })),
+        writeFile(join(storyDir, "state", "legacy-extra.json"), legacyExtra),
+        writeFile(join(storyDir, "runtime", "chapter-0006.run.json"), runEvidenceBytes),
+        writeFile(join(storyDir, "runtime", "chapter-0007.run.json"), "RUN_SEVEN"),
+        writeFile(join(boundedEvidenceDir, "initial.md"), initial),
+        writeFile(join(boundedEvidenceDir, "review.json"), reviewEvidenceBytes),
+        writeFile(join(boundedEvidenceDir, "preserved-review-resume-001.json"), terminalReceiptBytes),
+        writeFile(join(boundedEvidenceDir, "preserved-review-resume-001-revision_2.md"), terminalCandidate),
+        writeFile(join(providerDir, `${titleLogicalStepId}.json`), titleArtifactBytes),
+      ]);
+      await state.saveChapterIndex(bookId, [
+        ...(await state.loadChapterIndex(bookId)),
+        { number: 6, title: "Generic Six", status: "approved", wordCount: 700, createdAt: "now", updatedAt: "now", auditIssues: [], lengthWarnings: [] },
+        { number: 7, title: "Generic Seven", status: "state-degraded", wordCount: 2100, createdAt: "now", updatedAt: "now", auditIssues: [], lengthWarnings: [] },
+      ]);
+
+      const prepare = (value: FormalPreservedBoundedReviewResumePlan) => (runner as unknown as {
+        prepareTerminalLengthViolationRecoveryLocked: (value: FormalPreservedBoundedReviewResumePlan) => Promise<FormalPreservedBoundedReviewResumePlan>;
+      }).prepareTerminalLengthViolationRecoveryLocked(value);
+      const rollback = vi.spyOn(StateManager.prototype, "rollbackToChapter").mockImplementationOnce(async function (
+        this: StateManager,
+        _targetBookId: string,
+        _targetChapter: number,
+      ) {
+        await Promise.all([
+          writeFile(join(storyDir, "current_state.md"), "# Current State\n\nChapter 5"),
+          writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n"),
+          writeFile(join(storyDir, "state", "manifest.json"), JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 5 })),
+        ]);
+        throw new Error("synthetic crash during rewind after projections");
+      });
+      await expect(prepare(plan)).rejects.toThrow("synthetic crash during rewind after projections");
+      const receiptDir = join(storyDir, "runtime", "bounded-autonomous", "chapter-0006", "terminal-length-recovery-001");
+      await expect(readFile(join(receiptDir, "prepared.json"), "utf-8")).resolves.toContain("TERMINAL_LENGTH_VIOLATION_PREPARATION");
+      rollback.mockRestore();
+      const partialPlan: FormalPreservedBoundedReviewResumePlan = {
+        ...plan,
+        terminalLengthRecovery: { ...plan.terminalLengthRecovery!, preparationStatus: "PARTIAL_REWIND" },
+      };
+      await writeFile(join(storyDir, "state", "legacy-extra.json"), JSON.stringify({ legacy: "tampered" }));
+      await expect(prepare(partialPlan)).rejects.toThrow("TERMINAL_LENGTH_RECOVERY_PREPARATION_EVIDENCE_INVALID");
+      await expect(readFile(join(storyDir, "state", "legacy-extra.json"), "utf-8")).resolves.toBe(JSON.stringify({ legacy: "tampered" }));
+      await writeFile(join(storyDir, "state", "legacy-extra.json"), legacyExtra);
+      await writeFile(join(storyDir, "state", "unexpected-new.json"), JSON.stringify({ unexpected: true }));
+      await expect(prepare(partialPlan)).rejects.toThrow("TERMINAL_LENGTH_RECOVERY_PREPARATION_EVIDENCE_INVALID");
+      await expect(readFile(join(storyDir, "state", "unexpected-new.json"), "utf-8")).resolves.toBe(JSON.stringify({ unexpected: true }));
+      await expect(readFile(join(storyDir, "state", "legacy-extra.json"), "utf-8")).resolves.toBe(legacyExtra);
+      await rm(join(storyDir, "state", "unexpected-new.json"));
+      const prepared = await prepare({
+        ...partialPlan,
+      });
+
+      expect(prepared.terminalLengthRecovery).toMatchObject({ preparationStatus: "REWOUND" });
+      expect((await state.loadChapterIndex(bookId)).map((chapter) => chapter.number)).toEqual([1, 2, 3, 4, 5]);
+      await expect(readFile(join(chaptersDir, "0006_Generic_Six.md"), "utf-8")).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(readFile(join(chaptersDir, "0007_Generic_Seven.md"), "utf-8")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(join(receiptDir, "archive", "chapters", "0006_Generic_Six.md"), "utf-8")).toBe(currentSix);
+      expect(await readFile(join(receiptDir, "archive", "chapters", "0007_Generic_Seven.md"), "utf-8")).toBe(currentSeven);
+      expect(await readFile(join(receiptDir, "archive", "story", "current_state.md"), "utf-8")).toBe("# Current State\n\nChapter 5");
+      expect(await readFile(join(receiptDir, "archive", "story", "memory.db"), "utf-8")).toBe("MEMORY_DB");
+      expect(await readFile(join(receiptDir, "archive", "story", "state", "legacy-extra.json"), "utf-8")).toBe(legacyExtra);
+      await expect(readFile(join(storyDir, "state", "legacy-extra.json"), "utf-8")).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await readdir(join(storyDir, "state"))).sort()).toEqual(["facts.json", "manifest.json"]);
+      expect(await readFile(join(storyDir, "state", "facts.json"), "utf-8")).toBe(baselineFacts);
+      await expect(readFile(join(receiptDir, "rewound.json"), "utf-8")).resolves.toContain("TERMINAL_LENGTH_VIOLATION_REWOUND");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("resets Chapter 7 preparation telemetry and emits APPROVED exactly once only after terminal approval", async () => {
     const stages: Array<{ stage: string; role: string }> = [];
     const { root, runner, state, bookId } = await createRunnerFixture({

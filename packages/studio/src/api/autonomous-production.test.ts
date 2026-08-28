@@ -64,6 +64,43 @@ describe("autonomous production Studio projection", () => {
     });
   });
 
+  it("projects a terminal length violation through the existing preserved-recovery product flow", () => {
+    const runtime = { jobId: "generic-job", status: "PAUSED_BY_USER", mode: "current-volume" as const, nextChapter: 8, chapterNumber: 7, updatedAt: "now" };
+    const view = projectAutonomousProductionView({
+      map, targetChapters: 156, nextChapter: 8,
+      chapters: [1, 2, 3, 4, 5].map((number) => ({ number, status: "approved" })).concat([
+        { number: 6, status: "approved" }, { number: 7, status: "state-degraded" },
+      ]),
+      config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini", reviser: "gpt", "observer-reflector": "flash" } },
+      catalog, runtime,
+      offlineFinalizationPlan: {
+        kind: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME", recoveryClass: "TERMINAL_LENGTH_VIOLATION",
+        bookId: "book", jobId: "generic-job", pendingChapterNumber: 6, baselineChapterNumber: 5, productionMapSha256: "a".repeat(64),
+        candidate: { content: "INITIAL", sha256: "b".repeat(64), title: "Generic Six", titleAuthorityLogicalStepId: `provider-step-${"c".repeat(64)}`, titleAuthorityArtifactSha256: "d".repeat(64) },
+        reviewEvidence: { relativePath: "review.json", sha256: "e".repeat(64), runRelativePath: "run.json", runSha256: "f".repeat(64) },
+        initialReviews: { "logic-canon-auditor": { reviewerRole: "logic-canon-auditor", provider: "test", model: "logic", totalScore: 80, dimensionScores: {}, decision: "REVISION_REQUIRED", findings: [], reviewedCandidateSha: "b".repeat(64), reviewedAt: "now" } },
+        invalidReviewerRoles: ["commercial-reader"], historicalRoleUsage: {},
+      terminalLengthRecovery: {
+        bookConfigSha256: "b".repeat(64),
+        baselineSnapshotFiles: [],
+          currentChapterFile: "0006_Generic_Six.md", currentChapterSha256: "1".repeat(64), currentLengthCount: 700, candidateLengthCount: 2200, hardMin: 1600, hardMax: 2800,
+          terminalReceiptRelativePath: "receipt.json", terminalReceiptSha256: "3".repeat(64), terminalCandidateSha256: "4".repeat(64),
+          downstreamChapters: [{ chapterNumber: 7, chapterFile: "0007_Generic_Seven.md", chapterSha256: "2".repeat(64), action: "DISCARD_AND_REGENERATE" }], preparationStatus: "REQUIRED",
+        },
+      },
+      active: false, budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
+    });
+
+    expect(view.runtimeStatus).toBe("RECOVERY_READY_PRESERVED_BOUNDED_REVIEW");
+    expect(view.startEnabled).toBe(true);
+    expect(view.runtimeBlockers).not.toContain("PENDING_STATE_REPAIR_CHAPTER_7");
+    expect(view.finalReviewRecovery).toMatchObject({
+      chapter: 6, recoveryClass: "TERMINAL_LENGTH_VIOLATION", currentInvalidTerminalLength: 700,
+      recoveryCandidateLength: 2200, downstreamAction: "DISCARD_AND_REGENERATE", downstreamChapters: [7],
+      writerRegeneration: false, additionalWriterCalls: 0,
+    });
+  });
+
   it("verifies preserved rescue and passed final-review artifacts without changing them", async () => {
     const root = await mkdtemp(join(tmpdir(), "inkos-offline-finalization-view-"));
     const bookDir = join(root, "books", "book");

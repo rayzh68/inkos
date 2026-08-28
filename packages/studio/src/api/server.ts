@@ -141,6 +141,7 @@ import {
   runBoundedAutonomousScope,
   startAutonomousJobHeartbeat,
   type AutonomousJobClaim,
+  type FormalPendingChapterRecoveryPlan,
 } from "@actalk/inkos-core";
 import { isConfirmedProductionAction } from "../shared/confirmed-production.js";
 import { summarizeToolResult } from "../shared/tool-result.js";
@@ -2760,10 +2761,21 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       loadProductionRoleModels(),
     ]);
     const pending = chapters.find((chapter) => chapter.status === "audit-failed");
-    const recoveryChapter = pending?.number ?? runtime?.nextChapter;
-    const offlineFinalizationPlan = recoveryChapter
-      ? await resolveOfflineFinalizationPlan({ projectRoot: root, bookId, pendingChapter: recoveryChapter, nextChapter, runtime }).catch(() => null)
-      : null;
+    const recoveryCandidates = pending
+      ? [pending.number]
+      : runtime?.recoveryOwnership?.pendingChapterNumber
+        ? [runtime.recoveryOwnership.pendingChapterNumber]
+        : runtime?.status === "PAUSED_BY_USER" || runtime?.status === "PAUSED"
+          ? chapters.filter((chapter) => ["approved", "accepted-with-findings", "published", "imported"].includes(chapter.status)).map((chapter) => chapter.number)
+          : runtime?.nextChapter ? [runtime.nextChapter] : [];
+    let offlineFinalizationPlan: FormalPendingChapterRecoveryPlan | null = null;
+    for (const recoveryChapter of recoveryCandidates) {
+      const resolution = resolveOfflineFinalizationPlan({ projectRoot: root, bookId, pendingChapter: recoveryChapter, nextChapter, runtime });
+      offlineFinalizationPlan = runtime?.status === "PAUSED" || runtime?.status === "PAUSED_BY_USER"
+        ? await resolution
+        : await resolution.catch(() => null);
+      if (offlineFinalizationPlan) break;
+    }
     const view = projectAutonomousProductionView({
       map,
       targetChapters: book.targetChapters,
@@ -2959,7 +2971,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       });
       productionMap = await requireBookProductionMap(root, bookId);
       const identityNextChapter = admittedOfflineFinalizationPlan?.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
-        && admittedOfflineFinalizationPlan.terminalReconciliation
+        && (admittedOfflineFinalizationPlan.terminalReconciliation || admittedOfflineFinalizationPlan.recoveryClass === "TERMINAL_LENGTH_VIOLATION")
         ? admittedOfflineFinalizationPlan.pendingChapterNumber
         : startedNextChapter;
       jobId = deriveAutonomousJobIdentity({ map: productionMap, mode, nextChapter: identityNextChapter });
@@ -3040,7 +3052,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         ? { pendingChapterNumber: admittedOfflineFinalizationPlan.pendingChapterNumber }
         : actions.pendingChapterNumber !== undefined ? { pendingChapterNumber: actions.pendingChapterNumber } : {}),
       ...(admittedOfflineFinalizationPlan?.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
-        && admittedOfflineFinalizationPlan.terminalReconciliation
+        && (admittedOfflineFinalizationPlan.terminalReconciliation || admittedOfflineFinalizationPlan.recoveryClass === "TERMINAL_LENGTH_VIOLATION")
         ? { recoveryScopeChapterNumber: admittedOfflineFinalizationPlan.pendingChapterNumber }
         : {}),
       shouldStop: () => autonomousJobs.shouldStop(bookId),

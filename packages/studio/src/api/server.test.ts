@@ -6834,7 +6834,72 @@ describe("createStudioServer daemon lifecycle", () => {
     });
   });
 
-  it("reconciles a terminal preserved Chapter 6 after restart without rerunning review or generation", async () => {
+  it("discovers a generic terminal length violation behind descendants and resumes it without creative Writer generation", async () => {
+    const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
+    raw.llm = { ...raw.llm, service: "openrouter", defaultModel: "openai/gpt", model: "openai/gpt", services: [{ service: "openrouter" }] };
+    raw.modelOverrides = { auditor: "deepseek/chat", "commercial-reader": "google/gemini", reviser: "openai/gpt", "observer-reflector": "deepseek/flash" };
+    await writeFile(join(root, "inkos.json"), JSON.stringify(raw, null, 2), "utf-8");
+    await mkdir(join(root, "books", "demo-book", "story", "outline"), { recursive: true });
+    await writeFile(join(root, "books", "demo-book", "story", "outline", "book-production-map.json"), JSON.stringify({
+      schema_version: "1.0", book_id: "demo-book", authority_book_id: "authority", title: "Demo", total_chapters: 8,
+      volumes: [{ volume_id: "volume-001", volume_number: 1, title: "One", start_chapter: 1, end_chapter: 8, chapter_count: 8 }],
+    }));
+    loadSecretsMock.mockResolvedValue({ services: { openrouter: { apiKey: "test-only-secret" } } });
+    probeModelsFromUpstreamMock.mockResolvedValue(["openai/gpt", "deepseek/chat", "google/gemini", "deepseek/flash"].map((id) => ({
+      id, name: id, contextWindow: 128_000, maxOutputTokens: 16_000, inputPrice: "0.000001", outputPrice: "0.000004", inputModalities: ["text"], outputModalities: ["text"],
+    })));
+    loadBookConfigMock.mockResolvedValue({ id: "demo-book", title: "Demo", genre: "urban", targetChapters: 8 });
+    let nextChapter = 8;
+    getNextChapterNumberMock.mockImplementation(async () => nextChapter);
+    loadChapterIndexMock.mockResolvedValue([1, 2, 3, 4, 5, 6, 7].map((number) => ({
+      number, title: `Chapter ${number}`, status: number === 7 ? "state-degraded" : "approved", wordCount: number === 6 ? 700 : 2000, auditIssues: [], lengthWarnings: [],
+    })));
+    const { deriveAutonomousJobIdentity, loadBookProductionMap } = await import("@actalk/inkos-core");
+    const normalizedMap = await loadBookProductionMap(root, "demo-book");
+    const jobId = deriveAutonomousJobIdentity({ map: normalizedMap!, mode: "current-volume", nextChapter: 6 });
+    const plan = {
+      kind: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME", recoveryClass: "TERMINAL_LENGTH_VIOLATION",
+      bookId: "demo-book", jobId, pendingChapterNumber: 6, baselineChapterNumber: 5, productionMapSha256: "a".repeat(64),
+      candidate: { content: "INITIAL", sha256: "b".repeat(64), title: "Generic Six", titleAuthorityLogicalStepId: `provider-step-${"c".repeat(64)}`, titleAuthorityArtifactSha256: "d".repeat(64) },
+      reviewEvidence: { relativePath: "review.json", sha256: "e".repeat(64), runRelativePath: "run.json", runSha256: "f".repeat(64) },
+      initialReviews: {}, invalidReviewerRoles: ["commercial-reader"], historicalRoleUsage: {},
+      terminalLengthRecovery: {
+        currentChapterFile: "0006_Generic_Six.md", currentChapterSha256: "1".repeat(64), currentLengthCount: 700, candidateLengthCount: 2200, hardMin: 1600, hardMax: 2800,
+        terminalReceiptRelativePath: "receipt.json", terminalReceiptSha256: "3".repeat(64), terminalCandidateSha256: "4".repeat(64),
+        downstreamChapters: [{ chapterNumber: 7, chapterFile: "0007_Generic_Seven.md", chapterSha256: "2".repeat(64), action: "DISCARD_AND_REGENERATE" }], preparationStatus: "REQUIRED",
+      },
+    } as const;
+    resolveFormalPendingChapterRecoveryPlanMock.mockImplementation(async ({ pendingChapterNumber }: { pendingChapterNumber: number }) => pendingChapterNumber === 6 ? plan : null);
+    resumePreservedBoundedCandidateReviewMock.mockImplementation(async () => {
+      nextChapter = 6;
+      return { chapterNumber: 6, status: "blocked-critical-findings", autonomousReview: { status: "BLOCKED_CRITICAL_FINDINGS" } };
+    });
+    const runtimeDir = join(root, "books", "demo-book", "story", "runtime", "bounded-autonomous");
+    await mkdir(runtimeDir, { recursive: true });
+    await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+      jobId, status: "PAUSED_BY_USER", mode: "current-volume", volumeId: "volume-001", startChapter: 6, targetChapter: 8,
+      nextChapter: 8, chapterNumber: 7, completedThisRun: 2, responseArtifactStatus: "COMPLETE", updatedAt: "2026-08-28T00:00:00.000Z",
+    }));
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+    const projection = await app.request("http://localhost/api/v1/books/demo-book/autonomous-production");
+    expect(projection.status).toBe(200);
+    expect(await projection.json()).toMatchObject({
+      runtimeStatus: "RECOVERY_READY_PRESERVED_BOUNDED_REVIEW", startEnabled: true,
+      finalReviewRecovery: { chapter: 6, recoveryClass: "TERMINAL_LENGTH_VIOLATION", downstreamAction: "DISCARD_AND_REGENERATE", additionalWriterCalls: 0 },
+    });
+    const response = await app.request("http://localhost/api/v1/books/demo-book/autonomous-production/start", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "current-volume" }),
+    });
+    expect(response.status, await response.clone().text()).toBe(202);
+    await vi.waitFor(() => expect(resumePreservedBoundedCandidateReviewMock).toHaveBeenCalledWith(plan));
+    expect(writeNextChapterMock).not.toHaveBeenCalled();
+    await vi.waitFor(async () => expect(JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8")))
+      .toMatchObject({ status: "BLOCKED_CRITICAL_FINDINGS", nextChapter: 6, recoveryOwnership: { recoveryClass: "TERMINAL_LENGTH_VIOLATION" } }));
+  });
+
+  it("reconciles a terminal-length recovered Chapter 6 after restart without rerunning review or generation", async () => {
     const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
     raw.llm = { ...raw.llm, service: "openrouter", defaultModel: "openai/gpt", model: "openai/gpt", services: [{ service: "openrouter" }] };
     raw.modelOverrides = { auditor: "deepseek/chat", "commercial-reader": "google/gemini", reviser: "openai/gpt", "observer-reflector": "deepseek/flash" };
@@ -6861,12 +6926,19 @@ describe("createStudioServer daemon lifecycle", () => {
     const normalizedMap = await loadBookProductionMap(root, "demo-book");
     const jobId = deriveAutonomousJobIdentity({ map: normalizedMap!, mode: "current-volume", nextChapter: 6 });
     resolveFormalPendingChapterRecoveryPlanMock.mockResolvedValue({
-      kind: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME", recoveryClass: "PRESERVED_BOUNDED_REVIEW",
+      kind: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME", recoveryClass: "TERMINAL_LENGTH_VIOLATION",
       bookId: "demo-book", jobId, pendingChapterNumber: 6, baselineChapterNumber: 5,
       productionMapSha256: "a".repeat(64),
       candidate: { content: "ORIGINAL", sha256: "b".repeat(64), title: "Generic Six", titleAuthorityLogicalStepId: `provider-step-${"c".repeat(64)}`, titleAuthorityArtifactSha256: "d".repeat(64) },
       reviewEvidence: { relativePath: "review.json", sha256: "e".repeat(64), runRelativePath: "run.json", runSha256: "f".repeat(64) },
       initialReviews: {}, invalidReviewerRoles: ["commercial-reader"], historicalRoleUsage: {},
+      terminalLengthRecovery: {
+        bookConfigSha256: "5".repeat(64), baselineSnapshotFiles: [], currentChapterFile: "0006_Generic_Six.md",
+        currentChapterSha256: "6".repeat(64), currentLengthCount: 700, candidateLengthCount: 2200,
+        terminalReceiptRelativePath: "old-terminal.json", terminalReceiptSha256: "7".repeat(64), terminalCandidateSha256: "8".repeat(64),
+        hardMin: 1600, hardMax: 2800, downstreamChapters: [], preparationStatus: "REWOUND",
+        preparationReceiptRelativePath: "rewound.json", preparationReceiptSha256: "9".repeat(64),
+      },
       terminalReconciliation: {
         status: "approved", chapterFile: "0006_Generic_Six.md", candidateSha256: "1".repeat(64),
         receiptRelativePath: "story/runtime/bounded-autonomous/chapter-0006/preserved-review-resume-001.json",
@@ -6880,7 +6952,7 @@ describe("createStudioServer daemon lifecycle", () => {
       jobId, status: "RUNNING", mode: "current-volume", volumeId: "volume-001",
       startChapter: 6, targetChapter: 6, nextChapter: 6, chapterNumber: 6, completedThisRun: 0,
       recoveryOwnership: {
-        kind: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME", recoveryClass: "PRESERVED_BOUNDED_REVIEW",
+        kind: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME", recoveryClass: "TERMINAL_LENGTH_VIOLATION",
         bookId: "demo-book", jobId, pendingChapterNumber: 6,
       },
     }));

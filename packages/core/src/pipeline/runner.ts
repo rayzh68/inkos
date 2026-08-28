@@ -48,8 +48,8 @@ import {
 } from "../utils/outline-paths.js";
 import { loadNarrativeMemorySeed, loadSnapshotCurrentStateFacts } from "../state/runtime-state-store.js";
 import { rewriteStructuredStateFromMarkdown } from "../state/state-bootstrap.js";
-import { readFile, readdir, writeFile, mkdir, rename, rm, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { readFile, readdir, writeFile, mkdir, rename, rm, stat, unlink } from "node:fs/promises";
+import { join, relative } from "node:path";
 import {
   parseStateDegradedReviewNote,
   resolveStateDegradedBaseStatus,
@@ -79,6 +79,7 @@ import {
 } from "../production/harness.js";
 import {
   finalizePendingChapterOfflinePlan,
+  classifyTerminalLengthRecoveryRewind,
   loadAutonomousProductionState,
   resolveFormalPendingChapterRecoveryPlan,
   verifyFormalPendingChapterRecoveryEvidence,
@@ -2260,10 +2261,276 @@ export class PipelineRunner {
         || JSON.stringify(verified) !== JSON.stringify(plan)) {
         throw new Error("PRESERVED_CANDIDATE_RECOVERY_PLAN_CHANGED");
       }
-      return await this._writeNextChapterLocked(plan.bookId, undefined, undefined, this.config.externalContext, plan);
+      const executablePlan = plan.recoveryClass === "TERMINAL_LENGTH_VIOLATION"
+        ? await this.prepareTerminalLengthViolationRecoveryLocked(plan)
+        : plan;
+      return await this._writeNextChapterLocked(plan.bookId, undefined, undefined, this.config.externalContext, executablePlan);
     } finally {
       await releaseLock();
     }
+  }
+
+  private async prepareTerminalLengthViolationRecoveryLocked(
+    plan: FormalPreservedBoundedReviewResumePlan,
+  ): Promise<FormalPreservedBoundedReviewResumePlan> {
+    const authority = plan.terminalLengthRecovery;
+    if (plan.recoveryClass !== "TERMINAL_LENGTH_VIOLATION" || !authority) {
+      throw new Error("TERMINAL_LENGTH_RECOVERY_AUTHORITY_REQUIRED");
+    }
+    if (authority.preparationStatus === "REWOUND") return plan;
+    const bookDir = this.state.bookDir(plan.bookId);
+    const evidenceDir = join(bookDir, "story", "runtime", "bounded-autonomous", `chapter-${String(plan.pendingChapterNumber).padStart(4, "0")}`);
+    const receiptDir = join(evidenceDir, "terminal-length-recovery-001");
+    const archiveDir = join(receiptDir, "archive");
+    const sha = (bytes: Buffer | string) => createHash("sha256").update(bytes).digest("hex");
+    const writeReceipt = async (name: string, content: string) => {
+      const path = join(receiptDir, name);
+      try {
+        if (await readFile(path, "utf-8") !== content) throw new Error("TERMINAL_LENGTH_RECOVERY_RECEIPT_CONFLICT");
+        return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      await commitAtomicFileSet({ rootDir: receiptDir, writes: [{ relativePath: name, content }] });
+      if (await readFile(path, "utf-8") !== content) throw new Error("TERMINAL_LENGTH_RECOVERY_RECEIPT_CONFLICT");
+    };
+    const files = new Map<string, Buffer>();
+    const addFile = async (absolutePath: string) => {
+      const rel = toPosixPath(relative(bookDir, absolutePath));
+      if (rel.startsWith("../") || rel === "..") throw new Error("TERMINAL_LENGTH_RECOVERY_ARCHIVE_BOUNDARY_INVALID");
+      const bytes = await readFile(absolutePath);
+      files.set(rel, bytes);
+    };
+    const addTree = async (absoluteDir: string) => {
+      let entries: Awaited<ReturnType<typeof readdir>>;
+      try { entries = await readdir(absoluteDir, { withFileTypes: true }) as never; }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw error;
+      }
+      for (const entry of entries as unknown as Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>) {
+        const path = join(absoluteDir, entry.name);
+        if (absoluteDir === evidenceDir && entry.name === "terminal-length-recovery-001") continue;
+        if (entry.isDirectory()) await addTree(path);
+        else if (entry.isFile()) await addFile(path);
+      }
+    };
+    const exists = async (path: string) => await stat(path).then(() => true).catch(() => false);
+    const enumerateRollbackTargets = async () => {
+      const targets: string[] = [];
+      const baseline = plan.baselineChapterNumber;
+      const addTargetTree = async (absoluteDir: string, relativeDir: string): Promise<void> => {
+        targets.push(`D:${relativeDir}`);
+        for (const entry of await readdir(absoluteDir, { withFileTypes: true })) {
+          const relativePath = `${relativeDir}/${entry.name}`;
+          if (entry.isDirectory()) await addTargetTree(join(absoluteDir, entry.name), relativePath);
+          else if (entry.isFile()) targets.push(`F:${relativePath}`);
+          else throw new Error("TERMINAL_LENGTH_RECOVERY_AUTHORITY_CHANGED");
+        }
+      };
+      for (const entry of await readdir(join(bookDir, "chapters"), { withFileTypes: true }).catch(() => [] as Array<{ name: string; isFile(): boolean }>)) {
+        const match = /^(\d+)_.*\.md$/u.exec(entry.name);
+        if (match && Number(match[1]) > baseline) {
+          if (!entry.isFile()) throw new Error("TERMINAL_LENGTH_RECOVERY_AUTHORITY_CHANGED");
+          targets.push(`F:chapters/${entry.name}`);
+        }
+      }
+      for (const entry of await readdir(join(bookDir, "story", "snapshots"), { withFileTypes: true }).catch(() => [] as Array<{ name: string; isDirectory(): boolean }>)) {
+        const number = Number.parseInt(entry.name, 10);
+        if (Number.isFinite(number) && number > baseline) {
+          if (!entry.isDirectory()) throw new Error("TERMINAL_LENGTH_RECOVERY_AUTHORITY_CHANGED");
+          await addTargetTree(join(bookDir, "story", "snapshots", entry.name), `story/snapshots/${entry.name}`);
+        }
+      }
+      for (const entry of await readdir(join(bookDir, "story", "runtime"), { withFileTypes: true }).catch(() => [] as Array<{ name: string; isFile(): boolean }>)) {
+        const match = /^chapter-(\d+)\./u.exec(entry.name);
+        if (match && Number(match[1]) > baseline) {
+          if (!entry.isFile()) throw new Error("TERMINAL_LENGTH_RECOVERY_AUTHORITY_CHANGED");
+          targets.push(`F:story/runtime/${entry.name}`);
+        }
+      }
+      for (const entry of await readdir(join(bookDir, "story", "drafts"), { withFileTypes: true }).catch(() => [] as Array<{ name: string; isFile(): boolean }>)) {
+        const match = /^(\d+)_.*\.md$/u.exec(entry.name);
+        if (match && Number(match[1]) > baseline) {
+          if (!entry.isFile()) throw new Error("TERMINAL_LENGTH_RECOVERY_AUTHORITY_CHANGED");
+          targets.push(`F:story/drafts/${entry.name}`);
+        }
+      }
+      const storyEntries = await readdir(join(bookDir, "story"), { withFileTypes: true }).catch(() => [] as Array<{ name: string; isFile(): boolean }>);
+      for (const name of ["memory.db", "memory.db-shm", "memory.db-wal"]) {
+        const entry = storyEntries.find((candidate) => candidate.name === name);
+        if (entry && !entry.isFile()) throw new Error("TERMINAL_LENGTH_RECOVERY_AUTHORITY_CHANGED");
+        if (entry) targets.push(`F:story/${name}`);
+      }
+      return targets.sort();
+    };
+    const readBaselineSnapshotAuthority = async () => {
+      const snapshotDir = join(bookDir, "story", "snapshots", String(plan.baselineChapterNumber));
+      const baselineEntry = (await readdir(join(bookDir, "story", "snapshots"), { withFileTypes: true }))
+        .find((entry) => entry.name === String(plan.baselineChapterNumber));
+      if (!baselineEntry?.isDirectory()) throw new Error("TERMINAL_LENGTH_RECOVERY_AUTHORITY_CHANGED");
+      const paths: string[] = [];
+      for (const name of ["current_state.md", "particle_ledger.md", "pending_hooks.md", "chapter_summaries.md", "subplot_board.md", "emotional_arcs.md", "character_matrix.md"]) {
+        if (await exists(join(snapshotDir, name))) paths.push(toPosixPath(relative(bookDir, join(snapshotDir, name))));
+      }
+      const stateDir = join(snapshotDir, "state");
+      for (const entry of await readdir(stateDir, { withFileTypes: true }).catch(() => [] as Array<{ name: string; isFile(): boolean }>)) {
+        if (!entry.isFile()) throw new Error("TERMINAL_LENGTH_RECOVERY_AUTHORITY_CHANGED");
+        paths.push(toPosixPath(relative(bookDir, join(stateDir, entry.name))));
+      }
+      return await Promise.all(paths.sort().map(async (relativePath) => ({ relativePath, sha256: sha(await readFile(join(bookDir, relativePath))) })));
+    };
+
+    if (authority.preparationStatus === "REQUIRED") {
+      const active = [
+        { chapterNumber: plan.pendingChapterNumber, chapterFile: authority.currentChapterFile, chapterSha256: authority.currentChapterSha256 },
+        ...authority.downstreamChapters,
+      ];
+      for (const chapter of active) {
+        const chapterPath = join(bookDir, "chapters", chapter.chapterFile);
+        const bytes = await readFile(chapterPath);
+        if (sha(bytes) !== chapter.chapterSha256) throw new Error("TERMINAL_LENGTH_RECOVERY_ACTIVE_EVIDENCE_CHANGED");
+        files.set(toPosixPath(relative(bookDir, chapterPath)), bytes);
+      }
+      const requiredAuthority = [
+        { path: join(bookDir, "book.json"), sha256: authority.bookConfigSha256 },
+        { path: join(bookDir, "story", "runtime", "bounded-autonomous", `chapter-${String(plan.pendingChapterNumber).padStart(4, "0")}`, "initial.md"), sha256: plan.candidate.sha256 },
+        { path: join(bookDir, plan.reviewEvidence.relativePath), sha256: plan.reviewEvidence.sha256 },
+        { path: join(bookDir, plan.reviewEvidence.runRelativePath), sha256: plan.reviewEvidence.runSha256 },
+        { path: join(bookDir, authority.terminalReceiptRelativePath), sha256: authority.terminalReceiptSha256 },
+        { path: join(bookDir, "story", "runtime", "bounded-autonomous", "provider-responses", `${plan.candidate.titleAuthorityLogicalStepId}.json`), sha256: plan.candidate.titleAuthorityArtifactSha256 },
+      ];
+      for (const required of requiredAuthority) {
+        if (sha(await readFile(required.path)) !== required.sha256) throw new Error("TERMINAL_LENGTH_RECOVERY_AUTHORITY_CHANGED");
+      }
+      if (JSON.stringify(await readBaselineSnapshotAuthority()) !== JSON.stringify(authority.baselineSnapshotFiles)) {
+        throw new Error("TERMINAL_LENGTH_RECOVERY_AUTHORITY_CHANGED");
+      }
+      const terminalCandidateFiles = await readdir(evidenceDir);
+      let terminalCandidateMatched = false;
+      for (const name of terminalCandidateFiles.filter((entry) => /^preserved-review-resume-\d{3}-(?:initial|revision_1|revision_2)\.md$/u.test(entry))) {
+        if (sha(await readFile(join(evidenceDir, name))) === authority.terminalCandidateSha256) terminalCandidateMatched = true;
+      }
+      if (!terminalCandidateMatched) throw new Error("TERMINAL_LENGTH_RECOVERY_AUTHORITY_CHANGED");
+      await addFile(join(bookDir, "chapters", "index.json"));
+      await addFile(join(bookDir, "book.json"));
+      await addTree(join(bookDir, "story", "state"));
+      await addTree(join(bookDir, "story", "drafts"));
+      for (const entry of await readdir(join(bookDir, "story"), { withFileTypes: true })) {
+        if (entry.isFile()) await addFile(join(bookDir, "story", entry.name));
+      }
+      for (const chapter of active) {
+        await addTree(join(bookDir, "story", "snapshots", String(chapter.chapterNumber)));
+        const runtimeDir = join(bookDir, "story", "runtime");
+        for (const name of await readdir(runtimeDir)) {
+          if (name.startsWith(`chapter-${String(chapter.chapterNumber).padStart(4, "0")}.`)) await addFile(join(runtimeDir, name));
+        }
+        await addTree(join(runtimeDir, "bounded-autonomous", `chapter-${String(chapter.chapterNumber).padStart(4, "0")}`));
+      }
+      for (const baselineFile of authority.baselineSnapshotFiles) await addFile(join(bookDir, baselineFile.relativePath));
+      const rollbackTargets = await enumerateRollbackTargets();
+      for (const target of rollbackTargets) {
+        const type = target.slice(0, 1);
+        const relativePath = target.slice(2);
+        const absolutePath = join(bookDir, relativePath);
+        if (type === "D") await addTree(absolutePath);
+        else if (type === "F") await addFile(absolutePath);
+        else throw new Error("TERMINAL_LENGTH_RECOVERY_AUTHORITY_CHANGED");
+      }
+      await mkdir(archiveDir, { recursive: true });
+      for (const name of await readdir(archiveDir)) {
+        if (name.startsWith(".inkos-file-txn-")) await rm(join(archiveDir, name), { recursive: true, force: true });
+      }
+      const inventory = [...files.entries()].sort(([left], [right]) => left.localeCompare(right));
+      const missingArchiveWrites: Array<{ relativePath: string; content: Buffer }> = [];
+      for (const [rel, bytes] of inventory) {
+        const target = join(archiveDir, rel);
+        try {
+          if (!(await readFile(target)).equals(bytes)) throw new Error("TERMINAL_LENGTH_RECOVERY_ARCHIVE_CONFLICT");
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          missingArchiveWrites.push({ relativePath: rel, content: bytes });
+        }
+      }
+      if (missingArchiveWrites.length > 0) await commitAtomicFileSet({ rootDir: archiveDir, writes: missingArchiveWrites });
+      const providerDir = join(bookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
+      const providerArtifacts = await readdir(providerDir).catch(() => [] as string[]);
+      const preservedProviderArtifacts: Array<{ path: string; sha256: string }> = [];
+      for (const name of providerArtifacts.sort()) {
+        const path = join(providerDir, name);
+        if (!(await stat(path)).isFile()) continue;
+        preservedProviderArtifacts.push({ path: toPosixPath(relative(bookDir, path)), sha256: sha(await readFile(path)) });
+      }
+      const prepared = `${JSON.stringify({
+        schema_version: "1.0", evidence_type: "TERMINAL_LENGTH_VIOLATION_PREPARATION",
+        book_id: plan.bookId, job_id: plan.jobId, pending_chapter_number: plan.pendingChapterNumber,
+        authority_plan: plan,
+        rollback_targets: rollbackTargets,
+        archived_files: inventory.map(([path, bytes]) => ({ path, sha256: sha(bytes) })),
+        preserved_provider_artifacts: preservedProviderArtifacts,
+      }, null, 2)}\n`;
+      await writeReceipt("prepared.json", prepared);
+    }
+
+    const preparedForRewind = JSON.parse(await readFile(join(receiptDir, "prepared.json"), "utf-8")) as {
+      readonly archived_files: ReadonlyArray<{ readonly path?: unknown; readonly sha256?: unknown }>;
+      readonly rollback_targets: ReadonlyArray<unknown>;
+    };
+    const pruneArchivedStaleStructuredState = async () => {
+      const baselineStateDir = join(bookDir, "story", "snapshots", String(plan.baselineChapterNumber), "state");
+      const currentStateDir = join(bookDir, "story", "state");
+      const [baselineEntries, currentEntries] = await Promise.all([
+        readdir(baselineStateDir, { withFileTypes: true }),
+        readdir(currentStateDir, { withFileTypes: true }),
+      ]);
+      if (baselineEntries.some((entry) => !entry.isFile())) {
+        throw new Error("TERMINAL_LENGTH_RECOVERY_PREPARATION_EVIDENCE_INVALID");
+      }
+      const baselineStateNames = new Set(baselineEntries.map((entry) => entry.name));
+      const archivedStateHashes = new Map(preparedForRewind.archived_files.flatMap((entry) =>
+        typeof entry.path === "string" && typeof entry.sha256 === "string" && entry.path.startsWith("story/state/")
+          ? [[entry.path, entry.sha256] as const]
+          : []));
+      const staleStatePaths: string[] = [];
+      for (const entry of currentEntries) {
+        if (baselineStateNames.has(entry.name)) continue;
+        const relativePath = `story/state/${entry.name}`;
+        const expectedSha = archivedStateHashes.get(relativePath);
+        if (!entry.isFile() || !expectedSha || sha(await readFile(join(currentStateDir, entry.name))) !== expectedSha) {
+          throw new Error("TERMINAL_LENGTH_RECOVERY_PREPARATION_EVIDENCE_INVALID");
+        }
+        staleStatePaths.push(join(currentStateDir, entry.name));
+      }
+      await Promise.all(staleStatePaths.map((path) => unlink(path)));
+    };
+    const beforeRewind = await classifyTerminalLengthRecoveryRewind({ bookDir, plan, prepared: preparedForRewind });
+    if (authority.preparationStatus === "REWIND_COMPLETED" && beforeRewind !== "FULLY_REWOUND") {
+      throw new Error("TERMINAL_LENGTH_RECOVERY_REWIND_VALIDATION_FAILED");
+    }
+    if (beforeRewind !== "FULLY_REWOUND") {
+      await this.state.rollbackToChapter(plan.bookId, plan.baselineChapterNumber);
+      await pruneArchivedStaleStructuredState();
+    }
+    if (await classifyTerminalLengthRecoveryRewind({ bookDir, plan, prepared: preparedForRewind }) !== "FULLY_REWOUND") {
+      throw new Error("TERMINAL_LENGTH_RECOVERY_REWIND_VALIDATION_FAILED");
+    }
+    const preparedBytes = await readFile(join(receiptDir, "prepared.json"));
+    const rewound = `${JSON.stringify({
+      schema_version: "1.0", evidence_type: "TERMINAL_LENGTH_VIOLATION_REWOUND",
+      book_id: plan.bookId, job_id: plan.jobId, pending_chapter_number: plan.pendingChapterNumber,
+      baseline_chapter_number: plan.baselineChapterNumber, prepared_receipt_sha256: sha(preparedBytes),
+    }, null, 2)}\n`;
+    const rewoundPath = join(receiptDir, "rewound.json");
+    await writeReceipt("rewound.json", rewound);
+    return {
+      ...plan,
+      terminalLengthRecovery: {
+        ...authority,
+        preparationStatus: "REWOUND",
+        preparationReceiptRelativePath: toPosixPath(relative(bookDir, rewoundPath)),
+        preparationReceiptSha256: sha(rewound),
+      },
+    };
   }
 
   /** Resume a settled audit-failed chapter without invoking the Writer generation path. */

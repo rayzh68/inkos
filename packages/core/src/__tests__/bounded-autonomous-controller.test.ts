@@ -43,6 +43,310 @@ function providerFailure(params: {
 }
 
 describe("bounded autonomous production controller", () => {
+  it("admits a generic terminal hard-length violation with contiguous downstream evidence and rejects a valid terminal", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-terminal-length-recovery-"));
+    const { createHash } = await import("node:crypto");
+    const words = (count: number, stem: string) => Array.from({ length: count }, (_, index) => `${stem}${index}`).join(" ");
+    try {
+      const bookDir = join(root, "books", "book");
+      const evidenceDir = join(bookDir, "story", "runtime", "bounded-autonomous", "chapter-0006");
+      const responseDir = join(bookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
+      await Promise.all([
+        mkdir(join(bookDir, "chapters"), { recursive: true }),
+        mkdir(join(bookDir, "story", "outline"), { recursive: true }),
+        mkdir(join(bookDir, "story", "state"), { recursive: true }),
+        mkdir(join(bookDir, "story", "snapshots", "5", "state"), { recursive: true }),
+        mkdir(join(bookDir, "story", "snapshots", "6", "state"), { recursive: true }),
+        mkdir(evidenceDir, { recursive: true }),
+        mkdir(responseDir, { recursive: true }),
+      ]);
+      const recoveryMap: BookProductionMap = {
+        schemaVersion: "1.0", bookId: "book", authorityBookId: "authority", title: "Book", totalChapters: 8,
+        volumes: [{ volumeId: "volume-001", volumeNumber: 1, title: "One", startChapter: 1, endChapter: 8, chapterCount: 8 }],
+      };
+      await Promise.all([
+        writeFile(join(bookDir, "book.json"), JSON.stringify({ id: "book", title: "Book", language: "en", chapterWordCount: 2200 })),
+        writeFile(join(bookDir, "story", "outline", "book-production-map.json"), JSON.stringify({
+          schema_version: "1.0", book_id: "book", authority_book_id: "authority", title: "Book", total_chapters: 8,
+          volumes: [{ volume_id: "volume-001", volume_number: 1, title: "One", start_chapter: 1, end_chapter: 8, chapter_count: 8 }],
+        })),
+      ]);
+      const initial = words(2200, "initial");
+      const initialSha = createHash("sha256").update(initial).digest("hex");
+      const short = words(700, "short");
+      const shortSha = createHash("sha256").update(short).digest("hex");
+      const downstream = words(2100, "downstream");
+      const index = Array.from({ length: 5 }, (_, offset) => ({
+        number: offset + 1, title: `Chapter ${offset + 1}`, status: "approved", wordCount: 2000,
+        createdAt: "2026-08-28T00:00:00.000Z", updatedAt: "2026-08-28T00:00:00.000Z", auditIssues: [], lengthWarnings: [],
+      }));
+      await Promise.all([
+        writeFile(join(bookDir, "chapters", "0006_Generic_Six.md"), `# Chapter 6: Generic Six\n\n${short}`),
+        writeFile(join(bookDir, "chapters", "0007_Generic_Seven.md"), `# Chapter 7: Generic Seven\n\n${downstream}`),
+        writeFile(join(bookDir, "chapters", "index.json"), JSON.stringify([
+          ...index,
+          { ...index[0], number: 6, title: "Generic Six", status: "approved", wordCount: 700 },
+          { ...index[0], number: 7, title: "Generic Seven", status: "state-degraded", wordCount: 2100 },
+        ])),
+        writeFile(join(bookDir, "story", "state", "manifest.json"), JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 7 })),
+        writeFile(join(bookDir, "story", "snapshots", "5", "state", "manifest.json"), JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 5 })),
+        writeFile(join(bookDir, "story", "snapshots", "5", "current_state.md"), "# Current State\n\nChapter 5"),
+        writeFile(join(bookDir, "story", "snapshots", "5", "pending_hooks.md"), "# Pending Hooks\n"),
+        writeFile(join(bookDir, "story", "snapshots", "6", "state", "manifest.json"), JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 6 })),
+        writeFile(join(evidenceDir, "initial.md"), initial),
+        writeFile(join(evidenceDir, "preserved-review-resume-001-revision_2.md"), short),
+        writeFile(join(evidenceDir, "preserved-review-resume-001.json"), JSON.stringify({
+          schema_version: "1.0", chapter_number: 6, status: "APPROVED", grade: "A", revision_count: 2,
+          best_candidate: { label: "REVISION_2", sha256: shortSha, combined_score: 92 },
+          candidates: [{ label: "INITIAL", sha256: initialSha }, { label: "REVISION_2", sha256: shortSha }], usage_by_role: {},
+        })),
+      ]);
+      const logic = {
+        reviewerRole: "logic-canon-auditor", provider: "openrouter", model: "logic", totalScore: 81,
+        dimensionScores: { blueprint_transition: 80, causal_logic: 70, canon_continuity: 90, character_motivation: 90, state_inheritance: 90, hooks_disclosure: 90, narrative_clarity: 90 },
+        decision: "REVISION_REQUIRED", findings: [{ findingId: "logic-1", severity: "MAJOR", evidence: "fix", impact: "causal_logic", requiredOutcome: "repair" }],
+        reviewedCandidateSha: initialSha, reviewedAt: "2026-08-28T00:00:00.000Z",
+      };
+      const invalidCommercial = {
+        reviewerRole: "commercial-reader", provider: "openrouter", model: "reader", totalScore: 0,
+        dimensionScores: {}, decision: "INVALID_OUTPUT", findings: [{ findingId: "commercial-1", severity: "CRITICAL", evidence: "invalid", impact: "contract", requiredOutcome: "retry" }],
+        reviewedCandidateSha: initialSha, reviewedAt: "2026-08-28T00:00:01.000Z",
+      };
+      await writeFile(join(evidenceDir, "review.json"), JSON.stringify({
+        schema_version: "1.0", chapter_number: 6, status: "REVIEW_OUTPUT_INVALID", grade: "E", revision_count: 0, hold_reason: "INVALID_OUTPUT",
+        best_candidate: { label: "INITIAL", sha256: initialSha, combined_score: 81 },
+        candidates: [{ label: "INITIAL", sha256: initialSha, combined_score: 81, reviews: [logic, invalidCommercial] }], usage_by_role: {},
+      }));
+      await writeFile(join(bookDir, "story", "runtime", "chapter-0006.run.json"), JSON.stringify({
+        version: 1, kind: "long-fiction", id: "book:chapter-0006", stage: "chapter-6", model: "model", skillIds: ["inkos-long-writing"],
+        resumeCursor: "6", status: "needs-review", artifacts: ["story/runtime/bounded-autonomous/chapter-0006/review.json"], observations: [], updatedAt: "2026-08-28T00:00:02.000Z",
+      }));
+      await writeFile(join(bookDir, "story", "runtime", "chapter-0007.run.json"), JSON.stringify({
+        version: 1, kind: "long-fiction", id: "book:chapter-0007", stage: "chapter-7", model: "model", skillIds: ["inkos-long-writing"],
+        resumeCursor: "7", status: "state-degraded", artifacts: [], observations: [], updatedAt: "2026-08-28T00:00:03.000Z",
+      }));
+      const jobId = deriveAutonomousJobIdentity({ map: recoveryMap, mode: "current-volume", nextChapter: 6 });
+      const execution = createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId, getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "openrouter", model: "writer" }) });
+      const artifactPath = execution.responseArtifactPath("a".repeat(64), "openrouter", "writer", 6);
+      const logicalStepId = artifactPath.split(/[\\/]/u).at(-1)!.replace(/\.json$/u, "");
+      const content = `=== CHAPTER_TITLE ===\nGeneric Six\n=== CHAPTER_CONTENT ===\n${initial}`;
+      await writeFile(artifactPath, JSON.stringify({
+        schema_version: "1.0", job_id: jobId, logical_step_id: logicalStepId, usage_identity: logicalStepId,
+        chapter_number: 6, role: "writer", stage: "WRITING", provider: "openrouter", requested_model: "writer", input_fingerprint: "a".repeat(64),
+        response_artifact_status: "COMPLETE", content_sha256: createHash("sha256").update(content).digest("hex"), response: { content }, completed_at: "2026-08-28T00:00:00.000Z",
+      }));
+      await writeFile(join(bookDir, "story", "runtime", "bounded-autonomous", "production-state.json"), JSON.stringify({
+        jobId, status: "PAUSED_BY_USER", mode: "current-volume", volumeId: "volume-001", startChapter: 6, targetChapter: 8,
+        nextChapter: 8, chapterNumber: 7, completedThisRun: 2, responseArtifactStatus: "COMPLETE",
+      }));
+
+      const admitted = await resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 });
+      expect(admitted).toMatchObject({
+          kind: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME", recoveryClass: "TERMINAL_LENGTH_VIOLATION",
+          pendingChapterNumber: 6, baselineChapterNumber: 5,
+          candidate: { sha256: initialSha, title: "Generic Six" }, invalidReviewerRoles: ["commercial-reader"],
+          terminalLengthRecovery: { currentLengthCount: 700, hardMin: 1600, hardMax: 2800, downstreamChapters: [{ chapterNumber: 7, action: "DISCARD_AND_REGENERATE" }] },
+        });
+      for (const protectedStatus of ["published", "imported"] as const) {
+        await writeFile(join(bookDir, "chapters", "index.json"), JSON.stringify([
+          ...index,
+          { ...index[0], number: 6, title: "Generic Six", status: protectedStatus, wordCount: 700 },
+          { ...index[0], number: 7, title: "Generic Seven", status: "state-degraded", wordCount: 2100 },
+        ]));
+        await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 })).resolves.toBeNull();
+      }
+      for (const protectedStatus of ["published", "imported"] as const) {
+        await writeFile(join(bookDir, "chapters", "index.json"), JSON.stringify([
+          ...index,
+          { ...index[0], number: 6, title: "Generic Six", status: "approved", wordCount: 700 },
+          { ...index[0], number: 7, title: "Generic Seven", status: protectedStatus, wordCount: 2100 },
+        ]));
+        await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+          .rejects.toThrow("TERMINAL_LENGTH_RECOVERY_DOWNSTREAM_AUTHORITY_BLOCKED");
+      }
+      await writeFile(join(bookDir, "chapters", "index.json"), JSON.stringify([
+        ...index,
+        { ...index[0], number: 6, title: "Generic Six", status: "approved", wordCount: 700 },
+        { ...index[0], number: 7, title: "Generic Seven", status: "state-degraded", wordCount: 2100 },
+      ]));
+      await rm(join(bookDir, "chapters", "0007_Generic_Seven.md"));
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("TERMINAL_LENGTH_RECOVERY_DOWNSTREAM_AUTHORITY_BLOCKED");
+      await writeFile(join(bookDir, "chapters", "0007_Generic_Seven.md"), `# Chapter 7: Generic Seven\n\n${downstream}`);
+      await writeFile(join(bookDir, "chapters", "0008_Stray.md"), "# Chapter 8: Stray\n\nstray");
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("TERMINAL_LENGTH_RECOVERY_DOWNSTREAM_AUTHORITY_BLOCKED");
+      await rm(join(bookDir, "chapters", "0008_Stray.md"));
+      await mkdir(join(bookDir, "chapters", "0008_directory.md"));
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("TERMINAL_LENGTH_RECOVERY_DOWNSTREAM_AUTHORITY_BLOCKED");
+      await rm(join(bookDir, "chapters", "0008_directory.md"), { recursive: true });
+      await writeFile(join(bookDir, "chapters", "0007-Stray.md"), "# Chapter 7: Stray\n\nstray");
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("TERMINAL_LENGTH_RECOVERY_DOWNSTREAM_AUTHORITY_BLOCKED");
+      await rm(join(bookDir, "chapters", "0007-Stray.md"));
+      await mkdir(join(bookDir, "story", "snapshots", "8"), { recursive: true });
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("TERMINAL_LENGTH_RECOVERY_DOWNSTREAM_AUTHORITY_BLOCKED");
+      await rm(join(bookDir, "story", "snapshots", "8"), { recursive: true });
+      await mkdir(join(bookDir, "story", "snapshots", "7-old"), { recursive: true });
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("TERMINAL_LENGTH_RECOVERY_DOWNSTREAM_AUTHORITY_BLOCKED");
+      await rm(join(bookDir, "story", "snapshots", "7-old"), { recursive: true });
+      await writeFile(join(bookDir, "story", "snapshots", "8-file"), "not a directory");
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("TERMINAL_LENGTH_RECOVERY_DOWNSTREAM_AUTHORITY_BLOCKED");
+      await rm(join(bookDir, "story", "snapshots", "8-file"));
+
+      const receiptDir = join(evidenceDir, "terminal-length-recovery-001");
+      await mkdir(receiptDir, { recursive: true });
+      const archivedSources = [
+        "book.json",
+        "chapters/0006_Generic_Six.md", "chapters/0007_Generic_Seven.md", "chapters/index.json",
+        "story/state/manifest.json", "story/runtime/chapter-0006.run.json", "story/runtime/chapter-0007.run.json",
+        "story/runtime/bounded-autonomous/chapter-0006/initial.md",
+        "story/runtime/bounded-autonomous/chapter-0006/review.json",
+        "story/runtime/bounded-autonomous/chapter-0006/preserved-review-resume-001.json",
+        "story/runtime/bounded-autonomous/chapter-0006/preserved-review-resume-001-revision_2.md",
+        "story/snapshots/5/current_state.md", "story/snapshots/5/pending_hooks.md", "story/snapshots/5/state/manifest.json",
+        "story/snapshots/6/state/manifest.json",
+      ];
+      const archivedFiles = [];
+      for (const path of archivedSources) {
+        const bytes = await readFile(join(bookDir, path));
+        const target = join(receiptDir, "archive", path);
+        await mkdir(join(target, ".."), { recursive: true });
+        await writeFile(target, bytes);
+        archivedFiles.push({ path, sha256: createHash("sha256").update(bytes).digest("hex") });
+      }
+      const preparedBytes = Buffer.from(`${JSON.stringify({
+        schema_version: "1.0", evidence_type: "TERMINAL_LENGTH_VIOLATION_PREPARATION", book_id: "book", job_id: jobId,
+        pending_chapter_number: 6, authority_plan: admitted, archived_files: archivedFiles,
+        rollback_targets: [
+          "F:chapters/0006_Generic_Six.md", "F:chapters/0007_Generic_Seven.md",
+          "F:story/runtime/chapter-0006.run.json", "F:story/runtime/chapter-0007.run.json",
+          "D:story/snapshots/6", "D:story/snapshots/6/state", "F:story/snapshots/6/state/manifest.json",
+        ],
+        preserved_provider_artifacts: [{
+          path: `story/runtime/bounded-autonomous/provider-responses/${logicalStepId}.json`,
+          sha256: createHash("sha256").update(await readFile(artifactPath)).digest("hex"),
+        }],
+      }, null, 2)}\n`);
+      await writeFile(join(receiptDir, "prepared.json"), preparedBytes);
+      await writeFile(join(bookDir, "story", "runtime", "bounded-autonomous", "production-state.json"), JSON.stringify({
+        jobId, status: "RUNNING", mode: "current-volume", volumeId: "volume-001", startChapter: 6, targetChapter: 8,
+        nextChapter: 8, chapterNumber: 7, completedThisRun: 2, responseArtifactStatus: "COMPLETE",
+        recoveryOwnership: { kind: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME", recoveryClass: "TERMINAL_LENGTH_VIOLATION", bookId: "book", jobId, pendingChapterNumber: 6 },
+      }));
+      await rm(join(bookDir, "chapters", "0006_Generic_Six.md"));
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .resolves.toMatchObject({ terminalLengthRecovery: { preparationStatus: "PARTIAL_REWIND" } });
+      await writeFile(join(bookDir, "chapters", "0006_Generic_Six.md"), `# Chapter 6: Generic Six\n\n${short}`);
+      await Promise.all([
+        rm(join(bookDir, "chapters", "0006_Generic_Six.md")), rm(join(bookDir, "chapters", "0007_Generic_Seven.md")),
+        rm(join(bookDir, "story", "snapshots", "6"), { recursive: true }),
+        rm(join(bookDir, "story", "runtime", "chapter-0006.run.json")), rm(join(bookDir, "story", "runtime", "chapter-0007.run.json")),
+      ]);
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .resolves.toMatchObject({ terminalLengthRecovery: { preparationStatus: "PARTIAL_REWIND" } });
+      for (const path of [
+        "chapters/0006_Generic_Six.md", "chapters/0007_Generic_Seven.md", "story/runtime/chapter-0006.run.json",
+        "story/runtime/chapter-0007.run.json", "story/snapshots/6/state/manifest.json",
+      ]) {
+        const target = join(bookDir, path);
+        await mkdir(join(target, ".."), { recursive: true });
+        await writeFile(target, await readFile(join(receiptDir, "archive", path)));
+      }
+      await writeFile(join(bookDir, "chapters", "0007_Generic_Seven.md"), `${await readFile(join(bookDir, "chapters", "0007_Generic_Seven.md"), "utf-8")}\nDRIFT`);
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("TERMINAL_LENGTH_RECOVERY_PREPARATION_EVIDENCE_INVALID");
+      await writeFile(join(bookDir, "chapters", "0007_Generic_Seven.md"), `# Chapter 7: Generic Seven\n\n${downstream}`);
+      await writeFile(join(bookDir, "story", "runtime", "chapter-0008.plan.md"), "# Newly introduced rollback target");
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("TERMINAL_LENGTH_RECOVERY_PREPARATION_EVIDENCE_INVALID");
+      await rm(join(bookDir, "story", "runtime", "chapter-0008.plan.md"));
+      await writeFile(join(bookDir, "story", "snapshots", "6", "late.json"), "LATE EVIDENCE");
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("TERMINAL_LENGTH_RECOVERY_PREPARATION_EVIDENCE_INVALID");
+      await rm(join(bookDir, "story", "snapshots", "6", "late.json"));
+      await writeFile(join(bookDir, "story", "snapshots", "5", "current_state.md"), "# Tampered baseline");
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("TERMINAL_LENGTH_RECOVERY_PREPARATION_EVIDENCE_INVALID");
+      await writeFile(join(bookDir, "story", "snapshots", "5", "current_state.md"), "# Current State\n\nChapter 5");
+      await writeFile(join(bookDir, "book.json"), JSON.stringify({ id: "book", title: "Book", language: "en", chapterWordCount: 2300 }));
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .rejects.toThrow("TERMINAL_LENGTH_RECOVERY_PREPARATION_EVIDENCE_INVALID");
+      await writeFile(join(bookDir, "book.json"), JSON.stringify({ id: "book", title: "Book", language: "en", chapterWordCount: 2200 }));
+      await Promise.all([
+        rm(join(bookDir, "chapters", "0006_Generic_Six.md")), rm(join(bookDir, "chapters", "0007_Generic_Seven.md")),
+        rm(join(bookDir, "story", "snapshots", "6"), { recursive: true }),
+        rm(join(bookDir, "story", "runtime", "chapter-0006.run.json")),
+        rm(join(bookDir, "story", "runtime", "chapter-0007.run.json")),
+        writeFile(join(bookDir, "chapters", "index.json"), JSON.stringify(index)),
+        writeFile(join(bookDir, "story", "state", "manifest.json"), JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 5 })),
+        writeFile(join(bookDir, "story", "current_state.md"), "# Current State\n\nChapter 5"),
+        writeFile(join(bookDir, "story", "pending_hooks.md"), "# Pending Hooks\n"),
+        writeFile(join(bookDir, "story", "runtime", "bounded-autonomous", "production-state.json"), JSON.stringify({
+          jobId, status: "RUNNING", mode: "current-volume", volumeId: "volume-001", startChapter: 6, targetChapter: 8,
+          nextChapter: 6, chapterNumber: 6, completedThisRun: 0, responseArtifactStatus: "COMPLETE",
+          recoveryOwnership: { kind: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME", recoveryClass: "TERMINAL_LENGTH_VIOLATION", bookId: "book", jobId, pendingChapterNumber: 6 },
+        })),
+      ]);
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .resolves.toMatchObject({ recoveryClass: "TERMINAL_LENGTH_VIOLATION", terminalLengthRecovery: { preparationStatus: "REWIND_COMPLETED" } });
+      await writeFile(join(receiptDir, "rewound.json"), `${JSON.stringify({
+        schema_version: "1.0", evidence_type: "TERMINAL_LENGTH_VIOLATION_REWOUND", book_id: "book", job_id: jobId,
+        pending_chapter_number: 6, baseline_chapter_number: 5, prepared_receipt_sha256: createHash("sha256").update(preparedBytes).digest("hex"),
+      }, null, 2)}\n`);
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .resolves.toMatchObject({ recoveryClass: "TERMINAL_LENGTH_VIOLATION", terminalLengthRecovery: { preparationStatus: "REWOUND" } });
+
+      const recovered = words(2000, "recovered");
+      const recoveredSha = createHash("sha256").update(recovered).digest("hex");
+      await Promise.all([
+        writeFile(join(evidenceDir, "preserved-review-resume-002-revision_1.md"), recovered),
+        writeFile(join(evidenceDir, "preserved-review-resume-002.json"), JSON.stringify({
+          schema_version: "1.0", chapter_number: 6, status: "APPROVED", grade: "A", revision_count: 1,
+          best_candidate: { label: "REVISION_1", sha256: recoveredSha, combined_score: 94 },
+          candidates: [{ label: "INITIAL", sha256: initialSha }, { label: "REVISION_1", sha256: recoveredSha }], usage_by_role: {},
+        })),
+        writeFile(join(bookDir, "chapters", "0006_Generic_Six.md"), `# Chapter 6: Generic Six\n\n${recovered}`),
+        writeFile(join(bookDir, "chapters", "index.json"), JSON.stringify([
+          ...index, { ...index[0], number: 6, title: "Generic Six", status: "approved", wordCount: 2000 },
+        ])),
+        mkdir(join(bookDir, "story", "snapshots", "6", "state"), { recursive: true }),
+        writeFile(join(bookDir, "story", "state", "manifest.json"), JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 6 })),
+      ]);
+      await writeFile(join(bookDir, "story", "snapshots", "6", "state", "manifest.json"), JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 6 }));
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 }))
+        .resolves.toMatchObject({
+          recoveryClass: "TERMINAL_LENGTH_VIOLATION",
+          terminalLengthRecovery: { preparationStatus: "REWOUND" },
+          terminalReconciliation: { status: "approved", chapterFile: "0006_Generic_Six.md", candidateSha256: recoveredSha },
+        });
+      await Promise.all([
+        rm(join(evidenceDir, "preserved-review-resume-002-revision_1.md")), rm(join(evidenceDir, "preserved-review-resume-002.json")),
+        rm(join(bookDir, "chapters", "0006_Generic_Six.md")), rm(join(bookDir, "story", "snapshots", "6"), { recursive: true }),
+      ]);
+
+      await Promise.all([
+        writeFile(join(bookDir, "chapters", "0007_Generic_Seven.md"), `# Chapter 7: Generic Seven\n\n${downstream}`),
+        writeFile(join(bookDir, "chapters", "index.json"), JSON.stringify([...index, { ...index[0], number: 6, title: "Generic Six", status: "approved", wordCount: 2200 }, { ...index[0], number: 7, title: "Generic Seven", status: "state-degraded", wordCount: 2100 }])),
+        mkdir(join(bookDir, "story", "snapshots", "6", "state"), { recursive: true }),
+        writeFile(join(bookDir, "story", "state", "manifest.json"), JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 7 })),
+        writeFile(join(bookDir, "story", "runtime", "bounded-autonomous", "production-state.json"), JSON.stringify({
+          jobId, status: "PAUSED_BY_USER", mode: "current-volume", volumeId: "volume-001", startChapter: 6, targetChapter: 8,
+          nextChapter: 8, chapterNumber: 7, completedThisRun: 2, responseArtifactStatus: "COMPLETE",
+        })),
+      ]);
+      await writeFile(join(bookDir, "story", "snapshots", "6", "state", "manifest.json"), JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 6 }));
+      await writeFile(join(bookDir, "chapters", "0006_Generic_Six.md"), `# Chapter 6: Generic Six\n\n${initial}`);
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 6 })).resolves.toBeNull();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("proves a generic unindexed Chapter 6 preserved-review recovery and excludes true exhaustion", async () => {
     const root = await mkdtemp(join(tmpdir(), "inkos-preserved-review-"));
     const { createHash } = await import("node:crypto");
