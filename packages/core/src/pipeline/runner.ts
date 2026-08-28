@@ -58,6 +58,7 @@ import {
 import { persistChapterArtifacts } from "./chapter-persistence.js";
 import { runChapterReviewCycle } from "./chapter-review-cycle.js";
 import {
+  assertBoundedReviewTerminalLength,
   classifyFinalAuditDecision,
   runBoundedReviewCycle,
   scoredLogicReviewFromAudit,
@@ -322,8 +323,20 @@ export interface ChapterPipelineResult {
   readonly tokenUsage?: TokenUsageSummary;
   readonly contextTrace?: ChapterContextTraceSummary;
   readonly autonomousReview?: Omit<BoundedReviewResult, "finalContent" | "candidates" | "bestCandidate"> & {
-    readonly candidates: ReadonlyArray<{ readonly label: string; readonly sha256: string; readonly combinedScore: number }>;
-    readonly bestCandidate: { readonly label: string; readonly sha256: string; readonly combinedScore: number };
+    readonly candidates: ReadonlyArray<{
+      readonly label: string;
+      readonly sha256: string;
+      readonly combinedScore: number;
+      readonly lengthCount: number;
+      readonly lengthInHardRange: boolean;
+    }>;
+    readonly bestCandidate: {
+      readonly label: string;
+      readonly sha256: string;
+      readonly combinedScore: number;
+      readonly lengthCount: number;
+      readonly lengthInHardRange: boolean;
+    };
   };
   readonly roleUsage?: Readonly<Record<string, RoleTokenUsage>>;
   readonly candidateEvidencePath?: string;
@@ -3060,6 +3073,7 @@ export class PipelineRunner {
       const commercialReader = new CommercialReaderAgent(this.agentCtxFor("commercial-reader", bookId));
       autonomousReviewResult = await runBoundedReviewCycle({
         initialContent: output.content,
+        lengthSpec,
         ...(preservedReviewPlan ? { initialReviews: preservedReviewPlan.initialReviews } : {}),
         reviewLogic: async (content, candidateSha) => scoredLogicReviewFromAudit(
           await auditor.auditChapter(
@@ -3125,14 +3139,23 @@ export class PipelineRunner {
       revised = autonomousReviewResult.revisionCount > 0;
       postReviseCount = revised ? finalWordCount : 0;
       repairApplied = revised;
-      const latestReviews = autonomousReviewResult.candidates.at(-1)?.reviews ?? [];
-      const findings = latestReviews.flatMap((review) => review.findings);
+      const terminalReviews = autonomousReviewResult.bestCandidate.reviews;
+      const findings = terminalReviews.flatMap((review) => review.findings);
+      const lengthIssues: AuditIssue[] = autonomousReviewResult.holdReason === "LENGTH_BUDGET_VIOLATION"
+        ? [{
+            severity: "critical",
+            category: "length-budget",
+            description: `Candidate length ${autonomousReviewResult.bestCandidate.lengthCount} is outside the hard range ${lengthSpec.hardMin}-${lengthSpec.hardMax}.`,
+            suggestion: `Revise near ${lengthSpec.target} and keep the final chapter inside the hard range.`,
+            repairScope: "structural",
+          }]
+        : [];
       auditResult = {
         passed: autonomousReviewResult.status === "APPROVED",
-        overallScore: latestReviews.length > 0
-          ? Math.round(latestReviews.reduce((sum, review) => sum + review.totalScore, 0) / latestReviews.length)
+        overallScore: terminalReviews.length > 0
+          ? Math.round(terminalReviews.reduce((sum, review) => sum + review.totalScore, 0) / terminalReviews.length)
           : 0,
-        issues: this.reviewFindingsAsAuditIssues(findings),
+        issues: [...this.reviewFindingsAsAuditIssues(findings), ...lengthIssues],
         summary: autonomousReviewResult.status === "APPROVED"
           ? `Bounded autonomous review ${autonomousReviewResult.grade} approved.`
           : autonomousReviewResult.status === "ACCEPTED_WITH_FINDINGS"
@@ -3409,6 +3432,9 @@ export class PipelineRunner {
     const resolvedStatus = chapterStatus ?? (autonomousReviewResult?.status === "ACCEPTED_WITH_FINDINGS"
       ? "accepted-with-findings"
       : auditResult.passed ? "ready-for-review" : "audit-failed");
+    if (autonomousReviewResult) {
+      assertBoundedReviewTerminalLength(autonomousReviewResult, finalWordCount, lengthSpec);
+    }
     await persistChapterArtifacts({
       chapterNumber,
       chapterTitle: persistenceOutput.title,
@@ -4331,11 +4357,15 @@ ${matrix}`,
       holdReason: result.holdReason,
       invalidReviewerRole: result.invalidReviewerRole,
       usageByRole: result.usageByRole,
-      candidates: result.candidates.map(({ label, sha256, combinedScore }) => ({ label, sha256, combinedScore })),
+      candidates: result.candidates.map(({ label, sha256, combinedScore, lengthCount, lengthInHardRange }) => ({
+        label, sha256, combinedScore, lengthCount, lengthInHardRange,
+      })),
       bestCandidate: {
         label: result.bestCandidate.label,
         sha256: result.bestCandidate.sha256,
         combinedScore: result.bestCandidate.combinedScore,
+        lengthCount: result.bestCandidate.lengthCount,
+        lengthInHardRange: result.bestCandidate.lengthInHardRange,
       },
     };
   }
@@ -4360,11 +4390,15 @@ ${matrix}`,
         label: result.bestCandidate.label,
         sha256: result.bestCandidate.sha256,
         combined_score: result.bestCandidate.combinedScore,
+        length_count: result.bestCandidate.lengthCount,
+        length_in_hard_range: result.bestCandidate.lengthInHardRange,
       },
       candidates: result.candidates.map((candidate) => ({
         label: candidate.label,
         sha256: candidate.sha256,
         combined_score: candidate.combinedScore,
+        length_count: candidate.lengthCount,
+        length_in_hard_range: candidate.lengthInHardRange,
         reviews: candidate.reviews,
       })),
       usage_by_role: result.usageByRole,

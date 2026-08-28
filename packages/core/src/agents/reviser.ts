@@ -184,8 +184,8 @@ export class ReviserAgent extends BaseAgent {
           ? `\n\nProtagonist lock: ${bookRules.protagonist.name} — ${bookRules.protagonist.personalityLock.join(", ")}. Revisions must not violate the protagonist profile.`
           : `\n\n主角人设锁定：${bookRules.protagonist.name}，${bookRules.protagonist.personalityLock.join("、")}。修改不得违反人设。`)
       : "";
-    // Length guardrail only used by legacy modes (manual CLI revise).
-    // Auto mode delegates length to normalize, not reviser.
+    // Legacy modes place length guidance in the user prompt. Auto mode embeds
+    // its deterministic hard range in the system prompt below.
     const lengthGuardrail = mode !== "auto" && options?.lengthSpec
       ? (isEnglish
           ? "\n8. Keep the chapter word count within the target range; only allow minor deviation when fixing critical issues truly requires it"
@@ -397,8 +397,8 @@ ${chapterContent}`;
     const en = resolvedLanguage === "en";
     const rewriteLengthConstraint = lengthSpec
       ? (en
-          ? `\n  HARD CONSTRAINT: The revised chapter must stay within ${lengthSpec.softMin}-${lengthSpec.softMax} characters (target: ${lengthSpec.target}, ±25%). This is non-negotiable — do not exceed this range.`
-          : `\n  硬性约束：重写后的章节必须控制在 ${lengthSpec.softMin}-${lengthSpec.softMax} 字以内（目标 ${lengthSpec.target} 字，±25%）。这是不可突破的底线。`)
+          ? `\n  HARD LENGTH REQUIREMENT: Preserve and fix the requested literary findings while revising toward a target near ${lengthSpec.target} words. The final output MUST remain within ${lengthSpec.hardMin}-${lengthSpec.hardMax} words. When repairing findings, you must not collapse scenes or delete necessary narrative substance.`
+          : `\n  篇幅硬要求：保留并修复指定的文学审稿问题，目标接近 ${lengthSpec.target} 字；最终输出必须保持在 ${lengthSpec.hardMin}-${lengthSpec.hardMax} 字范围内。不得通过压垮场景或删除必要叙事内容来解决审稿问题。`)
       : "";
 
     const routingDirectiveEn = autoOutputMode === "rewrite-only"
