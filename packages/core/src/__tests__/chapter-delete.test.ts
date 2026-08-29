@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import type { ChapterMeta } from "../models/chapter.js";
 import { StateManager } from "../state/manager.js";
 import { deleteLatestChapter } from "../state/chapter-delete.js";
+import { createChapterGenesis } from "../production/chapter-transaction.js";
 
 function chapterEntry(number: number, title: string): ChapterMeta {
   const now = new Date().toISOString();
@@ -58,6 +59,30 @@ async function setupBook(params: {
 }
 
 describe("deleteLatestChapter", () => {
+  it("blocks deletion of Genesis and committed transaction chapters before any mutation", async () => {
+    for (const committed of [false, true]) {
+      const chapters = [1, 2, 3, 4, ...(committed ? [5] : [])].map((number) => ({ number, title: `C${number}`, content: `chapter ${number}` }));
+      const { root, bookDir } = await setupBook({
+        bookId: committed ? "committedbook" : "genesisbook",
+        chapters,
+        snapshotChapters: [0, 1, 2, 3, 4],
+      });
+      await createChapterGenesis({
+        bookDir, bookId: committed ? "committedbook" : "genesisbook", lastTrustedChapter: 4,
+        trustedSnapshotDir: join(bookDir, "story", "snapshots", "4"),
+      });
+      if (committed) {
+        await mkdir(join(bookDir, "story", "commits", "chapter-0005"), { recursive: true });
+        await writeFile(join(bookDir, "story", "commits", "chapter-0005", "commit.json"), "immutable");
+      }
+      const state = new StateManager(root);
+      const latest = committed ? 5 : 4;
+      await expect(deleteLatestChapter(state, committed ? "committedbook" : "genesisbook"))
+        .rejects.toThrow("TRANSACTION_AUTHORITY_MUTATION_FORBIDDEN");
+      await expect(exists(join(bookDir, "chapters", `${String(latest).padStart(4, "0")}_C${latest}.md`))).resolves.toBe(true);
+      await expect(exists(join(bookDir, "chapters", ".trash"))).resolves.toBe(false);
+    }
+  });
   it("moves the latest chapter file to chapters/.trash and rolls state back", async () => {
     const { root, bookDir } = await setupBook({
       bookId: "delbook",

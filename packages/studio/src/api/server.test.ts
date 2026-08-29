@@ -349,11 +349,13 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
     projectAutonomousEconomics: actual.projectAutonomousEconomics,
     resolveProductionScope: actual.resolveProductionScope,
     createAutonomousPipelineActions: actual.createAutonomousPipelineActions,
+    assertChapterAuthorityMutationAllowed: actual.assertChapterAuthorityMutationAllowed,
     assertChapterWriterStartAllowed: actual.assertChapterWriterStartAllowed,
     inspectChapterAuthority: actual.inspectChapterAuthority,
     isChapterTransactionEnabled: actual.isChapterTransactionEnabled,
     reconcileChapterProjections: actual.reconcileChapterProjections,
     createAutonomousProviderExecution: actual.createAutonomousProviderExecution,
+    createChapterGenesis: actual.createChapterGenesis,
     resolveFormalPendingChapterRecoveryPlan: resolveFormalPendingChapterRecoveryPlanMock,
     claimAutonomousJob: actual.claimAutonomousJob,
     deriveAutonomousJobIdentity: actual.deriveAutonomousJobIdentity,
@@ -3022,6 +3024,40 @@ describe("createStudioServer daemon lifecycle", () => {
       join(root, "books", "demo-book", "story", "runtime", "chapter-0003.user-brief.md"),
       "utf-8",
     )).resolves.toContain("保留事实");
+  });
+
+  it("blocks Studio rewrite before mutating a Genesis-bound chapter or its user brief", async () => {
+    const bookDir = join(root, "books", "demo-book");
+    await writeFile(join(bookDir, "chapters", "0001_Legacy.md"), "legacy 1", "utf-8");
+    await writeFile(join(bookDir, "chapters", "0002_Legacy.md"), "legacy 2", "utf-8");
+    await writeFile(join(bookDir, "chapters", "index.json"), JSON.stringify([1, 2, 3].map((number) => ({ number, title: `Legacy ${number}` }))), "utf-8");
+    const snapshotDir = join(bookDir, "story", "snapshots", "3");
+    await mkdir(join(snapshotDir, "state"), { recursive: true });
+    await writeFile(join(snapshotDir, "current_state.md"), "state 3", "utf-8");
+    await writeFile(join(snapshotDir, "state", "manifest.json"), JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 3 }), "utf-8");
+    const { createChapterGenesis } = await import("@actalk/inkos-core");
+    await createChapterGenesis({
+      bookDir,
+      bookId: "demo-book",
+      lastTrustedChapter: 3,
+      trustedSnapshotDir: snapshotDir,
+      createdAt: "2026-08-29T00:00:00.000Z",
+    });
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/books/demo-book/rewrite/3", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ brief: "must not be persisted" }),
+    });
+
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toMatchObject({
+      error: expect.stringContaining("TRANSACTION_AUTHORITY_MUTATION_FORBIDDEN"),
+    });
+    expect(reviseDraftMock).not.toHaveBeenCalled();
+    await expect(access(join(bookDir, "story", "runtime", "chapter-0003.user-brief.md"))).rejects.toThrow();
   });
 
   it("restores an archived chapter version and exposes safe latest-chapter deletion", async () => {

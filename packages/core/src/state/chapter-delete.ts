@@ -2,6 +2,7 @@ import { access, mkdir, readdir, rename, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { ChapterMeta } from "../models/chapter.js";
 import { toPosixPath } from "../utils/posix-path.js";
+import { assertChapterAuthorityMutationAllowed } from "../production/chapter-transaction.js";
 
 export interface ChapterDeleteDeps {
   bookDir(bookId: string): string;
@@ -53,6 +54,7 @@ export async function deleteLatestChapter(
   }
 
   const bookDir = deps.bookDir(bookId);
+  await assertChapterAuthorityMutationAllowed({ bookDir, chapterNumber: requested });
   const rollbackTarget = latest - 1;
 
   // Verify the rollback snapshot is usable BEFORE touching any file, so a

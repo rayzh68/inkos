@@ -133,6 +133,7 @@ import {
   type SessionKind,
   type AgentSessionAttachment,
   createAutonomousPipelineActions,
+  assertChapterAuthorityMutationAllowed,
   assertChapterWriterStartAllowed,
   inspectChapterAuthority,
   isChapterTransactionEnabled,
@@ -3810,6 +3811,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const pendingRepair = current?.runtimeBlockers.includes(`PENDING_STATE_REPAIR_CHAPTER_${chapterNum}`) === true;
     if (!pendingRepair) throw new ApiError(409, "CHAPTER_STATE_REPAIR_NOT_REQUIRED", `Chapter ${chapterNum} is not waiting for state repair.`);
     if (current?.runtime?.status === "REPAIRING") throw new ApiError(409, "STATE_REPAIR_ALREADY_PERSISTED", "A persisted state repair is already in progress and must be reconciled before another transport.");
+    await assertChapterAuthorityMutationAllowed({ bookDir: state.bookDir(id), chapterNumber: chapterNum });
     const repairHighUsd = current?.economics.repairForecast.highUsd ?? null;
     const priorRepairUpperUsd = current?.runtime?.repairOutcome?.reservedCostUpperUsd ?? 0;
     if (!autonomousJobs.reserve(id)) throw new ApiError(409, "AUTONOMOUS_JOB_ALREADY_RUNNING", "Production or state repair is already active for this book.");
@@ -6301,6 +6303,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
 
     broadcast("rewrite:start", { bookId: id, chapter: chapterNum });
     try {
+      await assertChapterAuthorityMutationAllowed({ bookDir: state.bookDir(id), chapterNumber: chapterNum });
       if (Object.prototype.hasOwnProperty.call(body, "brief")) {
         await saveChapterUserBrief(state.bookDir(id), chapterNum, body.brief ?? "");
       }

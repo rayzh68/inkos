@@ -89,6 +89,7 @@ import {
 } from "../production/bounded-autonomous-controller.js";
 import {
   beginChapterTransaction,
+  assertChapterAuthorityMutationAllowed,
   chapterTransactionStagingBookDir,
   finalizeChapterTransaction,
   isChapterTransactionEnabled,
@@ -1615,6 +1616,7 @@ export class PipelineRunner {
       if (targetChapter < 1) {
         throw new Error(`No chapters to revise for "${bookId}"`);
       }
+      await assertChapterAuthorityMutationAllowed({ bookDir, chapterNumber: targetChapter });
 
       const stageLanguage = await this.resolveBookLanguage(book);
       // Read the current audit issues from index
@@ -3704,6 +3706,7 @@ export class PipelineRunner {
     if (targetIndex < 0) {
       throw new Error(`Chapter ${targetChapter} not found in "${bookId}".`);
     }
+    await assertChapterAuthorityMutationAllowed({ bookDir, chapterNumber: targetChapter });
     const targetMeta = index[targetIndex]!;
     const latestChapter = Math.max(...index.map((chapter) => chapter.number));
     if (targetMeta.status !== "state-degraded") {
@@ -3834,6 +3837,7 @@ export class PipelineRunner {
     if (targetIndex < 0) {
       throw new Error(`Chapter ${targetChapter} not found in "${bookId}".`);
     }
+    await assertChapterAuthorityMutationAllowed({ bookDir, chapterNumber: targetChapter });
 
     const targetMeta = index[targetIndex]!;
     const latestChapter = Math.max(...index.map((chapter) => chapter.number));

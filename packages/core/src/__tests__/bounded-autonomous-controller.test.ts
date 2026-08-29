@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claimAutonomousJob, correctLegacyPendingChapterArtifactBindings, createAutonomousPipelineActions, createAutonomousProviderExecution, deriveAutonomousJobIdentity, finalizePendingChapterOfflinePlan, refreshAutonomousJobClaim, releaseAutonomousJob, resolveFormalPendingChapterRecoveryPlan, runBoundedAutonomousScope, saveAutonomousProductionState, verifyFormalPendingChapterRecoveryEvidence } from "../production/bounded-autonomous-controller.js";
+import type { AutonomousRunProgress } from "../production/bounded-autonomous-controller.js";
 import { LLMCallExecutionError } from "../llm/provider.js";
 import type { BookProductionMap } from "../production/book-production-map.js";
 import type { ChapterMeta } from "../models/chapter.js";
@@ -20,7 +21,7 @@ const map: BookProductionMap = {
 };
 
 function providerFailure(params: {
-  readonly classification: "RETRYABLE_PROVIDER_HTTP" | "RETRYABLE_PRE_TRANSPORT" | "AMBIGUOUS_PROVIDER_OUTCOME" | "DETERMINISTIC_PROVIDER_ERROR";
+  readonly classification: "RETRYABLE_PROVIDER_HTTP" | "RETRYABLE_PROVIDER_RESPONSE" | "RETRYABLE_PRE_TRANSPORT" | "AMBIGUOUS_PROVIDER_OUTCOME" | "DETERMINISTIC_PROVIDER_ERROR";
   readonly status?: number;
   readonly retryAfterMs?: number;
   readonly logicalStepId?: string;
@@ -36,7 +37,7 @@ function providerFailure(params: {
     ...(params.revisionRound !== undefined ? { revisionRound: params.revisionRound } : {}),
     classification: params.classification,
     transportStarted: params.classification !== "RETRYABLE_PRE_TRANSPORT",
-    transportReturned: params.classification === "RETRYABLE_PROVIDER_HTTP" || params.classification === "DETERMINISTIC_PROVIDER_ERROR",
+    transportReturned: params.classification === "RETRYABLE_PROVIDER_HTTP" || params.classification === "RETRYABLE_PROVIDER_RESPONSE" || params.classification === "DETERMINISTIC_PROVIDER_ERROR",
     ...(params.status ? { httpStatus: params.status } : {}),
     ...(params.retryAfterMs ? { retryAfterMs: params.retryAfterMs } : {}),
   });
@@ -340,6 +341,94 @@ describe("bounded autonomous production controller", () => {
         return { content: "must-not-run", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
       }, { provider: "test", model: "model", inputFingerprint: fingerprint })).rejects.toThrow(/AMBIGUOUS/i);
       expect(transportCalls).toBe(0);
+      const unchanged = JSON.parse(await readFile(join(root, "books", "book", "story", "runtime", "bounded-autonomous", "production-state.json"), "utf-8"));
+      expect(unchanged.providerAttemptHistory).toHaveLength(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("durably closes a returned retry failure, starts attempt 2, then replays only COMPLETE", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-returned-retry-"));
+    try {
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      await mkdir(runtimeDir, { recursive: true });
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId: "job", status: "RUNNING", mode: "current-volume", nextChapter: 5,
+      }));
+      const execution = createAutonomousProviderExecution({
+        projectRoot: root, bookId: "book", jobId: "job",
+        getActiveStage: () => ({ stage: "LOGIC_REVIEW", role: "auditor", provider: "test", model: "model" }),
+      });
+      const request = { provider: "test", model: "model", inputFingerprint: "7".repeat(64) };
+      let transports = 0;
+      await expect(execution.runProviderCall(5, async () => {
+        transports += 1;
+        throw Object.assign(new Error("HTTP 503 temporary failure"), { status: 503 });
+      }, request)).rejects.toThrow(/503/);
+
+      const afterFailure = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
+      expect(afterFailure.providerAttemptHistory).toMatchObject([{
+        attempt: 1, classification: "RETRYABLE_PROVIDER_HTTP", transportStarted: true, transportReturned: true,
+      }]);
+
+      const success = await execution.runProviderCall(5, async () => {
+        transports += 1;
+        return { content: "bounded success", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, request);
+      const replay = await execution.runProviderCall(5, async () => {
+        transports += 1;
+        throw new Error("must not transport after COMPLETE");
+      }, request);
+      expect(success).toEqual(replay);
+      expect(transports).toBe(2);
+      const runtime = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
+      expect(runtime.providerAttemptHistory).toMatchObject([
+        { attempt: 1, classification: "RETRYABLE_PROVIDER_HTTP", transportStarted: true, transportReturned: true },
+        { attempt: 2, classification: "SUCCESS", transportStarted: true, transportReturned: true },
+      ]);
+      expect(new Set(runtime.providerAttemptHistory.map((entry: { transportAttemptId: string }) => entry.transportAttemptId)).size).toBe(2);
+      expect(runtime.responseArtifactStatus).toBe("COMPLETE");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("normalizes one provable legacy empty-response record before a truthful bounded retry", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-legacy-empty-"));
+    try {
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      await mkdir(runtimeDir, { recursive: true });
+      const execution = createAutonomousProviderExecution({
+        projectRoot: root, bookId: "book", jobId: "job",
+        getActiveStage: () => ({ stage: "LOGIC_REVIEW", role: "auditor", provider: "test", model: "model" }),
+      });
+      const request = { provider: "test", model: "model", inputFingerprint: "8".repeat(64) };
+      const logicalStepId = execution.responseArtifactPath(request.inputFingerprint, request.provider, request.model, 5)
+        .split(/[\\/]/u).at(-1)!.replace(/\.json$/u, "");
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId: "job", status: "PAUSED_DETERMINISTIC_PROVIDER_ERROR", mode: "current-volume", nextChapter: 5,
+        checkpoint: "DETERMINISTIC_PROVIDER_ERROR", responseArtifactStatus: "NONE",
+        reason: "LLM returned empty response (usage=0+0)", lastErrorClassification: "DETERMINISTIC_PROVIDER_ERROR",
+        providerAttemptHistory: [{
+          transportAttemptId: `${logicalStepId}:transport-attempt:1`, logicalStepId, chapterNumber: 5,
+          role: "auditor", provider: "test", requestedModel: "model", attempt: 1,
+          classification: "TRANSPORT_STARTED", transportStarted: true, transportReturned: false,
+          recordedAt: "2026-08-29T00:00:00.000Z",
+        }],
+      }));
+      let transports = 0;
+      const result = await execution.runProviderCall(5, async () => {
+        transports += 1;
+        return { content: "legacy retry success", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, request);
+      expect(result.content).toBe("legacy retry success");
+      expect(transports).toBe(1);
+      const runtime = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
+      expect(runtime.providerAttemptHistory).toMatchObject([
+        { attempt: 1, classification: "RETRYABLE_PROVIDER_RESPONSE", transportStarted: true, transportReturned: true },
+        { attempt: 2, classification: "SUCCESS", transportStarted: true, transportReturned: true },
+      ]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -650,6 +739,33 @@ describe("bounded autonomous production controller", () => {
     expect(result.status).toBe("VOLUME_COMPLETE");
   });
 
+  it("applies the existing bounded retry policy to a returned empty-response failure", async () => {
+    let now = 0;
+    let next = 1;
+    let calls = 0;
+    const waits: number[] = [];
+    const result = await runBoundedAutonomousScope({
+      map,
+      mode: "current-volume",
+      getNextChapter: async () => next,
+      runChapter: async () => {
+        calls += 1;
+        if (calls === 1) throw providerFailure({ classification: "RETRYABLE_PROVIDER_RESPONSE" });
+        next = 4;
+        return { status: "ready-for-review" };
+      },
+      shouldStop: () => false,
+      persistProgress: async () => undefined,
+      providerRecovery: {
+        execute: async (_chapter, task) => task(), loadPersistedProgress: async () => null,
+        now: () => now, sleep: async (ms) => { waits.push(ms); now += ms; },
+      },
+    });
+    expect(waits).toEqual([300_000]);
+    expect(calls).toBe(2);
+    expect(result).toMatchObject({ status: "VOLUME_COMPLETE", nextChapter: 4 });
+  });
+
   it("uses 300 then 900 seconds for HTTP 503 and pauses after the third failed transport", async () => {
     let now = 0;
     let calls = 0;
@@ -781,6 +897,42 @@ describe("bounded autonomous production controller", () => {
     expect(result).toMatchObject({ status: "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", attempt: 1 });
     expect(calls).toBe(1);
     expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it("preserves the durable attempt number when restart finds attempt 2 ambiguous", async () => {
+    const logicalStepId = "step-ambiguous-restart";
+    const history = [
+      {
+        transportAttemptId: `${logicalStepId}:transport-attempt:1`, logicalStepId, chapterNumber: 1, role: "auditor",
+        provider: "openrouter", requestedModel: "provider/model", attempt: 1, classification: "RETRYABLE_PROVIDER_HTTP",
+        transportStarted: true, transportReturned: true, recordedAt: "2026-08-29T00:00:00.000Z",
+      },
+      {
+        transportAttemptId: `${logicalStepId}:transport-attempt:2`, logicalStepId, chapterNumber: 1, role: "auditor",
+        provider: "openrouter", requestedModel: "provider/model", attempt: 2, classification: "TRANSPORT_STARTED",
+        transportStarted: true, transportReturned: false, recordedAt: "2026-08-29T00:01:00.000Z",
+      },
+    ];
+    const persisted = {
+      jobId: deriveAutonomousJobIdentity({ map, mode: "current-volume", nextChapter: 1 }),
+      status: "WAITING_PROVIDER_RETRY", mode: "current-volume", volumeId: "volume-001", startChapter: 1,
+      targetChapter: 3, nextChapter: 1, completedThisRun: 0, logicalStepId, attempt: 2,
+      providerAttemptHistory: history,
+    } as AutonomousRunProgress;
+    const states: AutonomousRunProgress[] = [];
+    const result = await runBoundedAutonomousScope({
+      map, mode: "current-volume", getNextChapter: async () => 1,
+      runChapter: async () => { throw providerFailure({ classification: "AMBIGUOUS_PROVIDER_OUTCOME", logicalStepId }); },
+      shouldStop: () => false, persistProgress: async (state) => { states.push(state); },
+      providerRecovery: {
+        execute: async (_chapter, task) => task(), loadPersistedProgress: async () => persisted,
+        now: () => Date.parse("2026-08-29T00:02:00.000Z"), sleep: async () => undefined,
+      },
+    });
+    expect(result).toMatchObject({ status: "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", attempt: 2 });
+    expect(result.providerAttemptHistory).toHaveLength(2);
+    expect(result.providerAttemptHistory?.map((entry) => entry.transportAttemptId)).not.toContain(`${logicalStepId}:transport-attempt:3`);
+    expect(states.at(-1)).toMatchObject({ attempt: 2, providerAttemptHistory: history });
   });
 
   it.each([400, 401, 403])("does not retry deterministic HTTP %s", async (status) => {

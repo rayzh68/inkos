@@ -6,9 +6,11 @@ const buildPipelineConfigMock = vi.fn();
 const loadBookConfigMock = vi.fn();
 const logMock = vi.fn();
 const logErrorMock = vi.fn();
+const assertChapterAuthorityMutationAllowedMock = vi.fn();
 
 vi.mock("@actalk/inkos-core", () => ({
   DEFAULT_REVISE_MODE: "spot-fix",
+  assertChapterAuthorityMutationAllowed: assertChapterAuthorityMutationAllowedMock,
   PipelineRunner: class {
     reviseDraft = reviseDraftMock;
     resyncChapterArtifacts = resyncChapterArtifactsMock;
@@ -16,6 +18,9 @@ vi.mock("@actalk/inkos-core", () => ({
   StateManager: class {
     async loadBookConfig() {
       return loadBookConfigMock();
+    }
+    bookDir(bookId: string) {
+      return `/project/books/${bookId}`;
     }
   },
   // Mirrors the real core implementation; unit-tested in
@@ -62,6 +67,7 @@ describe("revision-related CLI commands", () => {
     });
     buildPipelineConfigMock.mockReturnValue({});
     loadBookConfigMock.mockResolvedValue({ language: "zh" });
+    assertChapterAuthorityMutationAllowedMock.mockResolvedValue(undefined);
   });
 
   it("passes one-off brief into revise command pipeline config", async () => {
@@ -85,5 +91,21 @@ describe("revision-related CLI commands", () => {
       externalContext: "以师债线为准同步状态。",
     });
     expect(resyncChapterArtifactsMock).toHaveBeenCalledWith("demo-book", 3);
+  });
+
+  it("blocks write rewrite at the transaction authority guard before filesystem mutation", async () => {
+    assertChapterAuthorityMutationAllowedMock.mockRejectedValueOnce(new Error("TRANSACTION_AUTHORITY_MUTATION_FORBIDDEN"));
+    const exit = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`EXIT_${code}`);
+    }) as never);
+    const { writeCommand } = await import("../commands/write.js");
+
+    await expect(writeCommand.parseAsync(["node", "write", "rewrite", "demo-book", "4", "--force"], { from: "node" }))
+      .rejects.toThrow("EXIT_1");
+    expect(assertChapterAuthorityMutationAllowedMock).toHaveBeenCalledWith({
+      bookDir: "/project/books/demo-book", chapterNumber: 4,
+    });
+    expect(logErrorMock).toHaveBeenCalledWith(expect.stringContaining("TRANSACTION_AUTHORITY_MUTATION_FORBIDDEN"));
+    exit.mockRestore();
   });
 });

@@ -584,6 +584,7 @@ export { parseBookProductionMap, loadBookProductionMap, resolveProductionScope, 
 export { autonomousProductionStatePath, claimAutonomousJob, correctLegacyPendingChapterArtifactBindings, createAutonomousPipelineActions, createAutonomousProviderExecution, deriveAutonomousJobIdentity, loadAutonomousProductionState, refreshAutonomousJobClaim, releaseAutonomousJob, resolveFormalPendingChapterRecoveryPlan, runBoundedAutonomousScope, saveAutonomousProductionState, startAutonomousJobHeartbeat, verifyFormalPendingChapterRecoveryEvidence, type AutonomousJobClaim, type AutonomousProviderRecovery, type AutonomousRecoveryOwnership, type AutonomousRunProgress, type AutonomousRunStatus, type AutonomousStageMetadata, type FormalOfflineFinalizationPlan, type FormalBoundedStateRebaselinePlan, type FormalPendingChapterRecoveryPlan } from "./production/bounded-autonomous-controller.js";
 export {
   beginChapterTransaction,
+  assertChapterAuthorityMutationAllowed,
   assertChapterWriterStartAllowed,
   chapterTransactionStagingBookDir,
   createChapterGenesis,

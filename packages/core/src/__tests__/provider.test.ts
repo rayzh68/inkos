@@ -194,13 +194,20 @@ describe("chatCompletion via pi-ai", () => {
   });
 
   it("delegates autonomous retry to the durable controller instead of retrying in memory", async () => {
-    mockStreamSimple.mockReturnValue(makeErrorStream("503 Service Unavailable"));
+    const order: string[] = [];
+    mockStreamSimple.mockImplementation(() => {
+      order.push("transport");
+      return makeErrorStream("503 Service Unavailable");
+    });
     const persistSuccess = vi.fn();
+    const persistFailure = vi.fn(async () => { order.push("failure-returned"); });
     const task = runWithLLMCallExecutionPolicy({
       prepare: async ({ inputFingerprint, provider, model }) => ({
         identity: { logicalStepId: "durable-step", inputFingerprint, provider, model, role: "auditor", stage: "LOGIC_REVIEW" },
       }),
       persistSuccess,
+      markTransportStarted: async () => { order.push("attempt-started"); },
+      persistFailure,
     }, () => chatCompletion(makeClient(), "test-model", [{ role: "user", content: "ping" }]));
 
     const error = await captureError(task);
@@ -208,6 +215,28 @@ describe("chatCompletion via pi-ai", () => {
     expect((error as LLMCallExecutionError).metadata.classification).toBe("RETRYABLE_PROVIDER_HTTP");
     expect(mockStreamSimple).toHaveBeenCalledTimes(1);
     expect(persistSuccess).not.toHaveBeenCalled();
+    expect(persistFailure).toHaveBeenCalledWith(expect.objectContaining({ logicalStepId: "durable-step" }), expect.objectContaining({
+      classification: "RETRYABLE_PROVIDER_HTTP", transportStarted: true, transportReturned: true,
+    }));
+    expect(order).toEqual(["attempt-started", "transport", "failure-returned"]);
+  });
+
+  it("persists an empty HTTP-200 response as returned retryable transport evidence", async () => {
+    mockStreamSimple.mockReturnValue(makeEmptyStream());
+    const persistFailure = vi.fn();
+    const task = runWithLLMCallExecutionPolicy({
+      prepare: async ({ inputFingerprint, provider, model }) => ({
+        identity: { logicalStepId: "empty-step", inputFingerprint, provider, model, role: "auditor", stage: "LOGIC_REVIEW" },
+      }),
+      persistSuccess: vi.fn(),
+      markTransportStarted: vi.fn(),
+      persistFailure,
+    }, () => chatCompletion(makeClient(), "test-model", [{ role: "user", content: "ping" }]));
+
+    await expect(task).rejects.toBeInstanceOf(LLMCallExecutionError);
+    expect(persistFailure).toHaveBeenCalledWith(expect.objectContaining({ logicalStepId: "empty-step" }), expect.objectContaining({
+      classification: "RETRYABLE_PROVIDER_RESPONSE", transportStarted: true, transportReturned: true,
+    }));
   });
 
   it("reuses a durable cached response without transport or duplicate success persistence", async () => {

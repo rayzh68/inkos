@@ -399,6 +399,31 @@ describe("PipelineRunner", () => {
     vi.restoreAllMocks();
   });
 
+  it("blocks revise, repair, and resync for Genesis authority before model or persistence work", async () => {
+    const { runner, state, bookId } = await createRunnerFixture();
+    const bookDir = state.bookDir(bookId);
+    const now = "2026-08-29T00:00:00.000Z";
+    await writeFile(join(bookDir, "chapters", "0001_Legacy.md"), "# Chapter 1\n\nimmutable legacy body");
+    await state.saveChapterIndex(bookId, [{
+      number: 1, title: "Legacy", status: "state-degraded", wordCount: 3,
+      createdAt: now, updatedAt: now, auditIssues: [], lengthWarnings: [],
+    }]);
+    await mkdir(join(bookDir, "story", "snapshots", "1"), { recursive: true });
+    await writeFile(join(bookDir, "story", "snapshots", "1", "current_state.md"), "immutable snapshot");
+    await createChapterGenesis({
+      bookDir, bookId, lastTrustedChapter: 1,
+      trustedSnapshotDir: join(bookDir, "story", "snapshots", "1"),
+    });
+    const provider = vi.spyOn(llmProvider, "chatCompletion");
+
+    await expect(runner.reviseDraft(bookId, 1, "rewrite")).rejects.toThrow("TRANSACTION_AUTHORITY_MUTATION_FORBIDDEN");
+    await expect(runner.repairChapterState(bookId, 1)).rejects.toThrow("TRANSACTION_AUTHORITY_MUTATION_FORBIDDEN");
+    await expect(runner.resyncChapterArtifacts(bookId, 1)).rejects.toThrow("TRANSACTION_AUTHORITY_MUTATION_FORBIDDEN");
+    await expect(runner.resyncChapterStateAndAudit(bookId, 1)).rejects.toThrow("TRANSACTION_AUTHORITY_MUTATION_FORBIDDEN");
+    expect(provider).not.toHaveBeenCalled();
+    await expect(readFile(join(bookDir, "chapters", "0001_Legacy.md"), "utf-8")).resolves.toContain("immutable legacy body");
+  });
+
   it("stages a transaction-enabled chapter and promotes one verified commit before cursor advance", async () => {
     let artifactBookDir = "";
     const stages: Array<{ stage: string; role: string; transactionId?: string }> = [];
