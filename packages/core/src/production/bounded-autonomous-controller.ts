@@ -100,6 +100,7 @@ export interface AutonomousStageMetadata {
   readonly model: string | null;
   readonly revisionRound?: number;
   readonly reviewRound?: number;
+  readonly transactionId?: string;
 }
 
 export interface AutonomousProviderRecovery {
@@ -464,6 +465,7 @@ interface PersistedProviderResponseArtifact {
   readonly content_sha256: string;
   readonly response: LLMResponse;
   readonly completed_at: string;
+  readonly transaction_id?: string;
 }
 
 interface CorrectedProviderArtifactBinding {
@@ -1776,15 +1778,17 @@ function logicalProviderStepId(params: {
   readonly inputFingerprint: string;
 }): string {
   const raw = [
-    "inkos-autonomous-provider-step-v1",
-    params.jobId,
+    params.stage.transactionId ? "inkos-autonomous-provider-step-v2" : "inkos-autonomous-provider-step-v1",
+    params.stage.transactionId ?? params.jobId,
     params.chapterNumber,
     params.stage.stage,
     params.stage.role,
     params.provider,
     params.model,
     params.inputFingerprint,
-    ...(params.stage.reviewRound === 0 ? ["semantic-review-retry:1"] : []),
+    ...(params.stage.transactionId && params.stage.revisionRound !== undefined ? [`revision-round:${params.stage.revisionRound}`] : []),
+    ...(params.stage.transactionId && params.stage.reviewRound !== undefined ? [`review-round:${params.stage.reviewRound}`] : []),
+    ...(!params.stage.transactionId && params.stage.reviewRound === 0 ? ["semantic-review-retry:1"] : []),
   ].join("\n");
   return `provider-step-${createHash("sha256").update(raw, "utf-8").digest("hex")}`;
 }
@@ -1824,6 +1828,7 @@ export function createAutonomousProviderExecution(params: {
       model: request.model,
       role: stage.role,
       stage: stage.stage,
+      ...(stage.transactionId !== undefined ? { transactionId: stage.transactionId } : {}),
       ...(stage.revisionRound !== undefined ? { revisionRound: stage.revisionRound } : {}),
       ...(stage.reviewRound !== undefined ? { reviewRound: stage.reviewRound } : {}),
     };
@@ -1835,12 +1840,21 @@ export function createAutonomousProviderExecution(params: {
     if (progress?.jobId !== params.jobId) return;
     const history = [...(progress.providerAttemptHistory ?? [])];
     const existingSuccess = history.find((entry) => entry.logicalStepId === identity.logicalStepId && entry.classification === "SUCCESS");
-    const attempt = existingSuccess?.attempt ?? Math.max(0, ...history
+    let startedIndex = -1;
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+      const entry = history[index]!;
+      if (entry.logicalStepId === identity.logicalStepId && entry.transportStarted && !entry.transportReturned) {
+        startedIndex = index;
+        break;
+      }
+    }
+    const started = startedIndex >= 0 ? history[startedIndex] : undefined;
+    const attempt = existingSuccess?.attempt ?? started?.attempt ?? Math.max(0, ...history
       .filter((entry) => entry.logicalStepId === identity.logicalStepId)
       .map((entry) => entry.attempt)) + 1;
-    const transportAttemptId = existingSuccess?.transportAttemptId ?? `${identity.logicalStepId}:transport-attempt:${attempt}`;
+    const transportAttemptId = existingSuccess?.transportAttemptId ?? started?.transportAttemptId ?? `${identity.logicalStepId}:transport-attempt:${attempt}`;
     if (!existingSuccess) {
-      history.push({
+      const success: (typeof history)[number] = {
         transportAttemptId,
         logicalStepId: identity.logicalStepId,
         chapterNumber: activeChapter,
@@ -1852,7 +1866,9 @@ export function createAutonomousProviderExecution(params: {
         transportStarted: true,
         transportReturned: true,
         recordedAt: new Date(params.now?.() ?? Date.now()).toISOString(),
-      });
+      };
+      if (startedIndex >= 0) history[startedIndex] = success;
+      else history.push(success);
     }
     await saveAutonomousProductionState(params.projectRoot, params.bookId, {
       ...progress,
@@ -1904,6 +1920,7 @@ export function createAutonomousProviderExecution(params: {
       || artifact.requested_model !== identity.model
       || artifact.input_fingerprint !== identity.inputFingerprint
       || artifact.response_artifact_status !== "COMPLETE"
+      || (identity.transactionId !== undefined && artifact.transaction_id !== identity.transactionId)
       || artifact.content_sha256 !== contentSha
     ) {
       throw new Error("AUTONOMOUS_PROVIDER_RESPONSE_ARTIFACT_IDENTITY_MISMATCH");
@@ -1988,6 +2005,7 @@ export function createAutonomousProviderExecution(params: {
       content_sha256: createHash("sha256").update(response.content, "utf-8").digest("hex"),
       response,
       completed_at: new Date(params.now?.() ?? Date.now()).toISOString(),
+      ...(identity.transactionId ? { transaction_id: identity.transactionId } : {}),
     };
     await mkdir(dirname(path), { recursive: true });
     const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
@@ -2000,18 +2018,57 @@ export function createAutonomousProviderExecution(params: {
     }
     await markResponseArtifactComplete(identity);
   };
+  const markTransportStarted = async (identity: LLMCallExecutionIdentity): Promise<void> => {
+    const progress = await loadAutonomousProductionState<AutonomousRunProgress>(params.projectRoot, params.bookId);
+    if (progress?.jobId !== params.jobId) return;
+    const history = [...(progress.providerAttemptHistory ?? [])];
+    const completed = history.some((entry) => entry.logicalStepId === identity.logicalStepId && entry.transportReturned);
+    if (completed) return;
+    const ambiguous = history.find((entry) => entry.logicalStepId === identity.logicalStepId && entry.transportStarted && !entry.transportReturned);
+    if (ambiguous) {
+      throw new LLMCallExecutionError("AUTONOMOUS_PROVIDER_OUTCOME_AMBIGUOUS", {
+        ...identity, classification: "AMBIGUOUS_PROVIDER_OUTCOME",
+        transportStarted: true, transportReturned: false,
+      });
+    }
+    const attempt = Math.max(0, ...history.filter((entry) => entry.logicalStepId === identity.logicalStepId).map((entry) => entry.attempt)) + 1;
+    const transportAttemptId = `${identity.logicalStepId}:transport-attempt:${attempt}`;
+    history.push({
+      transportAttemptId, logicalStepId: identity.logicalStepId, chapterNumber: activeChapter, role: identity.role,
+      provider: identity.provider, requestedModel: identity.model, attempt, classification: "TRANSPORT_STARTED",
+      transportStarted: true, transportReturned: false, recordedAt: new Date(params.now?.() ?? Date.now()).toISOString(),
+    });
+    await saveAutonomousProductionState(params.projectRoot, params.bookId, {
+      ...progress, logicalStepId: identity.logicalStepId, chapterNumber: activeChapter, role: identity.role,
+      stage: identity.stage, provider: identity.provider, requestedModel: identity.model, attempt, maxAttempts: 3,
+      transportRetryCount: Math.max(0, attempt - 1), transportAttemptId, providerAttemptHistory: history,
+      checkpoint: "TRANSPORT_STARTED", responseArtifactStatus: "NONE",
+    });
+  };
   const policy: LLMCallExecutionPolicy = {
     prepare: async (request) => {
       const identity = identify(request);
       const cachedResponse = await readArtifact(identity);
+      if (!cachedResponse) {
+        const progress = await loadAutonomousProductionState<AutonomousRunProgress>(params.projectRoot, params.bookId);
+        if (progress?.jobId === params.jobId && (progress.providerAttemptHistory ?? []).some((entry) => entry.logicalStepId === identity.logicalStepId
+          && entry.transportStarted && !entry.transportReturned)) {
+          throw new LLMCallExecutionError("AUTONOMOUS_PROVIDER_OUTCOME_AMBIGUOUS", {
+            ...identity, classification: "AMBIGUOUS_PROVIDER_OUTCOME",
+            transportStarted: true, transportReturned: false,
+          });
+        }
+      }
       return { identity, ...(cachedResponse ? { cachedResponse } : {}) };
     },
     persistSuccess: persistArtifact,
+    markTransportStarted,
   };
   const runProviderCall = async (chapterNumber: number, transport: () => Promise<LLMResponse>, request: { readonly provider: string; readonly model: string; readonly inputFingerprint: string }) => {
     activeChapter = chapterNumber;
     const prepared = await policy.prepare(request);
     if (prepared.cachedResponse) return prepared.cachedResponse;
+    await policy.markTransportStarted?.(prepared.identity);
     const response = await transport();
     await policy.persistSuccess(prepared.identity, response);
     return response;
@@ -2145,6 +2202,7 @@ export async function runBoundedAutonomousScope(params: {
   readonly shouldStop: () => boolean;
   readonly persistProgress: (progress: AutonomousRunProgress) => Promise<void>;
   readonly providerRecovery?: AutonomousProviderRecovery;
+  readonly verifyChapterStartAuthority?: (chapterNumber: number) => Promise<void>;
 }): Promise<AutonomousRunProgress> {
   const initialNext = await params.getNextChapter();
   const scopeChapterNumber = params.recoveryScopeChapterNumber ?? initialNext;
@@ -2351,6 +2409,7 @@ export async function runBoundedAutonomousScope(params: {
       await params.persistProgress(paused);
       return paused;
     }
+    await params.verifyChapterStartAuthority?.(nextChapter);
     const result = await executeRecoverably(nextChapter, () => params.runChapter());
     if ("mode" in result) return result;
     if (result.status === "state-degraded") {

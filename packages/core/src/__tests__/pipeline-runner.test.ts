@@ -33,6 +33,7 @@ import {
 } from "../state/chapter-workspace.js";
 import { correctLegacyPendingChapterArtifactBindings, createAutonomousProviderExecution, deriveAutonomousJobIdentity, resolveFormalPendingChapterRecoveryPlan, type FormalPreservedBoundedReviewResumePlan } from "../production/bounded-autonomous-controller.js";
 import type { BoundedReviewResult } from "../pipeline/bounded-review.js";
+import { createChapterGenesis, verifyChapterCommit } from "../production/chapter-transaction.js";
 
 const require = createRequire(import.meta.url);
 const hasNodeSqlite = (() => {
@@ -397,6 +398,238 @@ describe("PipelineRunner", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
+
+  it("stages a transaction-enabled chapter and promotes one verified commit before cursor advance", async () => {
+    let artifactBookDir = "";
+    const stages: Array<{ stage: string; role: string; transactionId?: string }> = [];
+    const { root, runner, state, bookId } = await createRunnerFixture({
+      boundedAutonomousReview: true,
+      onAutonomousStage: async (event) => {
+        stages.push({ stage: event.stage, role: event.role, ...(event.transactionId ? { transactionId: event.transactionId } : {}) });
+        if (!event.transactionId || !event.provider || !event.model) return;
+        const inputFingerprint = createHash("sha256").update(`${event.transactionId}:${event.stage}:${event.role}:input`).digest("hex");
+        const logicalOperationId = `provider-step-${createHash("sha256").update(`${event.transactionId}:${event.stage}:${event.role}`).digest("hex")}`;
+        const content = `${event.stage}:${event.role}:fixture-response`;
+        const artifact = {
+          schema_version: "1.0", job_id: "pipeline-test-job", logical_step_id: logicalOperationId, usage_identity: logicalOperationId,
+          transaction_id: event.transactionId, chapter_number: 1, role: event.role, stage: event.stage,
+          provider: event.provider, requested_model: event.model, input_fingerprint: inputFingerprint,
+          response_artifact_status: "COMPLETE", content_sha256: createHash("sha256").update(content).digest("hex"),
+          response: { content }, completed_at: "2026-08-28T00:00:00.000Z",
+        };
+        const dir = join(artifactBookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, `${logicalOperationId}.json`), `${JSON.stringify(artifact, null, 2)}\n`, "utf-8");
+      },
+    });
+    const bookDir = state.bookDir(bookId);
+    artifactBookDir = bookDir;
+    const storyDir = join(bookDir, "story");
+    const body = englishWords(2200, "chapter");
+    const dimensions = {
+      blueprint_transition: 92, causal_logic: 92, canon_continuity: 92, character_motivation: 92,
+      state_inheritance: 92, hooks_disclosure: 92, narrative_clarity: 92,
+    };
+    try {
+      await state.saveBookConfig(bookId, { ...(await state.loadBookConfig(bookId)), language: "en", chapterWordCount: 2200 });
+      await Promise.all([
+        writeFile(join(storyDir, "current_state.md"), createStateCard({ chapter: 0, location: "Gate", protagonistState: "Ready", goal: "Begin", conflict: "Clock" })),
+        writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n"),
+      ]);
+      await state.snapshotState(bookId, 0);
+      await createChapterGenesis({ bookDir, bookId, lastTrustedChapter: 0, trustedSnapshotDir: join(storyDir, "snapshots", "0"), createdAt: "2026-08-28T00:00:00.000Z" });
+      vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(createWriterOutput({
+        chapterNumber: 1, title: "Transaction One", content: body, wordCount: 2200,
+        updatedState: createStateCard({ chapter: 1, location: "Gate", protagonistState: "Moving", goal: "Proceed", conflict: "Clock" }),
+        updatedHooks: "# Pending Hooks\n",
+      }));
+      vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockResolvedValue(createAuditResult({ passed: true, overallScore: 92, dimensionScores: dimensions }));
+      vi.spyOn(CommercialReaderAgent.prototype, "reviewChapter").mockImplementation(async (input) => ({
+        reviewerRole: "commercial-reader", provider: "openai", model: "test-model", totalScore: 90,
+        dimensionScores: { opening_hook: 90, pacing_tension: 90, emotional_investment: 90, plot_clarity: 90, dialogue_appeal: 90, western_cultural_naturalness: 90, commercial_appeal: 90, ending_hook: 90 },
+        decision: "APPROVED", findings: [], reviewedCandidateSha: input.candidateSha,
+        reviewedAt: "2026-08-28T00:00:00.000Z", tokenUsage: ZERO_USAGE,
+      }));
+      vi.spyOn(ChapterAnalyzerAgent.prototype, "analyzeChapter").mockResolvedValue(createAnalyzedOutput({
+        chapterNumber: 1, title: "Transaction One", content: body, wordCount: 2200,
+        updatedState: createStateCard({ chapter: 1, location: "Gate", protagonistState: "Moving", goal: "Proceed", conflict: "Clock" }),
+        updatedHooks: "# Pending Hooks\n",
+      }));
+
+      const result = await runner.writeNextChapter(bookId, 2200);
+      expect(result.status).toBe("ready-for-review");
+      const commit = await verifyChapterCommit({ bookDir, chapterNumber: 1 });
+      expect(commit.finalLengthCount).toBe(2200);
+      expect(commit.providerReferenceCount).toBeGreaterThanOrEqual(5);
+      expect(stages[0]).toMatchObject({ stage: "PREPARING", transactionId: expect.stringMatching(/^chapter-txn-/u) });
+      expect(stages.filter((event) => event.stage === "PREPARING").map((event) => event.role)).toEqual(expect.arrayContaining(["writer", "planner", "composer"]));
+      const logicEvidenceDir = join(
+        bookDir, "story", "runtime", "chapter-transactions", "chapter-0001", "staging", "evidence",
+        "reviews", commit.finalBodySha256, "logic-canon-auditor",
+      );
+      const logicEvidenceFiles = await readdir(logicEvidenceDir);
+      expect(logicEvidenceFiles).toHaveLength(1);
+      await expect(readFile(join(logicEvidenceDir, logicEvidenceFiles[0]!), "utf-8")).resolves.toContain(commit.finalBodySha256);
+      await expect(readFile(join(
+        bookDir, "story", "runtime", "chapter-transactions", "chapter-0001", "staging", "evidence", "review-result.json",
+      ), "utf-8")).resolves.toContain('"status": "APPROVED"');
+      expect(await state.getNextChapterNumber(bookId)).toBe(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
+
+  it.each(["PREPARING", "WRITER", "REVIEW", "REVISION", "STATE"] as const)(
+    "restarts the actual transaction Pipeline after %s without duplicating completed paid operations",
+    async (boundary) => {
+      let activeStage = { stage: "NOT_STARTED", role: "none", provider: "openai" as string | null, model: "test-model" as string | null, transactionId: undefined as string | undefined };
+      let execution: ReturnType<typeof createAutonomousProviderExecution> | undefined;
+      let crashEnabled = true;
+      let saveCrashEnabled = boundary === "STATE";
+      let perRunStageCounts = new Map<string, number>();
+      const transportCounts = new Map<string, number>();
+      const onAutonomousStage = async (event: Omit<typeof activeStage, "transactionId"> & { transactionId?: string }) => {
+        activeStage = { ...event, transactionId: event.transactionId };
+        if (!event.transactionId || !event.provider || !event.model || event.stage === "APPROVED") return;
+        const stageKey = `${event.stage}:${event.role}`;
+        const occurrence = (perRunStageCounts.get(stageKey) ?? 0) + 1;
+        perRunStageCounts.set(stageKey, occurrence);
+        const operationKey = `${stageKey}:${occurrence}`;
+        const inputFingerprint = createHash("sha256").update(operationKey).digest("hex");
+        if (!execution) throw new Error("TEST_PROVIDER_EXECUTION_NOT_READY");
+        await execution.runProviderCall(1, async () => {
+          transportCounts.set(operationKey, (transportCounts.get(operationKey) ?? 0) + 1);
+          return { content: `complete:${operationKey}`, usage: ZERO_USAGE };
+        }, { provider: event.provider, model: event.model, inputFingerprint });
+        const crash = boundary === "PREPARING"
+          ? event.stage === "PREPARING" && event.role === "composer"
+          : boundary === "WRITER" ? event.stage === "LOGIC_REVIEW" && occurrence === 1
+            : boundary === "REVIEW" ? event.stage === "SETTLING_STATE"
+              : boundary === "REVISION" ? event.stage === "LOGIC_REVIEW" && occurrence === 2
+                : false;
+        if (crashEnabled && crash) throw new Error(`TEST_CRASH_AFTER_${boundary}`);
+      };
+      const { root, runner, state, bookId } = await createRunnerFixture({ boundedAutonomousReview: true, onAutonomousStage });
+      const bookDir = state.bookDir(bookId);
+      const storyDir = join(bookDir, "story");
+      const initialBody = englishWords(2200, "initial");
+      const revisedBody = englishWords(2200, "revised");
+      const dimensions = {
+        blueprint_transition: 92, causal_logic: 92, canon_continuity: 92, character_motivation: 92,
+        state_inheritance: 92, hooks_disclosure: 92, narrative_clarity: 92,
+      };
+      execution = createAutonomousProviderExecution({ projectRoot: root, bookId, jobId: `restart-${boundary}`, getActiveStage: () => activeStage });
+      try {
+        await state.saveBookConfig(bookId, { ...(await state.loadBookConfig(bookId)), language: "en", chapterWordCount: 2200 });
+        await Promise.all([
+          writeFile(join(storyDir, "current_state.md"), createStateCard({ chapter: 0, location: "Gate", protagonistState: "Ready", goal: "Begin", conflict: "Clock" })),
+          writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n"),
+        ]);
+        await state.snapshotState(bookId, 0);
+        await createChapterGenesis({ bookDir, bookId, lastTrustedChapter: 0, trustedSnapshotDir: join(storyDir, "snapshots", "0"), createdAt: "2026-08-28T00:00:00.000Z" });
+        vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(createWriterOutput({
+          chapterNumber: 1, title: "Restart One", content: initialBody, wordCount: 2200,
+          updatedState: createStateCard({ chapter: 1, location: "Gate", protagonistState: "Moving", goal: "Proceed", conflict: "Clock" }),
+          updatedHooks: "# Pending Hooks\n",
+        }));
+        vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockImplementation(async (_dir, content) => boundary === "REVISION" && content === initialBody
+          ? createAuditResult({
+              passed: false, overallScore: 70, dimensionScores: { ...dimensions, causal_logic: 70 },
+              issues: [{ severity: "warning", explicitSeverity: "MAJOR", category: "causal_logic", description: "Revise.", suggestion: "Repair." }],
+            })
+          : createAuditResult({ passed: true, overallScore: 92, dimensionScores: dimensions }));
+        vi.spyOn(CommercialReaderAgent.prototype, "reviewChapter").mockImplementation(async (input) => ({
+          reviewerRole: "commercial-reader", provider: "openai", model: "test-model",
+          totalScore: boundary === "REVISION" && input.content === initialBody ? 75 : 90,
+          dimensionScores: { opening_hook: 90, pacing_tension: 90, emotional_investment: 90, plot_clarity: 90, dialogue_appeal: 90, western_cultural_naturalness: 90, commercial_appeal: 90, ending_hook: 90 },
+          decision: boundary === "REVISION" && input.content === initialBody ? "REVISION_REQUIRED" : "APPROVED",
+          findings: boundary === "REVISION" && input.content === initialBody
+            ? [{ findingId: "commercial-1", severity: "MAJOR", evidence: "slow", impact: "pacing", requiredOutcome: "repair" }]
+            : [],
+          reviewedCandidateSha: input.candidateSha, reviewedAt: "2026-08-28T00:00:00.000Z", tokenUsage: ZERO_USAGE,
+        }));
+        vi.spyOn(ReviserAgent.prototype, "reviseChapter").mockResolvedValue(createReviseOutput({ revisedContent: revisedBody, wordCount: 2200 }));
+        vi.spyOn(ChapterAnalyzerAgent.prototype, "analyzeChapter").mockImplementation(async (input) => createAnalyzedOutput({
+          chapterNumber: 1, title: "Restart One", content: input.chapterContent, wordCount: 2200,
+          updatedState: createStateCard({ chapter: 1, location: "Gate", protagonistState: "Moving", goal: "Proceed", conflict: "Clock" }),
+          updatedHooks: "# Pending Hooks\n",
+        }));
+        if (boundary === "STATE") {
+          vi.spyOn(WriterAgent.prototype, "saveChapter").mockImplementationOnce(async () => {
+            if (saveCrashEnabled) {
+              saveCrashEnabled = false;
+              throw new Error("TEST_CRASH_AFTER_STATE");
+            }
+          });
+        }
+
+        await expect(runner.writeNextChapter(bookId, 2200)).rejects.toThrow(`TEST_CRASH_AFTER_${boundary}`);
+        const completedBeforeRestart = new Map(transportCounts);
+        expect(completedBeforeRestart.size).toBeGreaterThan(0);
+
+        crashEnabled = false;
+        perRunStageCounts = new Map();
+        await expect(runner.writeNextChapter(bookId, 2200)).resolves.toMatchObject({ status: "ready-for-review" });
+        const commit = await verifyChapterCommit({ bookDir, chapterNumber: 1 });
+        expect(commit.revisionCount).toBe(boundary === "REVISION" ? 1 : 0);
+        for (const [operationKey, calls] of completedBeforeRestart) {
+          expect(transportCounts.get(operationKey), operationKey).toBe(calls);
+        }
+        expect([...transportCounts.values()].every((calls) => calls === 1)).toBe(true);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+    SLOW_PIPELINE_TEST_TIMEOUT_MS,
+  );
+
+  it("restarts after Commit promotion, rebuilds projections locally, and performs zero Chapter N model calls", async () => {
+    let activeStage = { stage: "NOT_STARTED", role: "none", provider: "openai" as string | null, model: "test-model" as string | null, transactionId: undefined as string | undefined };
+    let execution: ReturnType<typeof createAutonomousProviderExecution> | undefined;
+    let paidCalls = 0;
+    let stopAtNextPreparing = false;
+    const { root, runner, state, bookId } = await createRunnerFixture({
+      boundedAutonomousReview: true,
+      onAutonomousStage: async (event) => {
+        activeStage = { ...event, transactionId: event.transactionId };
+        if (stopAtNextPreparing && event.stage === "PREPARING") throw new Error("TEST_STOP_AFTER_COMMIT_RECONCILIATION");
+        if (!event.transactionId || !event.provider || !event.model || event.stage === "APPROVED") return;
+        const fingerprint = createHash("sha256").update(`${event.transactionId}:${event.stage}:${event.role}`).digest("hex");
+        await execution!.runProviderCall(1, async () => {
+          paidCalls += 1;
+          return { content: `${event.stage}:${event.role}`, usage: ZERO_USAGE };
+        }, { provider: event.provider, model: event.model, inputFingerprint: fingerprint });
+      },
+    });
+    const bookDir = state.bookDir(bookId);
+    const storyDir = join(bookDir, "story");
+    const body = englishWords(2200, "commit");
+    const dimensions = { blueprint_transition: 92, causal_logic: 92, canon_continuity: 92, character_motivation: 92, state_inheritance: 92, hooks_disclosure: 92, narrative_clarity: 92 };
+    execution = createAutonomousProviderExecution({ projectRoot: root, bookId, jobId: "commit-restart", getActiveStage: () => activeStage });
+    try {
+      await state.saveBookConfig(bookId, { ...(await state.loadBookConfig(bookId)), language: "en", chapterWordCount: 2200 });
+      await writeFile(join(storyDir, "current_state.md"), createStateCard({ chapter: 0, location: "Gate", protagonistState: "Ready", goal: "Begin", conflict: "Clock" }));
+      await writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n");
+      await state.snapshotState(bookId, 0);
+      await createChapterGenesis({ bookDir, bookId, lastTrustedChapter: 0, trustedSnapshotDir: join(storyDir, "snapshots", "0"), createdAt: "2026-08-28T00:00:00.000Z" });
+      vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(createWriterOutput({ chapterNumber: 1, title: "Commit One", content: body, wordCount: 2200, updatedState: createStateCard({ chapter: 1, location: "Gate", protagonistState: "Moving", goal: "Proceed", conflict: "Clock" }), updatedHooks: "# Pending Hooks\n" }));
+      vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockResolvedValue(createAuditResult({ passed: true, overallScore: 92, dimensionScores: dimensions }));
+      vi.spyOn(CommercialReaderAgent.prototype, "reviewChapter").mockImplementation(async (input) => ({ reviewerRole: "commercial-reader", provider: "openai", model: "test-model", totalScore: 90, dimensionScores: { commercial_appeal: 90 }, decision: "APPROVED", findings: [], reviewedCandidateSha: input.candidateSha, reviewedAt: "2026-08-28T00:00:00.000Z", tokenUsage: ZERO_USAGE }));
+      vi.spyOn(ChapterAnalyzerAgent.prototype, "analyzeChapter").mockResolvedValue(createAnalyzedOutput({ chapterNumber: 1, title: "Commit One", content: body, wordCount: 2200, updatedState: createStateCard({ chapter: 1, location: "Gate", protagonistState: "Moving", goal: "Proceed", conflict: "Clock" }), updatedHooks: "# Pending Hooks\n" }));
+      await runner.writeNextChapter(bookId, 2200);
+      const callsAfterCommit = paidCalls;
+      const chapterPath = join(bookDir, "chapters", "0001_Commit One.md");
+      await rm(chapterPath, { force: true });
+      await rm(join(bookDir, "chapters", "index.json"), { force: true });
+      stopAtNextPreparing = true;
+      await expect(runner.writeNextChapter(bookId, 2200)).rejects.toThrow("TEST_STOP_AFTER_COMMIT_RECONCILIATION");
+      expect(paidCalls).toBe(callsAfterCommit);
+      await expect(readFile(chapterPath, "utf-8")).resolves.toContain(body);
+      expect(await state.getNextChapterNumber(bookId)).toBe(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
 
   it("persists a generic Chapter 6 from preserved review evidence without creative Writer generation", async () => {
     const { root, runner, state, bookId } = await createRunnerFixture({ boundedAutonomousReview: true });

@@ -290,6 +290,7 @@ export interface LLMCallExecutionIdentity {
   readonly model: string;
   readonly role: string;
   readonly stage: string;
+  readonly transactionId?: string;
   readonly revisionRound?: number;
   readonly reviewRound?: number;
 }
@@ -319,6 +320,7 @@ export interface LLMCallExecutionPolicy {
     readonly inputFingerprint: string;
   }) => Promise<{ readonly identity: LLMCallExecutionIdentity; readonly cachedResponse?: LLMResponse }>;
   readonly persistSuccess: (identity: LLMCallExecutionIdentity, response: LLMResponse) => Promise<void>;
+  readonly markTransportStarted?: (identity: LLMCallExecutionIdentity) => Promise<void>;
 }
 
 const llmCallExecutionPolicyStorage = new AsyncLocalStorage<LLMCallExecutionPolicy>();
@@ -1683,6 +1685,7 @@ export async function chatCompletion(
         }
         return prepared.cachedResponse;
       }
+      await executionPolicy.markTransportStarted?.(executionIdentity);
     }
     modelCall = beginAgentModelCall();
     const response = await withTransientLLMRetry(

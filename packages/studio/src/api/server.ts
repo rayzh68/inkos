@@ -133,6 +133,10 @@ import {
   type SessionKind,
   type AgentSessionAttachment,
   createAutonomousPipelineActions,
+  assertChapterWriterStartAllowed,
+  inspectChapterAuthority,
+  isChapterTransactionEnabled,
+  reconcileChapterProjections,
   createAutonomousProviderExecution,
   claimAutonomousJob,
   deriveAutonomousJobIdentity,
@@ -2750,7 +2754,10 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     bookId: string,
     nextChapterOverride?: number,
   ) {
-    const [map, book, chapters, nextChapter, runtime, safeConfig, productionModels] = await Promise.all([
+    const bookDir = state.bookDir(bookId);
+    const transactionEnabled = await isChapterTransactionEnabled(bookDir);
+    if (transactionEnabled) await reconcileChapterProjections({ bookDir });
+    const [map, book, chapters, nextChapter, runtime, safeConfig, productionModels, transactionAuthority] = await Promise.all([
       requireBookProductionMap(root, bookId),
       state.loadBookConfig(bookId),
       state.loadChapterIndex(bookId),
@@ -2758,10 +2765,11 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       loadAutonomousRuntime(root, bookId),
       loadSafeAutonomousConfig(root),
       loadProductionRoleModels(),
+      transactionEnabled ? inspectChapterAuthority({ bookDir }) : null,
     ]);
     const pending = chapters.find((chapter) => chapter.status === "audit-failed");
     const recoveryChapter = pending?.number ?? runtime?.nextChapter;
-    const offlineFinalizationPlan = recoveryChapter
+    const offlineFinalizationPlan = !transactionEnabled && recoveryChapter
       ? await resolveOfflineFinalizationPlan({ projectRoot: root, bookId, pendingChapter: recoveryChapter, nextChapter, runtime }).catch(() => null)
       : null;
     const view = projectAutonomousProductionView({
@@ -2775,6 +2783,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       offlineFinalizationPlan,
       active: autonomousJobs.isActive(bookId),
       budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
+      transactionAuthority,
     });
     return { view, offlineFinalizationPlan };
   }
@@ -2906,7 +2915,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const recoveringProviderWait = persistedRuntime?.status === "WAITING_PROVIDER_RETRY"
       && persistedRuntime.mode === mode;
     const { view: admission, offlineFinalizationPlan: admittedOfflineFinalizationPlan } = await loadAutonomousProjection(bookId);
-    if (persistedRecoveryOwnership && !admittedOfflineFinalizationPlan) {
+    if (persistedRecoveryOwnership && !admittedOfflineFinalizationPlan && !admission.chapterTransaction) {
       throw new ApiError(409, "FORMAL_RECOVERY_AUTHORITY_INVALID", "Persisted recovery ownership no longer has valid formal authority.");
     }
     if (!admission.startEnabled && !recoveringProviderWait && !recoveringOwnedFormalRecovery) {
@@ -3036,6 +3045,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       map: productionMap,
       mode,
       getNextChapter: () => state.getNextChapterNumber(bookId),
+      verifyChapterStartAuthority: (chapterNumber) => assertChapterWriterStartAllowed({ bookDir: state.bookDir(bookId), chapterNumber }),
       ...(admittedOfflineFinalizationPlan?.pendingChapterNumber !== undefined
         ? { pendingChapterNumber: admittedOfflineFinalizationPlan.pendingChapterNumber }
         : actions.pendingChapterNumber !== undefined ? { pendingChapterNumber: actions.pendingChapterNumber } : {}),
