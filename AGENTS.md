@@ -4,73 +4,98 @@
 
 ## 1. 权威与适用范围
 
+
 - 开始任何大型任务前，必须完整读取本文件、[`docs/product/PRODUCT_MASTER.md`](docs/product/PRODUCT_MASTER.md) 和 [`docs/project/CURRENT_STATE.md`](docs/project/CURRENT_STATE.md)，并按任务需要核验 Git、测试、Chapter Commit、Genesis、transaction artifacts、Provider evidence 等机器事实。
 - 产品意图由 `PRODUCT_MASTER.md` 决定；开发行为由本文件决定；当前暂停点由 `CURRENT_STATE.md` 记录；稳定历史由 [`docs/memory/MEMORY.md`](docs/memory/MEMORY.md) 记录。
 - 文档快照不得覆盖相反的机器证据。发生冲突时先停止写入，记录冲突，并以当前机器事实校正文档。
 - 用户给出的任务范围、允许文件、禁止文件、授权门禁和停止条件优先于一般工作惯例。
 
-## 2. Goal-first development
+## 2. Authority / goal gate
 
-- 每个任务必须先明确一个可验证目标，再进行调查或实现。
-- 大任务开始前必须锁定：目标、root cause、allowed files、forbidden files、Definition of Done、验证命令、停止条件和授权边界。
-- 调查阶段默认只读。若 root cause 尚未锁定，不得以“试试看”为由修改源码。
-- 优先最小充分修改。不得为了增加机制而增加机制，不得创建无必要的 workflow、state、recovery、journal、database 或其他 subsystem。
-- 发现问题不等于获得修复授权。超出当前 scope 的问题只记录，不顺手修改。
+- 每个任务先明确可验证的 Goal。大型任务开始时先完整读取相关权威文档并核验必要机器事实，锁定 Goal、authority、initial scope、forbidden boundaries、production authorization、investigation questions 和 stop conditions。
+- 初始 gate 不要求假装已经知道 root cause。只读调查完成后，才能锁定 Proven Root Cause、Evidence、Rejected Hypotheses、exact allowed implementation files、Definition of Done、tests 和 regression boundary；证据不足则 `STOP/BLOCKED`，不得试改源码寻找答案。
+- 优先最小充分修改。不得为了增加机制而增加机制，不得创建无必要的 workflow、state、recovery、journal、database 或其他 subsystem。发现问题不等于获得修复授权，超出 scope 的问题只记录为 `FOLLOW-UP`。
 
-## 3. 主代理与 Subagent 模式
+## 3. Development Method V1
 
-### 3.1 Sol 主代理职责
+### 3.1 Common sequence
 
-Sol 主代理负责：
+```text
+GOAL / AUTHORITY / SAFETY BOUNDARY
+→ READ
+→ READ-ONLY INVESTIGATION
+→ ROOT CAUSE LOCK
+→ IMPLEMENTATION LOCK
+→ IMPLEMENT
+→ INDEPENDENT REVIEW
+→ VERIFY
+→ HANDOFF
+```
 
-- 理解最终目标与产品约束；
-- 分解问题并锁定 scope；
-- 汇总机器事实和只读调查结果；
-- 解决 Explorer、Safety、Test、Regression reviewer 之间的分歧；
-- 指定唯一 Implementer；
-- 执行最终 verification 并交付证据。
+### 3.2 FAST PATH
 
-### 3.2 只读并行调查
+文档小修或机器证据已明确证明的 1–2 文件修复，可走 FAST PATH，前提是不涉及 production safety、transaction authority 或大型 GPT Source Review；任一条件不满足即升级 FULL。
 
-- 复杂排错、跨层修改和 Source Review 默认采用 Subagents。
-- 可并行使用多个只读 Explorer、Safety Reviewer、Test Reviewer、Regression Reviewer 分析调用链、风险、测试覆盖和历史证据。
-- 只读代理不得编辑文件、暂存、提交、调用真实 Provider、修改真实书或执行生产动作。
+```text
+READ → LOCK → ONE IMPLEMENTER → FOCUSED VERIFY → HANDOFF
+```
 
-### 3.3 单一写入代理
+FAST 仍须锁清 scope、唯一写入者、DoD、验证、allowed/forbidden files 和 completion evidence。单独 Implementer 写入时，Sol 的最终验证必须独立；若 Sol 写入，完成前至少由一名轻量只读 reviewer 复查。
 
-- 同一工作树在任何时刻只能有一个写入 Implementer。
-- 主代理锁定 root cause、范围、DoD、测试和停止条件后，Implementer 才能写入。
-- 不允许多个代理并行修改同一文件或同一工作树。
-- 小修复（通常为 1–2 个文件且 root cause 明确）可以由单代理完成；仍须遵守范围、测试和验证门禁。
+### 3.3 FULL SUBAGENT PATH
+
+跨层开发、复杂或未明 root cause 的 bug、transaction/retry/recovery/provider 或其他 safety-sensitive 修改、性能问题、大型 UI/Core 联动、Source Review 和 real-book incident recovery 使用 FULL：
+
+1. **Authority / Goal Gate**：读取权威文档和机器事实，锁定目标、初始范围、禁止范围、授权、调查问题和停止条件；不得写入。
+2. **Parallel Read-Only Investigation**：仅对真正独立的问题并行查代码、调用链、测试、日志/evidence、安全、性能和回归；不得写入、commit、调用 Provider 或修改真实书。
+3. **Synthesis + Root Cause Lock**：Sol 汇总 Proven Root Cause、Evidence、Rejected Hypotheses 和 Implementation Boundary；不足则 `STOP/BLOCKED`。
+4. **Implementation Lock**：明确 sole Implementer、baseline、Allowed Files、Forbidden Files、Definition of Done、Tests、Regression Tests、Safety Invariants 和 Stop Conditions。未锁定项目默认禁止。
+5. **Single Implementer**：同一工作树同一时刻只有一个写入者；功能修改和 bugfix 使用 TDD，文档修改使用相关文档检查；最小充分修改，不扩 scope，不顺手修无关问题，不新增无必要 subsystem。
+6. **Independent Review**：实现后由新的只读 reviewer 按风险选择 Requirements、Safety、Regression、Performance 或 UX 视角；FULL 必须有 fresh read-only review。
+7. **Final Verification**：Sol 独立执行与风险相称的验证并准备证据。
+8. **Handoff**：交付目标、根因、变更、测试、基线限定、安全证据、意外发现、Git 状态和 Next Gate。
+
+### 3.4 Coordination and re-lock
+
+- Sol 负责汇总分歧并收敛，形成 Proven Root Cause、Evidence、Rejected Hypotheses、Implementation Boundary 以及 accepted/rejected/merged findings 和理由；结果是 `IMPLEMENT` 或 `STOP/BLOCKED`，不是无限 review loop。
+- 不按固定角色数量机械启动代理；只有独立问题才并行，一个简单问题不启动不必要的团队，review 数量按风险决定。Reviewer 不得为证明价值制造问题；非 scope finding 仅记为非阻断 `FOLLOW-UP`。同一 finding 不重复审核，除非修复改变了相关代码或 evidence。
+- 硬性的 safety/correctness/authority finding 是 blocker；in-scope 必需修复返回 Implementation Lock，并使受影响的 review/verification 失效。
+- 若 correction 完全位于现有已证明的 root cause、scope 和 risk lock 内，可返回 Implementation Lock；任何改变 root cause、scope、risk 或 safety boundary 的 finding 都必须走完整 `RE-LOCK`。
+- 任一阶段（Implementer、reviewer 或 final verification）发现 root cause、scope、risk 或 safety boundary 变化，都必须立即停止写入，冻结并报告 diff/evidence，返回只读调查并 `RE-LOCK`；相关旧 review/verification 失效，authority 扩大须重新取得用户授权。
+- Codex 内部可自主完成 read、investigation、decomposition、implementation、test、internal review、verification 和 evidence preparation。GPT Source Review 只在大型业务修改、重大 transaction/provider/safety 变更或正式要求时触发；不把日常协调转嫁给用户。
+- 安全、authority 和产品硬约束优先于流程便利；便利性不得伪装成 authority。
 
 ## 4. 实现与审查
 
-- 功能修改和 bugfix 使用 TDD：先写能证明问题的失败测试，确认按预期失败，再做最小实现并确认通过。
+- 功能修改和 bugfix 使用 TDD：先写能证明问题的失败测试，确认按预期失败，再做最小实现并确认通过；文档小修按其文档检查验证。
 - 不得删除、弱化或改写测试来掩盖失败；已知平台基线失败必须与本次回归分别报告。
 - Implementer 不得自行宣布最终 PASS。
-- 实现完成后，必须由新的只读 reviewer 独立复查需求符合性、范围、安全性和回归风险。
+- 实现完成后按风险由新的只读 reviewer 独立复查需求符合性、范围、安全性和回归风险；FULL 必须使用 fresh read-only reviewer，FAST 按上文轻量复查规则执行。
 - 大型业务修改必须经过 GPT Source Review 门禁。review 未 PASS 时不得把实现描述为最终通过。
 - Codex 不得擅自 merge。测试通过、review 通过、Draft Ready 或本地 commit 均不构成 merge 授权。
 
 ## 5. Verification before completion
 
-完成声明前必须重新运行与风险成比例的验证，并直接检查输出。至少确认：
+完成声明前必须重新运行与风险成比例的验证，并直接检查输出。Completion evidence 至少包含 Goal/Lock、实际命令与结果、Git 状态、范围检查、授权/安全证据、TEMP/orphan 和 Next Gate。至少确认：
 
 - Git branch、HEAD、status 和 diff 与任务范围一致；
 - 只有 allowed files 改变，forbidden files 为 0 修改；
 - 相关 focused tests、typecheck、build 或文档检查已按任务要求执行；
+- 必要的 regression/typecheck/build 已按风险执行，并明确 focused 与 full suite 的区别；
 - 独立 reviewer 的发现已解决或明确列为 blocker；
 - 真实 Provider/model calls、真实书 mutation、Resume/Rewrite/Abandon 等受控动作符合授权；
 - 临时日志、临时 ZIP、临时 diff、解压目录和中间验证文件已清理，任务 TEMP/orphan 最终为 0；
-- 未把本地报告冒充独立 CI，也未把部分测试结果冒充完整测试结果。
+- 未把本地报告冒充独立 CI，也未把部分测试结果冒充完整测试结果；已知平台基线失败须单独列出。
 
 没有新的验证证据，不得声称“已完成”“已修复”或“全部通过”。
 
 ## 6. 生产与外部边界
 
+- 任何 generic destructive action（删除、覆盖、reset 等）均须取得当前用户明确授权；此要求独立于 production authorization。
 - 未获得针对当前动作的明确授权，不得调用真实 Provider 或模型。
 - 未获得明确授权，不得修改真实书、Chapter artifacts、运行时状态或 Provider evidence。
-- `Ready`、可点击按钮、已有 active job、历史授权、成功测试或建议的 NEXT 均不是新的生产授权。
+- 未获得明确授权，不得 Resume、Rewrite、Abandon、push（除非已预授权）、merge、部署或执行其他 production action。
+- `Ready`、可点击按钮、已有 active job、历史授权、成功测试、Draft Ready、mergeable 或建议的 NEXT 均不是新的生产授权。
 - 禁止修改、清理、reset 或复用 `D:\NovelFactory`；它是已停用/冻结系统。
 - 禁止恢复 `D:\AI-Dev-Orchestrator` 作为当前 InkOS 开发入口，也不得启动其 V0.4 或借其绕过本文件的开发流程。
 - 任务涉及其他仓库、部署、push 或生产执行时，必须取得独立且明确的授权。
@@ -97,4 +122,3 @@ Sol 主代理负责：
 - 只有稳定且以后不应反复讨论的决定或里程碑才进入 `MEMORY.md`。
 - 产品方向变化先更新 `PRODUCT_MASTER.md`；不得用 MEMORY 的旧决定覆盖新的产品权威。
 - `docs/` 是 InkOS 唯一 Obsidian 项目知识目录。不得复制出第二套 Markdown 项目真相。
-

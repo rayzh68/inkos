@@ -1,7 +1,7 @@
 # InkOS Current State
 
 **Snapshot date:** 2026-08-30  
-**Task:** `INKOS_AUTHORITY_DOCS_TRACKING_CLOSEOUT`  
+**Task:** `INKOS_DEVELOPMENT_METHOD_V1` — `COMPLETE`
 **Rule:** 本文件是当前暂停点快照；继续工作前必须重新核验机器事实。
 
 ## 1. Repository
@@ -11,13 +11,23 @@
 | Repository | `rayzh68/inkos` |
 | Local root | `D:\Inkos-Projects\inkos` |
 | Branch | `master` |
-| Baseline HEAD before authority-doc commits | `a5671b1cde68a1ed98f83e602dd4f66904bc8a71` |
+| Development Method V1 base HEAD | `4c1a48e6899ad2b57b7ab19291d6df90d977623c` |
+| Completion HEAD | the local commit containing this snapshot; resolve with `git rev-parse HEAD` |
 | `origin/master` | `a5671b1cde68a1ed98f83e602dd4f66904bc8a71` |
-| Baseline status | Clean before this documentation-only task |
+| Task-start Git status | Clean; local `master` is ahead of `origin/master` by 1 commit |
+| Completion Git status | CLEAN after the authorized local commit; local `master` is ahead of `origin/master` by 2 commits |
+| Push | No |
 
-Authority-doc bootstrap 与 tracking closeout 只修改允许的文档和 `.gitignore` 白名单，不修改业务源码。本轮可以形成本地 commit；最终当前 HEAD 必须从 Git 机器事实读取，不能由文档自引用推导。
+本任务只修改 `AGENTS.md` 与本文件；task completion 由包含本快照的 authorized local commit 固化，不在此处写入其 SHA。该 commit 后 bounded write authorization expires；不 push。最终/current HEAD 必须从 Git 机器事实和最终 handoff 读取，因为文档不能嵌入包含自身的 commit SHA。
 
-## 2. PR #14
+## 2. Development Method V1
+
+- 共同顺序：`GOAL / AUTHORITY / SAFETY BOUNDARY → READ → READ-ONLY INVESTIGATION → ROOT CAUSE LOCK → IMPLEMENTATION LOCK → IMPLEMENT → INDEPENDENT REVIEW → VERIFY → HANDOFF`。
+- FAST PATH 仅用于文档小修或证据明确的 1–2 文件、非 production/transaction/safety、大型 Source Review 任务；否则走 FULL。
+- FULL 只对真正独立问题并行只读调查；Sol 汇总并锁定根因和实施边界，唯一 Implementer 写入，按风险进行 fresh read-only review，scope/root cause/risk 变化即停止写入并 `RE-LOCK`。
+- Codex 内部自主完成调查、实现、测试、复核和验证；Provider/model、真实书、Resume/Rewrite/Abandon、destructive action、push、merge、部署仍须明确授权。Chapter Transaction、exact-once、N+1、最终 prose→state→validation→Commit、replay、attempt 隔离和 ambiguous evidence fail-closed 继续是硬约束。
+
+## 3. PR #14
 
 | Field | Current fact |
 | --- | --- |
@@ -32,8 +42,9 @@ Authority-doc bootstrap 与 tracking closeout 只修改允许的文档和 `.giti
 | Current gate | `GPT_FINAL_PR14_REVIEW` |
 
 `PR14_FINAL_BOUNDED_REWORK` 已由当前 head 的第二个 PR commit 收尾。该事实不等于 GPT PASS，也不授权 merge。PR14 业务源码在本任务中冻结；不得在此文档任务中做增量源码审核、继续修改或 merge。
+PR14 专用 worktree 保持 clean，HEAD 仍为 `66b32a7cba25968f7337db2990966b9253275e8f`；本任务未触碰该 worktree。
 
-## 3. 当前真实 Book
+## 4. 当前真实 Book
 
 | Field | Current machine fact |
 | --- | --- |
@@ -66,12 +77,12 @@ Authority-doc bootstrap 与 tracking closeout 只修改允许的文档和 `.giti
 - Chapter 006 未开始：没有 Chapter 006 committed prose，也没有 Chapter 006 transaction。
 - 已存在的预规划材料不构成 Chapter 006 已开始或已取得 authority。
 
-## 4. 当前授权矩阵
+## 5. 当前授权矩阵
 
 | Action | Authorized now? |
 | --- | --- |
 | 读取 Git、PR、测试报告和真实书 evidence | Yes, read-only |
-| 修改本任务五个权威 Markdown | Yes, only for this bootstrap |
+| 修改 `AGENTS.md` 与本 `CURRENT_STATE.md` | No — bounded authorization expires with the authorized local commit containing this snapshot |
 | 修改 Core / Studio / tests / workflows | No |
 | 调用真实 Provider/model | No |
 | 修改真实书或 runtime | No |
@@ -80,13 +91,13 @@ Authority-doc bootstrap 与 tracking closeout 只修改允许的文档和 `.giti
 | 修改 NovelFactory 或 AI-Dev-Orchestrator | No |
 | merge PR14 | No |
 
-## 5. Blockers
+## 6. Blockers
 
 - PR14 尚未通过 `GPT_FINAL_PR14_REVIEW`。
 - PR14 未 merge，当前 master 不包含 PR14 head。
 - Chapter 005 保持未 Commit 的 STAGING/failed 历史现场；恢复真实生产需要 PR14 门禁完成、同步后的 clean master、现场重新核验以及新的明确生产授权。
 
-## 6. 上一轮 verification 摘要
+## 7. 上一轮 verification 摘要
 
 PR14 当前 head `66b32a7cba25968f7337db2990966b9253275e8f` 的 bounded rework 记录如下。这些是 Codex 本地验证，不是独立 CI，也不等于 `GPT_FINAL_PR14_REVIEW` PASS：
 
@@ -103,18 +114,10 @@ PR14 当前 head `66b32a7cba25968f7337db2990966b9253275e8f` 的 bounded rework �
 
 GitHub 当前没有 PR14 CI workflow/status；上述结果不得冒充独立 CI，也不得作为 merge、真实 Provider 调用或真实书 mutation 的授权。本 documentation-only closeout 未重跑业务测试套件。
 
-## 7. NEXT
+## 8. NEXT
 
-Authority-doc bootstrap 与 tracking closeout 完成后，当前顺序为：
+`READ_CURRENT_CODEX_PR14_RESULT` -> `PR14_NEW_METHOD_SOURCE_REVIEW` / `GPT_FINAL_PR14_REVIEW`
 
-1. `INKOS_DEVELOPMENT_METHOD_V1` / development method stabilization；
-2. `READ_CURRENT_CODEX_PR14_RESULT`；
-3. `PR14_NEW_METHOD_SOURCE_REVIEW` / `GPT_FINAL_PR14_REVIEW`；
-4. 只有 GPT PASS 后，才决定是否 merge PR14；
-5. PR14 merge、master 同步且现场重新核验后，另行取得明确授权，才可考虑恢复 Chapter 005。
-
-`INKOS_DEVELOPMENT_METHOD_V1` 需要正式梳理 AGENTS 中 root cause 的锁定时间点；本任务只记录该待办，不提前改写开发流程，也不开始上述第 1 步。
-
-## 8. 更新触发器
+## 9. 更新触发器
 
 每次 merge、PR 关键门禁、real-book test、正式停工或重大开发任务结束时更新本文件。更新时删除已经失效的短期细节，不把完整项目历史复制进来。
