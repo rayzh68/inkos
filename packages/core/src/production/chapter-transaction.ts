@@ -885,6 +885,19 @@ export async function isChapterTransactionEnabled(bookDir: string): Promise<bool
   return exists(join(authorityRoot(bookDir), "genesis.json"));
 }
 
+/** Blocks generic mutation paths from rewriting immutable transaction authority. */
+export async function assertChapterAuthorityMutationAllowed(input: {
+  readonly bookDir: string;
+  readonly chapterNumber: number;
+}): Promise<void> {
+  const genesis = await loadChapterGenesis(input.bookDir);
+  if (!genesis) return;
+  const committed = await exists(join(commitRoot(input.bookDir, input.chapterNumber), "commit.json"));
+  if (input.chapterNumber <= genesis.lastTrustedChapter || committed) {
+    throw new Error("TRANSACTION_AUTHORITY_MUTATION_FORBIDDEN");
+  }
+}
+
 export async function assertChapterWriterStartAllowed(input: { readonly bookDir: string; readonly chapterNumber: number }): Promise<void> {
   if (!(await isChapterTransactionEnabled(input.bookDir))) return;
   const chain = await verifyChapterCommitChain({ bookDir: input.bookDir });

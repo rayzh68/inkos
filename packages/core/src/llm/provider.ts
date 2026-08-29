@@ -279,6 +279,7 @@ export interface LLMOutcomeRecord {
 
 export type LLMFailureClassification =
   | "RETRYABLE_PROVIDER_HTTP"
+  | "RETRYABLE_PROVIDER_RESPONSE"
   | "RETRYABLE_PRE_TRANSPORT"
   | "AMBIGUOUS_PROVIDER_OUTCOME"
   | "DETERMINISTIC_PROVIDER_ERROR";
@@ -321,6 +322,7 @@ export interface LLMCallExecutionPolicy {
   }) => Promise<{ readonly identity: LLMCallExecutionIdentity; readonly cachedResponse?: LLMResponse }>;
   readonly persistSuccess: (identity: LLMCallExecutionIdentity, response: LLMResponse) => Promise<void>;
   readonly markTransportStarted?: (identity: LLMCallExecutionIdentity) => Promise<void>;
+  readonly persistFailure?: (identity: LLMCallExecutionIdentity, failure: LLMCallFailureMetadata) => Promise<void>;
 }
 
 const llmCallExecutionPolicyStorage = new AsyncLocalStorage<LLMCallExecutionPolicy>();
@@ -857,6 +859,14 @@ export function classifyLLMCallFailure(error: unknown): {
     || lower.includes("model not found")
     || lower.includes("unsupported parameter")
     || lower.includes("unsupported role");
+  if (lower.includes("llm returned reasoning without a final answer")
+    || lower.includes("llm returned empty response")) {
+    return {
+      classification: "RETRYABLE_PROVIDER_RESPONSE",
+      transportStarted: true,
+      transportReturned: true,
+    };
+  }
   if (httpStatus !== undefined) {
     const retryable = [408, 429, 500, 502, 503, 504].includes(httpStatus) && !deterministicModelError;
     return {
@@ -1775,10 +1785,12 @@ export async function chatCompletion(
     const wrapped = wrapLLMError(error, errorCtx);
     if (executionIdentity && !(wrapped instanceof LLMCallExecutionError)) {
       const classified = classifyLLMCallFailure(error);
-      throw new LLMCallExecutionError(wrapped.message, {
+      const executionError = new LLMCallExecutionError(wrapped.message, {
         ...executionIdentity,
         ...classified,
       }, { cause: wrapped });
+      await executionPolicy?.persistFailure?.(executionIdentity, executionError.metadata);
+      throw executionError;
     }
     throw wrapped;
   }

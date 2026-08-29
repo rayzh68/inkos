@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { StateManager } from "../state/manager.js";
 import {
   beginChapterTransaction,
+  assertChapterAuthorityMutationAllowed,
   createChapterGenesis,
   finalizeChapterTransaction,
   inspectChapterAuthority,
@@ -40,6 +41,17 @@ describe("chapter transaction convergence", () => {
     });
     return { bookDir, genesis };
   }
+
+  it("centralizes Genesis and committed chapter mutation denial while leaving staging outside P0", async () => {
+    const { bookDir } = await fixture();
+    await expect(assertChapterAuthorityMutationAllowed({ bookDir, chapterNumber: 4 }))
+      .rejects.toThrow("TRANSACTION_AUTHORITY_MUTATION_FORBIDDEN");
+    await mkdir(join(bookDir, "story", "commits", "chapter-0005"), { recursive: true });
+    await writeFile(join(bookDir, "story", "commits", "chapter-0005", "commit.json"), "immutable");
+    await expect(assertChapterAuthorityMutationAllowed({ bookDir, chapterNumber: 5 }))
+      .rejects.toThrow("TRANSACTION_AUTHORITY_MUTATION_FORBIDDEN");
+    await expect(assertChapterAuthorityMutationAllowed({ bookDir, chapterNumber: 6 })).resolves.toBeUndefined();
+  });
 
   const body = Array.from({ length: 2200 }, (_, index) => `w${index}`).join(" ");
   const lengthSpec = { target: 2200, softMin: 1980, softMax: 2420, hardMin: 1760, hardMax: 2640, countingMode: "en_words" as const };

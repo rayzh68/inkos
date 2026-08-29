@@ -6,6 +6,7 @@ import {
   type ChapterVersionSource,
 } from "../state/chapter-workspace.js";
 import { classifyTruthAuthority, normalizeTruthFileName, type TruthAuthority } from "./truth-authority.js";
+import { assertChapterAuthorityMutationAllowed, loadChapterGenesis, type ChapterGenesis } from "../production/chapter-transaction.js";
 
 export type EditRequest =
   | {
@@ -164,6 +165,30 @@ async function collectEditableFiles(dir: string): Promise<ReadonlyArray<string>>
   return files.flat();
 }
 
+function chapterNumberFromPath(root: string, filePath: string): number | undefined {
+  const match = relative(root, filePath).replace(/\\/gu, "/").match(/^chapters\/(\d+)[_-].*\.md$/u);
+  return match ? Number(match[1]) : undefined;
+}
+
+async function isTransactionRenameAuthorityPath(root: string, filePath: string, genesis: ChapterGenesis): Promise<boolean> {
+  const relativePath = relative(root, filePath).replace(/\\/gu, "/");
+  if (relativePath === "chapters/index.json"
+    || relativePath.startsWith("story/commits/")
+    || relativePath.startsWith("story/runtime/")
+    || relativePath.startsWith("story/migrations/")
+    || relativePath.startsWith("story/acceptance/")
+    || relativePath.startsWith("story/snapshots/")) return true;
+  const chapterNumber = chapterNumberFromPath(root, filePath);
+  if (chapterNumber === undefined) return false;
+  if (chapterNumber <= genesis.lastTrustedChapter) return true;
+  return access(join(root, "story", "commits", `chapter-${String(chapterNumber).padStart(4, "0")}`, "commit.json"))
+    .then(() => true)
+    .catch((error) => {
+      if (isMissingDirectoryError(error)) return false;
+      throw error;
+    });
+}
+
 interface PlannedFileRename {
   readonly fromAbs: string;
   readonly toAbs: string;
@@ -217,7 +242,13 @@ async function executeEntityRename(
 ): Promise<ExecutedEditTransaction> {
   const root = deps.bookDir(request.bookId);
   assertEntityRenameTargetIsSafe(request.newValue);
-  const files = await collectEditableFiles(root);
+  const collected = await collectEditableFiles(root);
+  const genesis = await loadChapterGenesis(root);
+  const files = genesis
+    ? (await Promise.all(collected.map(async (filePath) => ({ filePath, protected: await isTransactionRenameAuthorityPath(root, filePath, genesis) }))))
+      .filter(({ protected: isProtected }) => !isProtected)
+      .map(({ filePath }) => filePath)
+    : collected;
   const plannedRenames = await planEntityFileRenames(root, files, request.oldValue, request.newValue);
   const matcher = new RegExp(escapeRegExp(request.oldValue), "g");
   const touched = new Set<string>();
@@ -323,6 +354,7 @@ async function executeChapterReplace(
   request: Extract<EditRequest, { kind: "chapter-replace" }>,
 ): Promise<ExecutedEditTransaction> {
   const root = deps.bookDir(request.bookId);
+  await assertChapterAuthorityMutationAllowed({ bookDir: root, chapterNumber: request.chapterNumber });
   const fullText = request.fullText.trim();
   if (!fullText) {
     throw new Error("Chapter replacement requires fullText.");
@@ -365,6 +397,7 @@ async function executeChapterLocalEdit(
   request: Extract<EditRequest, { kind: "chapter-local-edit" }>,
 ): Promise<ExecutedEditTransaction> {
   const root = deps.bookDir(request.bookId);
+  await assertChapterAuthorityMutationAllowed({ bookDir: root, chapterNumber: request.chapterNumber });
   const { chapterPath } = await findChapterPath(root, request.chapterNumber);
   if (!request.targetText || request.replacementText === undefined) {
     throw new Error("Chapter-local edits require targetText and replacementText.");

@@ -1,4 +1,4 @@
-import { access, mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it, vi } from "vitest";
@@ -13,6 +13,7 @@ import {
   type EditRequest,
 } from "../interaction/edit-controller.js";
 import { listChapterVersions, readChapterVersion } from "../state/chapter-workspace.js";
+import { createChapterGenesis } from "../production/chapter-transaction.js";
 
 let projectRoot: string;
 
@@ -38,6 +39,61 @@ describe("truth authority", () => {
 });
 
 describe("edit controller", () => {
+  it("quarantines transaction authority while allowing entity rename in ordinary editable story files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-transaction-edit-quarantine-"));
+    const bookDir = join(root, "books", "transaction-book");
+    try {
+      await Promise.all([
+        mkdir(join(bookDir, "chapters"), { recursive: true }),
+        mkdir(join(bookDir, "story", "snapshots", "4"), { recursive: true }),
+        mkdir(join(bookDir, "story", "roles"), { recursive: true }),
+        mkdir(join(bookDir, "story", "commits", "chapter-0005"), { recursive: true }),
+        mkdir(join(bookDir, "story", "runtime", "bounded-autonomous", "provider-responses"), { recursive: true }),
+        mkdir(join(bookDir, "story", "migrations", "cutover"), { recursive: true }),
+        mkdir(join(bookDir, "story", "acceptance"), { recursive: true }),
+      ]);
+      for (const chapter of [1, 2, 3, 4]) {
+        await writeFile(join(bookDir, "chapters", `${String(chapter).padStart(4, "0")}_Legacy.md`), `Old chapter ${chapter}`);
+      }
+      await writeFile(join(bookDir, "chapters", "index.json"), JSON.stringify([1, 2, 3, 4].map((number) => ({ number, title: `Old ${number}` }))));
+      await writeFile(join(bookDir, "story", "snapshots", "4", "current_state.md"), "Old snapshot");
+      await createChapterGenesis({ bookDir, bookId: "transaction-book", lastTrustedChapter: 4, trustedSnapshotDir: join(bookDir, "story", "snapshots", "4") });
+      const protectedEvidenceFiles = [
+        join(bookDir, "story", "commits", "chapter-0005", "commit.json"),
+        join(bookDir, "story", "runtime", "bounded-autonomous", "provider-responses", "response.json"),
+        join(bookDir, "story", "migrations", "cutover", "receipt.json"),
+        join(bookDir, "story", "acceptance", "proof.md"),
+      ];
+      for (const path of protectedEvidenceFiles) await writeFile(path, "Old immutable authority");
+      const protectedFiles = [
+        join(bookDir, "story", "commits", "genesis.json"),
+        join(bookDir, "chapters", "0004_Legacy.md"),
+        ...protectedEvidenceFiles,
+      ];
+      await writeFile(join(bookDir, "story", "roles", "Old.md"), "Old remains editable here");
+      const before = await Promise.all(protectedFiles.map((path) => readFile(path, "utf-8")));
+
+      const result = await executeEditTransaction({
+        bookDir: () => bookDir, loadChapterIndex: async () => [], saveChapterIndex: async () => undefined,
+      }, { kind: "entity-rename", bookId: "transaction-book", entityType: "character", oldValue: "Old", newValue: "New" });
+      expect(result.touchedFiles).toContain(join("story", "roles", "New.md"));
+      await expect(readFile(join(bookDir, "story", "roles", "New.md"), "utf-8")).resolves.toContain("New remains editable");
+      expect(await Promise.all(protectedFiles.map((path) => readFile(path, "utf-8")))).toEqual(before);
+
+      for (const request of [
+        { kind: "chapter-replace" as const, bookId: "transaction-book", chapterNumber: 4, fullText: "replacement" },
+        { kind: "chapter-local-edit" as const, bookId: "transaction-book", chapterNumber: 4, instruction: "edit", targetText: "Old", replacementText: "New" },
+        { kind: "chapter-replace" as const, bookId: "transaction-book", chapterNumber: 5, fullText: "replacement" },
+        { kind: "chapter-local-edit" as const, bookId: "transaction-book", chapterNumber: 5, instruction: "edit", targetText: "Old", replacementText: "New" },
+      ]) {
+        await expect(executeEditTransaction({
+          bookDir: () => bookDir, loadChapterIndex: async () => [], saveChapterIndex: async () => undefined,
+        }, request)).rejects.toThrow("TRANSACTION_AUTHORITY_MUTATION_FORBIDDEN");
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
   it("plans entity rename transactions", () => {
     const result = planEditTransaction({
       kind: "entity-rename",

@@ -6,8 +6,10 @@ import { dirname, join } from "node:path";
 import { parseBookProductionMap, resolveProductionScope, type BookProductionMap, type ProductionMode } from "./book-production-map.js";
 import type { ChapterMeta } from "../models/chapter.js";
 import {
+  classifyLLMCallFailure,
   LLMCallExecutionError,
   runWithLLMCallExecutionPolicy,
+  type LLMCallFailureMetadata,
   type LLMCallExecutionIdentity,
   type LLMCallExecutionPolicy,
   type LLMResponse,
@@ -2022,8 +2024,6 @@ export function createAutonomousProviderExecution(params: {
     const progress = await loadAutonomousProductionState<AutonomousRunProgress>(params.projectRoot, params.bookId);
     if (progress?.jobId !== params.jobId) return;
     const history = [...(progress.providerAttemptHistory ?? [])];
-    const completed = history.some((entry) => entry.logicalStepId === identity.logicalStepId && entry.transportReturned);
-    if (completed) return;
     const ambiguous = history.find((entry) => entry.logicalStepId === identity.logicalStepId && entry.transportStarted && !entry.transportReturned);
     if (ambiguous) {
       throw new LLMCallExecutionError("AUTONOMOUS_PROVIDER_OUTCOME_AMBIGUOUS", {
@@ -2032,6 +2032,7 @@ export function createAutonomousProviderExecution(params: {
       });
     }
     const attempt = Math.max(0, ...history.filter((entry) => entry.logicalStepId === identity.logicalStepId).map((entry) => entry.attempt)) + 1;
+    if (attempt > 3) throw new Error("PROVIDER_RETRY_EXHAUSTED");
     const transportAttemptId = `${identity.logicalStepId}:transport-attempt:${attempt}`;
     history.push({
       transportAttemptId, logicalStepId: identity.logicalStepId, chapterNumber: activeChapter, role: identity.role,
@@ -2045,12 +2046,91 @@ export function createAutonomousProviderExecution(params: {
       checkpoint: "TRANSPORT_STARTED", responseArtifactStatus: "NONE",
     });
   };
+  const persistFailure = async (identity: LLMCallExecutionIdentity, failure: LLMCallFailureMetadata): Promise<void> => {
+    const progress = await loadAutonomousProductionState<AutonomousRunProgress>(params.projectRoot, params.bookId);
+    if (progress?.jobId !== params.jobId) return;
+    const history = [...(progress.providerAttemptHistory ?? [])];
+    let startedIndex = -1;
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+      const entry = history[index]!;
+      if (entry.logicalStepId === identity.logicalStepId && entry.transportStarted && !entry.transportReturned) {
+        startedIndex = index;
+        break;
+      }
+    }
+    if (startedIndex < 0) throw new Error("AUTONOMOUS_PROVIDER_ATTEMPT_START_NOT_DURABLE");
+    const started = history[startedIndex]!;
+    history[startedIndex] = {
+      ...started,
+      classification: failure.classification,
+      transportStarted: failure.transportStarted,
+      transportReturned: failure.transportReturned,
+      ...(failure.httpStatus !== undefined ? { httpStatus: failure.httpStatus } : {}),
+      recordedAt: new Date(params.now?.() ?? Date.now()).toISOString(),
+    };
+    await saveAutonomousProductionState(params.projectRoot, params.bookId, {
+      ...progress,
+      logicalStepId: identity.logicalStepId,
+      chapterNumber: activeChapter,
+      role: identity.role,
+      stage: identity.stage,
+      provider: identity.provider,
+      requestedModel: identity.model,
+      attempt: started.attempt,
+      maxAttempts: 3,
+      transportRetryCount: Math.max(0, started.attempt - 1),
+      transportAttemptId: started.transportAttemptId,
+      providerAttemptHistory: history,
+      checkpoint: failure.transportReturned ? "TRANSPORT_RETURNED_FAILURE" : "TRANSPORT_OUTCOME_AMBIGUOUS",
+      responseArtifactStatus: "NONE",
+      lastErrorClassification: failure.classification,
+      lastRetryableClassification: failure.classification,
+      ...(failure.httpStatus !== undefined ? { lastHttpStatus: failure.httpStatus } : {}),
+    });
+  };
+  const normalizeLegacyEmptyResponseAttempt = async (
+    identity: LLMCallExecutionIdentity,
+    progress: AutonomousRunProgress,
+  ): Promise<AutonomousRunProgress> => {
+    const history = [...(progress.providerAttemptHistory ?? [])];
+    const ambiguousIndexes = history
+      .map((entry, index) => ({ entry, index }))
+      .filter(({ entry }) => entry.logicalStepId === identity.logicalStepId && entry.transportStarted && !entry.transportReturned);
+    const errorText = String(progress.reason ?? "").toLowerCase();
+    const knownEmptyResponse = errorText.includes("llm returned empty response")
+      || errorText.includes("llm returned reasoning without a final answer");
+    const provableLegacyShape = progress.responseArtifactStatus !== "COMPLETE"
+      && progress.status === "PAUSED_DETERMINISTIC_PROVIDER_ERROR"
+      && progress.checkpoint === "DETERMINISTIC_PROVIDER_ERROR"
+      && progress.lastErrorClassification === "DETERMINISTIC_PROVIDER_ERROR"
+      && knownEmptyResponse
+      && ambiguousIndexes.length === 1;
+    if (!provableLegacyShape) return progress;
+    const { entry, index } = ambiguousIndexes[0]!;
+    history[index] = {
+      ...entry,
+      classification: "RETRYABLE_PROVIDER_RESPONSE",
+      transportStarted: true,
+      transportReturned: true,
+      recordedAt: new Date(params.now?.() ?? Date.now()).toISOString(),
+    };
+    const normalized = {
+      ...progress,
+      providerAttemptHistory: history,
+      lastErrorClassification: "RETRYABLE_PROVIDER_RESPONSE",
+      lastRetryableClassification: "RETRYABLE_PROVIDER_RESPONSE",
+      checkpoint: "LEGACY_RETURNED_RESPONSE_NORMALIZED",
+    };
+    await saveAutonomousProductionState(params.projectRoot, params.bookId, normalized);
+    return normalized;
+  };
   const policy: LLMCallExecutionPolicy = {
     prepare: async (request) => {
       const identity = identify(request);
       const cachedResponse = await readArtifact(identity);
       if (!cachedResponse) {
-        const progress = await loadAutonomousProductionState<AutonomousRunProgress>(params.projectRoot, params.bookId);
+        let progress = await loadAutonomousProductionState<AutonomousRunProgress>(params.projectRoot, params.bookId);
+        if (progress?.jobId === params.jobId) progress = await normalizeLegacyEmptyResponseAttempt(identity, progress);
         if (progress?.jobId === params.jobId && (progress.providerAttemptHistory ?? []).some((entry) => entry.logicalStepId === identity.logicalStepId
           && entry.transportStarted && !entry.transportReturned)) {
           throw new LLMCallExecutionError("AUTONOMOUS_PROVIDER_OUTCOME_AMBIGUOUS", {
@@ -2058,20 +2138,38 @@ export function createAutonomousProviderExecution(params: {
             transportStarted: true, transportReturned: false,
           });
         }
+        const returned = progress?.jobId === params.jobId
+          ? [...(progress.providerAttemptHistory ?? [])].reverse().find((entry) => entry.logicalStepId === identity.logicalStepId && entry.transportReturned)
+          : undefined;
+        if (returned && !["RETRYABLE_PROVIDER_HTTP", "RETRYABLE_PROVIDER_RESPONSE"].includes(returned.classification)) {
+          throw new Error("OPERATOR_DECISION_REQUIRED");
+        }
       }
       return { identity, ...(cachedResponse ? { cachedResponse } : {}) };
     },
     persistSuccess: persistArtifact,
     markTransportStarted,
+    persistFailure,
   };
   const runProviderCall = async (chapterNumber: number, transport: () => Promise<LLMResponse>, request: { readonly provider: string; readonly model: string; readonly inputFingerprint: string }) => {
     activeChapter = chapterNumber;
     const prepared = await policy.prepare(request);
     if (prepared.cachedResponse) return prepared.cachedResponse;
     await policy.markTransportStarted?.(prepared.identity);
-    const response = await transport();
-    await policy.persistSuccess(prepared.identity, response);
-    return response;
+    try {
+      const response = await transport();
+      await policy.persistSuccess(prepared.identity, response);
+      return response;
+    } catch (error) {
+      if (error instanceof LLMCallExecutionError) throw error;
+      const classified = classifyLLMCallFailure(error);
+      const executionError = new LLMCallExecutionError(error instanceof Error ? error.message : String(error), {
+        ...prepared.identity,
+        ...classified,
+      }, { cause: error });
+      await policy.persistFailure?.(prepared.identity, executionError.metadata);
+      throw executionError;
+    }
   };
   return {
     execute: async (chapterNumber, task) => {
@@ -2314,9 +2412,20 @@ export async function runBoundedAutonomousScope(params: {
           return paused;
         }
         const priorAttempt = previous?.logicalStepId === error.metadata.logicalStepId ? previous.attempt ?? 0 : 0;
-        const attempt = priorAttempt + 1;
+        const latestFailureState = await params.providerRecovery.loadPersistedProgress();
+        const matchingHistory = latestFailureState?.jobId === jobId
+          ? (latestFailureState.providerAttemptHistory ?? []).filter((entry) => entry.logicalStepId === error.metadata.logicalStepId)
+          : [];
+        const unfinishedAttempt = [...matchingHistory].reverse()
+          .find((entry) => entry.transportStarted && !entry.transportReturned)?.attempt;
+        const latestDurableAttempt = Math.max(0, ...matchingHistory.map((entry) => entry.attempt));
+        const attempt = error.metadata.classification === "AMBIGUOUS_PROVIDER_OUTCOME" && unfinishedAttempt !== undefined
+          ? unfinishedAttempt
+          : Math.max(priorAttempt + 1, latestDurableAttempt);
         const base = await retryDetails(error, attempt, { chapterNumber });
-        if (error.metadata.classification === "RETRYABLE_PROVIDER_HTTP" || error.metadata.classification === "RETRYABLE_PRE_TRANSPORT") {
+        if (error.metadata.classification === "RETRYABLE_PROVIDER_HTTP"
+          || error.metadata.classification === "RETRYABLE_PROVIDER_RESPONSE"
+          || error.metadata.classification === "RETRYABLE_PRE_TRANSPORT") {
           if (attempt >= 3) {
             const paused = project("PAUSED_PROVIDER_UNAVAILABLE", durableNextChapter, "PROVIDER_RETRY_EXHAUSTED", {
               ...base,

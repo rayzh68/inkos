@@ -76,6 +76,19 @@ describe("isTransientLLMHttpError", () => {
     });
   });
 
+  it("classifies HTTP-200 empty and reasoning-only responses as returned retryable failures", () => {
+    for (const message of [
+      "LLM returned empty response (usage=0+0)",
+      "LLM returned reasoning without a final answer",
+    ]) {
+      expect(classifyLLMCallFailure(new Error(message))).toMatchObject({
+        classification: "RETRYABLE_PROVIDER_RESPONSE",
+        transportStarted: true,
+        transportReturned: true,
+      });
+    }
+  });
+
   it("reads HTTP status and Retry-After without treating 400/401/403 as retryable", () => {
     const retryable = Object.assign(new Error("temporarily unavailable"), {
       status: 503,
