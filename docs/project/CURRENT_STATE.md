@@ -1,7 +1,7 @@
 # InkOS Current State
 
 **Snapshot date:** 2026-08-30  
-**Task:** `INKOS_DEVELOPMENT_METHOD_V1` — `COMPLETE`
+**Task:** `DEVELOPMENT_METHOD_V1_OFFICIAL_ALIGNMENT` — `COMPLETE`
 **Rule:** 本文件是当前暂停点快照；继续工作前必须重新核验机器事实。
 
 ## 1. Repository
@@ -11,11 +11,11 @@
 | Repository | `rayzh68/inkos` |
 | Local root | `D:\Inkos-Projects\inkos` |
 | Branch | `master` |
-| Development Method V1 base HEAD | `4c1a48e6899ad2b57b7ab19291d6df90d977623c` |
+| Development Method V1 base HEAD | `91ce3a1901b5bea638358cec248361b0a4a31b46` |
 | Completion HEAD | the local commit containing this snapshot; resolve with `git rev-parse HEAD` |
 | `origin/master` | `a5671b1cde68a1ed98f83e602dd4f66904bc8a71` |
-| Task-start Git status | Clean; local `master` is ahead of `origin/master` by 1 commit |
-| Completion Git status | CLEAN after the authorized local commit; local `master` is ahead of `origin/master` by 2 commits |
+| Task-start Git status | Clean; local `master` is ahead of `origin/master` by 2 commits |
+| Completion Git status | CLEAN after the authorized local commit; local `master` is ahead of `origin/master` by 3 commits |
 | Push | No |
 
 本任务只修改 `AGENTS.md` 与本文件；task completion 由包含本快照的 authorized local commit 固化，不在此处写入其 SHA。该 commit 后 bounded write authorization expires；不 push。最终/current HEAD 必须从 Git 机器事实和最终 handoff 读取，因为文档不能嵌入包含自身的 commit SHA。
@@ -24,7 +24,9 @@
 
 - 共同顺序：`GOAL / AUTHORITY / SAFETY BOUNDARY → READ → READ-ONLY INVESTIGATION → ROOT CAUSE LOCK → IMPLEMENTATION LOCK → IMPLEMENT → INDEPENDENT REVIEW → VERIFY → HANDOFF`。
 - FAST PATH 仅用于文档小修或证据明确的 1–2 文件、非 production/transaction/safety、大型 Source Review 任务；否则走 FULL。
-- FULL 只对真正独立问题并行只读调查；Sol 汇总并锁定根因和实施边界，唯一 Implementer 写入，按风险进行 fresh read-only review，scope/root cause/risk 变化即停止写入并 `RE-LOCK`。
+- 长期角色抽象为 Main Agent/Coordinator、Subagent、Explorer、Implementer、Reviewer；具体模型名只是当前例子。SAME WORKTREE 同时只能一个 writing Implementer；只有具备清晰 ownership/integration contract 且无共享高耦合可变状态的独立 workstreams，才可在隔离 worktrees 中并行写入。
+- **PARALLELISM FOLLOWS INDEPENDENCE**：并行调查和隔离实施以独立性、wall-clock reduction 与 correctness 为目标；同文件、高耦合核心状态路径、共享未提交状态或依赖修复不并行。
+- FULL 只对真正独立问题并行只读调查；Main Agent/Coordinator 汇总并锁定根因和实施边界，每个同一 worktree 由唯一 Implementer 写入，按风险进行 fresh read-only review，scope/root cause/risk 变化即停止写入并 `RE-LOCK`。多 worktree 主集成前须核验 goal/scope、ownership、overlap/conflict、order、combined regression、machine state、independent review 和 TEMP/orphan/worktree cleanup。
 - Codex 内部自主完成调查、实现、测试、复核和验证；Provider/model、真实书、Resume/Rewrite/Abandon、destructive action、push、merge、部署仍须明确授权。Chapter Transaction、exact-once、N+1、最终 prose→state→validation→Commit、replay、attempt 隔离和 ambiguous evidence fail-closed 继续是硬约束。
 
 ## 3. PR #14
@@ -43,6 +45,7 @@
 
 `PR14_FINAL_BOUNDED_REWORK` 已由当前 head 的第二个 PR commit 收尾。该事实不等于 GPT PASS，也不授权 merge。PR14 业务源码在本任务中冻结；不得在此文档任务中做增量源码审核、继续修改或 merge。
 PR14 专用 worktree 保持 clean，HEAD 仍为 `66b32a7cba25968f7337db2990966b9253275e8f`；本任务未触碰该 worktree。
+PR14 属于 transaction/provider/runtime 的高耦合路径；后续 Source Review 应采用并行只读调查加受控 review/bounded implementation，不应人为拆成并行 writers。
 
 ## 4. 当前真实 Book
 
