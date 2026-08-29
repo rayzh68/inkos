@@ -3558,7 +3558,7 @@ export class PipelineRunner {
         { ...this.stableChapterTransactionReview(logicAuthority), provider: logicAuthority.provider, model: logicAuthority.model, decision: logicAuthority.decision as "APPROVED" | "APPROVED_WITH_NOTES" },
         { ...this.stableChapterTransactionReview(commercialAuthority), provider: commercialAuthority.provider, model: commercialAuthority.model, decision: commercialAuthority.decision as "APPROVED" | "APPROVED_WITH_NOTES" },
       ] as const;
-      const stagingBookDir = chapterTransactionStagingBookDir(bookDir, chapterNumber);
+      const stagingBookDir = chapterTransactionStagingBookDir(bookDir, chapterNumber, chapterTransaction.attemptNumber);
       await rm(stagingBookDir, { recursive: true, force: true });
       await writer.saveChapter(stagingBookDir, persistenceOutput, gp.numericalSystem, pipelineLang);
       await this.syncLegacyStructuredStateFromMarkdown(stagingBookDir, chapterNumber, persistenceOutput);

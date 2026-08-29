@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import {
   AutonomousProductionCard,
+  ATTEMPT_ABANDON_CONFIRMATION,
   autonomousFallbackPollMs,
   formatRetryCountdown,
   type AutonomousView,
@@ -208,5 +209,31 @@ describe("compact autonomous production card", () => {
     expect(html).toContain("may have incurred cost");
     expect(html).toContain("check Provider logs before choosing Resume");
     expect(autonomousFallbackPollMs(view.runtimeStatus)).toBeNull();
+  });
+
+  it("shows one bilingual abandon-and-rewrite action only for active STAGING authority", () => {
+    const view: AutonomousView = {
+      ...blockedView,
+      runtimeStatus: "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME",
+      runtimeBlockers: [],
+      startEnabled: true,
+      chapterTransaction: { state: "STAGING", activeTransactionId: "chapter-txn-one", canAbandonAttempt: true },
+    };
+    const html = renderToStaticMarkup(createElement(AutonomousProductionCard, {
+      view, pending: false, error: null, onStart: () => undefined, onStop: () => undefined,
+      onRepair: () => undefined, onAbandon: () => undefined, onConfigureModels: () => undefined,
+    }));
+    expect(html).toContain("Discard Current Attempt &amp; Rewrite Chapter");
+    expect(html).toContain("放弃当前尝试并重写本章");
+    expect(ATTEMPT_ABANDON_CONFIRMATION).toContain("preserved as history");
+    expect(ATTEMPT_ABANDON_CONFIRMATION).toContain("restart from Writer");
+    expect(ATTEMPT_ABANDON_CONFIRMATION).toContain("Provider cost cannot be recovered");
+
+    const readyHtml = renderToStaticMarkup(createElement(AutonomousProductionCard, {
+      view: { ...view, chapterTransaction: { state: "NOT_STARTED", canAbandonAttempt: false } },
+      pending: false, error: null, onStart: () => undefined, onStop: () => undefined,
+      onRepair: () => undefined, onAbandon: () => undefined, onConfigureModels: () => undefined,
+    }));
+    expect(readyHtml).not.toContain("Discard Current Attempt");
   });
 });

@@ -7,6 +7,7 @@ import type { AutonomousRunProgress } from "../production/bounded-autonomous-con
 import { LLMCallExecutionError } from "../llm/provider.js";
 import type { BookProductionMap } from "../production/book-production-map.js";
 import type { ChapterMeta } from "../models/chapter.js";
+import { abandonChapterTransactionAttempt, beginChapterTransaction, createChapterGenesis } from "../production/chapter-transaction.js";
 
 const map: BookProductionMap = {
   schemaVersion: "1.0",
@@ -275,17 +276,45 @@ describe("bounded autonomous production controller", () => {
     expect(deriveAutonomousJobIdentity({ map, mode: "full-book", nextChapter: 3 })).not.toBe(first);
   });
 
-  it("namespaces exact Provider replay by chapter transaction identity", async () => {
+  it("never replays a COMPLETE Writer artifact across abandoned chapter attempts", async () => {
     const root = await mkdtemp(join(tmpdir(), "inkos-provider-transaction-"));
     try {
+      const bookDir = join(root, "books", "book");
+      await mkdir(join(bookDir, "story", "snapshots", "4", "state"), { recursive: true });
+      await mkdir(join(bookDir, "chapters"), { recursive: true });
+      for (const chapter of [1, 2, 3, 4]) await writeFile(join(bookDir, "chapters", `${String(chapter).padStart(4, "0")}_Legacy.md`), `legacy ${chapter}`);
+      await writeFile(join(bookDir, "chapters", "index.json"), JSON.stringify([1, 2, 3, 4].map((number) => ({ number }))));
+      await writeFile(join(bookDir, "story", "snapshots", "4", "current_state.md"), "state 4");
+      await writeFile(join(bookDir, "story", "snapshots", "4", "state", "manifest.json"), JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 4 }));
+      await createChapterGenesis({ bookDir, bookId: "book", lastTrustedChapter: 4, trustedSnapshotDir: join(bookDir, "story", "snapshots", "4") });
+      const attempt1 = await beginChapterTransaction({ bookDir, bookId: "book", chapterNumber: 5, productionAuthority: "blueprint:v1" });
       const base = { projectRoot: root, bookId: "book", jobId: "same-job" };
-      const first = createAutonomousProviderExecution({ ...base, getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId: "chapter-txn-one" }) });
-      const second = createAutonomousProviderExecution({ ...base, getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId: "chapter-txn-two" }) });
+      const first = createAutonomousProviderExecution({ ...base, getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId: attempt1.transactionId }) });
       const firstPath = first.responseArtifactPath("a".repeat(64), "test", "model", 5);
+      let attempt1TransportCalls = 0;
+      await first.runProviderCall(5, async () => {
+        attempt1TransportCalls += 1;
+        return { content: "first", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "test", model: "model", inputFingerprint: "a".repeat(64) });
+      expect(JSON.parse(await readFile(firstPath, "utf-8"))).toMatchObject({ transaction_id: attempt1.transactionId, response_artifact_status: "COMPLETE" });
+
+      await abandonChapterTransactionAttempt({
+        bookDir, bookId: "book", chapterNumber: 5, transactionId: attempt1.transactionId, runtimeSnapshot: "{}\n",
+      });
+      const attempt2 = await beginChapterTransaction({ bookDir, bookId: "book", chapterNumber: 5, productionAuthority: "blueprint:v1" });
+      const second = createAutonomousProviderExecution({ ...base, getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId: attempt2.transactionId }) });
       const secondPath = second.responseArtifactPath("a".repeat(64), "test", "model", 5);
-      expect(firstPath).not.toBe(secondPath);
-      await first.runProviderCall(5, async () => ({ content: "first", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } }), { provider: "test", model: "model", inputFingerprint: "a".repeat(64) });
-      expect(JSON.parse(await readFile(firstPath, "utf-8"))).toMatchObject({ transaction_id: "chapter-txn-one", response_artifact_status: "COMPLETE" });
+      expect(secondPath).not.toBe(firstPath);
+      expect(secondPath.split(/[\\/]/u).at(-1)).not.toBe(firstPath.split(/[\\/]/u).at(-1));
+      let attempt2TransportCalls = 0;
+      const result = await second.runProviderCall(5, async () => {
+        attempt2TransportCalls += 1;
+        return { content: "second", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "test", model: "model", inputFingerprint: "a".repeat(64) });
+      expect(result.content).toBe("second");
+      expect(attempt1TransportCalls).toBe(1);
+      expect(attempt2TransportCalls).toBe(1);
+      expect(JSON.parse(await readFile(secondPath, "utf-8"))).toMatchObject({ transaction_id: attempt2.transactionId, response_artifact_status: "COMPLETE" });
     } finally {
       await rm(root, { recursive: true, force: true });
     }

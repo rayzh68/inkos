@@ -133,6 +133,7 @@ import {
   type SessionKind,
   type AgentSessionAttachment,
   createAutonomousPipelineActions,
+  abandonChapterTransactionAttempt,
   assertChapterAuthorityMutationAllowed,
   assertChapterWriterStartAllowed,
   inspectChapterAuthority,
@@ -144,6 +145,7 @@ import {
   refreshAutonomousJobClaim,
   releaseAutonomousJob,
   runBoundedAutonomousScope,
+  saveAutonomousProductionState,
   startAutonomousJobHeartbeat,
   type AutonomousJobClaim,
 } from "@actalk/inkos-core";
@@ -2897,6 +2899,60 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
 
   app.get("/api/v1/books/:id/autonomous-production", async (c) => {
     return c.json(await loadAutonomousView(c.req.param("id")));
+  });
+
+  app.post("/api/v1/books/:id/autonomous-production/abandon-attempt", async (c) => {
+    const bookId = c.req.param("id");
+    if (!autonomousJobs.reserve(bookId)) {
+      throw new ApiError(409, "AUTONOMOUS_JOB_ALREADY_RUNNING", "A bounded production job is already active for this book.");
+    }
+    let releaseBookLock: (() => Promise<void>) | undefined;
+    try {
+      const bookDir = state.bookDir(bookId);
+      if (!(await isChapterTransactionEnabled(bookDir))) {
+        throw new ApiError(409, "CHAPTER_ATTEMPT_ABANDON_NOT_ALLOWED", "Attempt abandonment requires Chapter Transaction authority.");
+      }
+      releaseBookLock = await state.acquireBookLock(bookId);
+      const runtimeDir = join(bookDir, "story", "runtime", "bounded-autonomous");
+      if (await access(join(runtimeDir, "active-job.json")).then(() => true).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      })) {
+        throw new ApiError(409, "AUTONOMOUS_JOB_ALREADY_RUNNING", "A durable bounded production job is still active for this book.");
+      }
+      const authority = await inspectChapterAuthority({ bookDir });
+      if (authority.state !== "STAGING" || !authority.activeTransactionId) {
+        throw new ApiError(409, "CHAPTER_ATTEMPT_ABANDON_NOT_ACTIVE", "No active uncommitted chapter attempt is available to abandon.");
+      }
+      const runtimePath = join(runtimeDir, "production-state.json");
+      const runtimeSnapshot = await readFile(runtimePath, "utf-8").catch((error) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return "{}\n";
+        throw error;
+      });
+      await abandonChapterTransactionAttempt({
+        bookDir,
+        bookId,
+        chapterNumber: authority.nextChapter,
+        transactionId: authority.activeTransactionId,
+        runtimeSnapshot,
+      });
+      await saveAutonomousProductionState(root, bookId, {
+        status: "READY_TO_REWRITE_SAME_CHAPTER",
+        mode: (await loadAutonomousRuntime(root, bookId))?.mode ?? "current-volume",
+        nextChapter: authority.nextChapter,
+        chapterNumber: authority.nextChapter,
+        completedThisRun: 0,
+        responseArtifactStatus: "NONE",
+      });
+      return c.json({
+        status: "READY_TO_REWRITE_SAME_CHAPTER",
+        nextChapter: authority.nextChapter,
+        abandonedTransactionId: authority.activeTransactionId,
+      });
+    } finally {
+      await releaseBookLock?.();
+      autonomousJobs.release(bookId);
+    }
   });
 
   app.post("/api/v1/books/:id/autonomous-production/start", async (c) => {

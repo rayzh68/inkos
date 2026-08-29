@@ -468,6 +468,9 @@ export function projectAutonomousProductionView(params: {
       ...params.transactionAuthority,
       currentStage: params.runtime?.phase ?? null,
       blockedReason: params.runtime?.reason ?? params.runtime?.lastError ?? null,
+      canAbandonAttempt: params.transactionAuthority.state === "STAGING"
+        && typeof params.transactionAuthority.activeTransactionId === "string"
+        && !params.active,
     } : null,
     currentVolume: scope.currentVolume,
     currentVolumeCompleted: params.chapters.filter((chapter) =>

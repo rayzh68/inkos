@@ -5,12 +5,15 @@ import { join } from "node:path";
 import { StateManager } from "../state/manager.js";
 import {
   beginChapterTransaction,
+  abandonChapterTransactionAttempt,
   assertChapterAuthorityMutationAllowed,
+  assertChapterWriterStartAllowed,
   createChapterGenesis,
   finalizeChapterTransaction,
   inspectChapterAuthority,
   reconcileChapterProjections,
   recordChapterTransactionOperation,
+  recordChapterTransactionCandidate,
   recordChapterTransactionReviewEvidence,
   recordChapterTransactionReviewResult,
   resolveChapterProviderOperation,
@@ -51,6 +54,110 @@ describe("chapter transaction convergence", () => {
     await expect(assertChapterAuthorityMutationAllowed({ bookDir, chapterNumber: 5 }))
       .rejects.toThrow("TRANSACTION_AUTHORITY_MUTATION_FORBIDDEN");
     await expect(assertChapterAuthorityMutationAllowed({ bookDir, chapterNumber: 6 })).resolves.toBeUndefined();
+  });
+
+  it("abandons one immutable staging attempt and starts a separately identified rewrite attempt", async () => {
+    const { bookDir } = await fixture();
+    const first = await beginChapterTransaction({
+      bookDir, bookId: "book-a", chapterNumber: 5, productionAuthority: "blueprint:v1",
+      createdAt: "2026-08-29T00:00:00.000Z",
+    });
+    const initial = "preserved initial candidate";
+    await recordChapterTransactionCandidate({
+      bookDir, transactionId: first.transactionId, label: "INITIAL", content: initial, sha256: first.hash(initial),
+    });
+    await recordChapterTransactionOperation({
+      bookDir, transactionId: first.transactionId, logicalOperationId: "attempt-1-writer",
+      stage: "WRITING", inputFingerprint: "b".repeat(64), responseArtifactStatus: "COMPLETE", responseSha256: "c".repeat(64),
+    });
+    const providerArtifactPath = join(bookDir, "story", "runtime", "bounded-autonomous", "provider-responses", "attempt-1-writer.json");
+    const providerArtifact = '{"transaction_id":"attempt-1","response_artifact_status":"COMPLETE"}\n';
+    await mkdir(join(providerArtifactPath, ".."), { recursive: true });
+    await writeFile(providerArtifactPath, providerArtifact);
+    const providerArtifactSha = first.hash(providerArtifact);
+    await recordChapterTransactionReviewEvidence({
+      bookDir, transactionId: first.transactionId, candidateSha256: first.hash(initial), reviewerRole: "logic-canon-auditor",
+      evidence: { decision: "REVISION_REQUIRED" },
+    });
+    const resumed = await beginChapterTransaction({ bookDir, bookId: "book-a", chapterNumber: 5, productionAuthority: "blueprint:v1" });
+    expect(resumed.transactionId).toBe(first.transactionId);
+
+    const abandonment = await abandonChapterTransactionAttempt({
+      bookDir,
+      bookId: "book-a",
+      chapterNumber: 5,
+      transactionId: first.transactionId,
+      runtimeSnapshot: '{"status":"PAUSED_AMBIGUOUS_PROVIDER_OUTCOME","nextChapter":5}\n',
+      abandonedAt: "2026-08-29T01:00:00.000Z",
+    });
+    expect(abandonment).toMatchObject({ transactionId: first.transactionId, attemptNumber: 1, chapterNumber: 5 });
+    expect(await readFile(join(bookDir, "story", "runtime", "chapter-transactions", "chapter-0005", "abandonment.json"), "utf-8"))
+      .toContain("OPERATOR_DISCARDED_STAGING_ATTEMPT");
+    await expect(readFile(join(bookDir, "story", "runtime", "chapter-transactions", "chapter-0005", "runtime-at-abandon.json"), "utf-8"))
+      .resolves.toContain("PAUSED_AMBIGUOUS_PROVIDER_OUTCOME");
+    await expect(readFile(join(bookDir, "story", "runtime", "chapter-transactions", "chapter-0005", "staging", "evidence", "candidates", "INITIAL", "body.md"), "utf-8"))
+      .resolves.toBe(initial);
+
+    expect(await inspectChapterAuthority({ bookDir })).toMatchObject({ state: "NOT_STARTED", latestChapter: 4, nextChapter: 5 });
+    await expect(recordChapterTransactionOperation({
+      bookDir, transactionId: first.transactionId, logicalOperationId: "late-operation",
+      stage: "WRITING", inputFingerprint: "b".repeat(64), responseArtifactStatus: "COMPLETE", responseSha256: "c".repeat(64),
+    })).rejects.toThrow("CHAPTER_ATTEMPT_ABANDONED");
+    await expect(recordChapterTransactionCandidate({
+      bookDir, transactionId: first.transactionId, label: "REVISION_1", content: initial, sha256: first.hash(initial),
+    })).rejects.toThrow("CHAPTER_ATTEMPT_ABANDONED");
+    await expect(recordChapterTransactionReviewEvidence({
+      bookDir, transactionId: first.transactionId, candidateSha256: first.hash(initial), reviewerRole: "logic-canon-auditor", evidence: {},
+    })).rejects.toThrow("CHAPTER_ATTEMPT_ABANDONED");
+    await expect(recordChapterTransactionReviewResult({ bookDir, transactionId: first.transactionId, result: {} }))
+      .rejects.toThrow("CHAPTER_ATTEMPT_ABANDONED");
+    await expect(stageChapterCommitCandidate({
+      bookDir, transactionId: first.transactionId, title: "must not stage", body, lengthSpec,
+      review: {} as never, stateFiles: {}, snapshotFiles: {}, usage: {}, stateValidation: {} as never,
+      providerReferences: [], completedAt: "2026-08-29T01:01:00.000Z",
+    })).rejects.toThrow("CHAPTER_ATTEMPT_ABANDONED");
+    await expect(finalizeChapterTransaction({ bookDir, transactionId: first.transactionId }))
+      .rejects.toThrow("CHAPTER_ATTEMPT_ABANDONED");
+
+    const second = await beginChapterTransaction({
+      bookDir, bookId: "book-a", chapterNumber: 5, productionAuthority: "blueprint:v1",
+      createdAt: "2026-08-29T02:00:00.000Z",
+    });
+    expect(second.attemptNumber).toBe(2);
+    expect(second.transactionId).not.toBe(first.transactionId);
+    expect(second.previousAuthoritySha256).toBe(first.previousAuthoritySha256);
+    expect(second.completedOperations).toEqual([]);
+    expect((await inspectChapterAuthority({ bookDir })).activeTransactionId).toBe(second.transactionId);
+    await expect(readFile(join(bookDir, "story", "runtime", "chapter-transactions", "chapter-0005", "attempts", "attempt-0002", "transaction.json"), "utf-8"))
+      .resolves.toContain(second.transactionId);
+    expect(first.hash(await readFile(providerArtifactPath))).toBe(providerArtifactSha);
+    await expect(readFile(join(bookDir, "story", "runtime", "chapter-transactions", "chapter-0005", "attempts", "attempt-0002", "staging", "evidence", "candidates", "INITIAL", "body.md")))
+      .rejects.toThrow();
+    await expect(readdir(join(bookDir, "story", "runtime", "chapter-transactions", "chapter-0005", "attempts", "attempt-0002", "staging", "evidence", "reviews")))
+      .rejects.toThrow();
+    await expect(assertChapterWriterStartAllowed({ bookDir, chapterNumber: 6 })).rejects.toThrow("CHAPTER_TRANSACTION_WRITER_START_AUTHORITY_MISMATCH");
+  });
+
+  it("blocks abandonment for committed and Genesis-bound chapters", async () => {
+    const { bookDir } = await fixture();
+    const committed = await stagePassing(bookDir);
+    await finalizeChapterTransaction({ bookDir, transactionId: committed.transactionId });
+    await expect(abandonChapterTransactionAttempt({
+      bookDir, bookId: "book-a", chapterNumber: 5, transactionId: committed.transactionId, runtimeSnapshot: "{}\n",
+    })).rejects.toThrow("CHAPTER_ALREADY_COMMITTED");
+    await expect(abandonChapterTransactionAttempt({
+      bookDir, bookId: "book-a", chapterNumber: 4, transactionId: "genesis", runtimeSnapshot: "{}\n",
+    })).rejects.toThrow("CHAPTER_ATTEMPT_ABANDON_NOT_ALLOWED");
+  });
+
+  it("fails closed when an abandoned attempt loses its transaction identity", async () => {
+    const { bookDir } = await fixture();
+    const transaction = await beginChapterTransaction({ bookDir, bookId: "book-a", chapterNumber: 5, productionAuthority: "blueprint:v1" });
+    await abandonChapterTransactionAttempt({
+      bookDir, bookId: "book-a", chapterNumber: 5, transactionId: transaction.transactionId, runtimeSnapshot: "{}\n",
+    });
+    await writeFile(join(bookDir, "story", "runtime", "chapter-transactions", "chapter-0005", "transaction.json"), "{", "utf-8");
+    await expect(inspectChapterAuthority({ bookDir })).rejects.toThrow("CHAPTER_ATTEMPT_ABANDONMENT_AUTHORITY_MISMATCH");
   });
 
   const body = Array.from({ length: 2200 }, (_, index) => `w${index}`).join(" ");
