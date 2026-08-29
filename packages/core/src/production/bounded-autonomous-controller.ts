@@ -1893,7 +1893,8 @@ export function createAutonomousProviderExecution(params: {
     let startedIndex = -1;
     for (let index = history.length - 1; index >= 0; index -= 1) {
       const entry = history[index]!;
-      if (entry.logicalStepId === identity.logicalStepId && entry.transportStarted && !entry.transportReturned) {
+      if (entry.logicalStepId === identity.logicalStepId && entry.transportStarted
+        && (!entry.transportReturned || entry.classification === "TRANSPORT_STARTED")) {
         startedIndex = index;
         break;
       }
@@ -2165,6 +2166,42 @@ export function createAutonomousProviderExecution(params: {
       ...(failure.httpStatus !== undefined ? { lastHttpStatus: failure.httpStatus } : {}),
     });
   };
+  const markTransportReturned = async (identity: LLMCallExecutionIdentity): Promise<void> => {
+    const progress = await loadAutonomousProductionState<AutonomousRunProgress>(params.projectRoot, params.bookId);
+    if (progress?.jobId !== params.jobId) return;
+    const history = [...(progress.providerAttemptHistory ?? [])];
+    let startedIndex = -1;
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+      const entry = history[index]!;
+      if (entry.logicalStepId === identity.logicalStepId && entry.transportStarted && !entry.transportReturned) {
+        startedIndex = index;
+        break;
+      }
+    }
+    if (startedIndex < 0) throw new Error("AUTONOMOUS_PROVIDER_ATTEMPT_START_NOT_DURABLE");
+    const started = history[startedIndex]!;
+    history[startedIndex] = {
+      ...started,
+      transportReturned: true,
+      recordedAt: new Date(params.now?.() ?? Date.now()).toISOString(),
+    };
+    await saveAutonomousProductionState(params.projectRoot, params.bookId, {
+      ...progress,
+      logicalStepId: identity.logicalStepId,
+      chapterNumber: activeChapter,
+      role: identity.role,
+      stage: identity.stage,
+      provider: identity.provider,
+      requestedModel: identity.model,
+      attempt: started.attempt,
+      maxAttempts: 3,
+      transportRetryCount: Math.max(0, started.attempt - 1),
+      transportAttemptId: started.transportAttemptId,
+      providerAttemptHistory: history,
+      checkpoint: "TRANSPORT_RETURNED",
+      responseArtifactStatus: "NONE",
+    });
+  };
   const normalizeLegacyEmptyResponseAttempt = async (
     identity: LLMCallExecutionIdentity,
     progress: AutonomousRunProgress,
@@ -2226,6 +2263,7 @@ export function createAutonomousProviderExecution(params: {
     },
     persistSuccess: persistArtifact,
     markTransportStarted,
+    markTransportReturned,
     persistFailure,
   };
   const runProviderCall = async (chapterNumber: number, transport: () => Promise<LLMResponse>, request: { readonly provider: string; readonly model: string; readonly inputFingerprint: string }) => {
@@ -2233,10 +2271,9 @@ export function createAutonomousProviderExecution(params: {
     const prepared = await policy.prepare(request);
     if (prepared.cachedResponse) return prepared.cachedResponse;
     await policy.markTransportStarted?.(prepared.identity);
+    let response: LLMResponse;
     try {
-      const response = await transport();
-      await policy.persistSuccess(prepared.identity, response);
-      return response;
+      response = await transport();
     } catch (error) {
       if (error instanceof LLMCallExecutionError) throw error;
       const classified = classifyLLMCallFailure(error);
@@ -2247,6 +2284,9 @@ export function createAutonomousProviderExecution(params: {
       await policy.persistFailure?.(prepared.identity, executionError.metadata);
       throw executionError;
     }
+    await policy.markTransportReturned?.(prepared.identity);
+    await policy.persistSuccess(prepared.identity, response);
+    return response;
   };
   return {
     execute: async (chapterNumber, task) => {
@@ -2475,6 +2515,7 @@ export async function runBoundedAutonomousScope(params: {
       } catch (error) {
         if (!params.providerRecovery) throw error;
         if (!(error instanceof LLMCallExecutionError)) {
+          const latest = await params.providerRecovery.loadPersistedProgress();
           const paused = project(
             "PAUSED_PIPELINE_ERROR",
             durableNextChapter,
@@ -2483,6 +2524,9 @@ export async function runBoundedAutonomousScope(params: {
               chapterNumber,
               checkpoint: "DETERMINISTIC_PIPELINE_ERROR",
               lastErrorClassification: "DETERMINISTIC_PIPELINE_ERROR",
+              ...(latest?.jobId === jobId && latest.providerAttemptHistory
+                ? { providerAttemptHistory: latest.providerAttemptHistory }
+                : {}),
             },
           );
           await params.persistProgress(paused);

@@ -392,6 +392,65 @@ describe("bounded autonomous production controller", () => {
     }
   });
 
+  it("pauses as a pipeline error when local success persistence fails after one returned transport", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-local-persist-failure-"));
+    try {
+      const oneChapterMap: BookProductionMap = {
+        ...map,
+        totalChapters: 1,
+        volumes: [{ volumeId: "volume-001", volumeNumber: 1, title: "One", startChapter: 1, endChapter: 1, chapterCount: 1 }],
+      };
+      const jobId = deriveAutonomousJobIdentity({ map: oneChapterMap, mode: "current-volume", nextChapter: 1 });
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      const responseDir = join(runtimeDir, "provider-responses");
+      await mkdir(runtimeDir, { recursive: true });
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId, status: "RUNNING", mode: "current-volume", volumeId: "volume-001",
+        startChapter: 1, targetChapter: 1, nextChapter: 1, completedThisRun: 0,
+      }));
+      const stage = { stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId: "chapter-txn-local-persist" };
+      const execution = createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId, getActiveStage: () => stage });
+      let nextChapter = 1;
+      let transportCalls = 0;
+      const persisted: AutonomousRunProgress[] = [];
+      const result = await runBoundedAutonomousScope({
+        map: oneChapterMap,
+        mode: "current-volume",
+        getNextChapter: async () => nextChapter,
+        runChapter: async () => {
+          await execution.runProviderCall(1, async () => {
+            transportCalls += 1;
+            await rm(responseDir, { recursive: true, force: true });
+            await writeFile(responseDir, "provider response directory unavailable");
+            return { content: "transport returned", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+          }, { provider: "test", model: "model", inputFingerprint: "a".repeat(64) });
+          nextChapter += 1;
+          return { status: "ready-for-review" };
+        },
+        shouldStop: () => false,
+        persistProgress: async (progress) => {
+          persisted.push(progress);
+          await saveAutonomousProductionState(root, "book", progress);
+        },
+        providerRecovery: execution,
+      });
+
+      expect(result).toMatchObject({ status: "PAUSED_PIPELINE_ERROR", nextChapter: 1 });
+      expect(transportCalls).toBe(1);
+      expect(result.providerAttemptHistory).toHaveLength(1);
+      expect(result.providerAttemptHistory?.[0]).toMatchObject({
+        transactionId: stage.transactionId,
+        classification: "TRANSPORT_STARTED",
+        transportStarted: true,
+        transportReturned: true,
+      });
+      expect(persisted.at(-1)).toMatchObject({ status: "PAUSED_PIPELINE_ERROR" });
+      await expect(readdir(join(root, "books", "book", "story", "commits"))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("durably closes a returned retry failure, starts attempt 2, then replays only COMPLETE", async () => {
     const root = await mkdtemp(join(tmpdir(), "inkos-provider-returned-retry-"));
     try {

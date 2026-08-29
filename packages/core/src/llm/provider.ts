@@ -322,6 +322,7 @@ export interface LLMCallExecutionPolicy {
   }) => Promise<{ readonly identity: LLMCallExecutionIdentity; readonly cachedResponse?: LLMResponse }>;
   readonly persistSuccess: (identity: LLMCallExecutionIdentity, response: LLMResponse) => Promise<void>;
   readonly markTransportStarted?: (identity: LLMCallExecutionIdentity) => Promise<void>;
+  readonly markTransportReturned?: (identity: LLMCallExecutionIdentity) => Promise<void>;
   readonly persistFailure?: (identity: LLMCallExecutionIdentity, failure: LLMCallFailureMetadata) => Promise<void>;
 }
 
@@ -1672,34 +1673,41 @@ export async function chatCompletion(
     stream: client.stream,
   }), "utf-8").digest("hex");
   let executionIdentity: LLMCallExecutionIdentity | undefined;
-  let modelCall: ReturnType<typeof beginAgentModelCall>;
-
-  try {
-    if (executionPolicy) {
-      const prepared = await executionPolicy.prepare({
-        provider: client.service ?? client.provider,
-        model,
-        inputFingerprint,
-      });
-      executionIdentity = prepared.identity;
-      if (prepared.cachedResponse) {
-        const observer = llmOutcomeObserverStorage.getStore();
-        if (observer) {
-          await observer({
-            modelCallId: executionIdentity.logicalStepId,
-            provider: executionIdentity.provider,
-            model: executionIdentity.model,
-            usage: prepared.cachedResponse.usage,
-            returnedAt: new Date().toISOString(),
-          });
-        }
-        return prepared.cachedResponse;
+  if (executionPolicy) {
+    const prepared = await executionPolicy.prepare({
+      provider: client.service ?? client.provider,
+      model,
+      inputFingerprint,
+    });
+    executionIdentity = prepared.identity;
+    if (prepared.cachedResponse) {
+      const observer = llmOutcomeObserverStorage.getStore();
+      if (observer) {
+        await observer({
+          modelCallId: executionIdentity.logicalStepId,
+          provider: executionIdentity.provider,
+          model: executionIdentity.model,
+          usage: prepared.cachedResponse.usage,
+          returnedAt: new Date().toISOString(),
+        });
       }
-      await executionPolicy.markTransportStarted?.(executionIdentity);
+      return prepared.cachedResponse;
     }
-    modelCall = beginAgentModelCall();
-    const response = await withTransientLLMRetry(
+  }
+  signal?.throwIfAborted();
+  assertWithinContextWindow({
+    piModel: resolvePiModel(client, model),
+    model,
+    estimatedInputTokens: estimateLLMMessagesTokens(messages),
+    reservedOutputTokens: resolved.maxTokens,
+  });
+  const modelCall = beginAgentModelCall();
+  let transportInvocationStarted = false;
+  let response: LLMResponse;
+  try {
+    response = await withTransientLLMRetry(
       async (attempt) => {
+        transportInvocationStarted = false;
         signal?.throwIfAborted();
         const traceHeaders = agentTrajectoryHeaders(client._piModel?.baseUrl, modelCall, attempt, {
           effort: client.defaults.thinkingBudget > 0 ? "enabled" : "disabled",
@@ -1723,12 +1731,10 @@ export async function chatCompletion(
               },
             )
           : undefined;
-        assertWithinContextWindow({
-          piModel: resolvePiModel(client, model),
-          model,
-          estimatedInputTokens: estimateLLMMessagesTokens(messages),
-          reservedOutputTokens: resolved.maxTokens,
-        });
+        if (executionPolicy && executionIdentity) {
+          await executionPolicy.markTransportStarted?.(executionIdentity);
+        }
+        transportInvocationStarted = true;
         try {
           if (shouldUseNativeCustomTransport(client)) {
             return await chatCompletionViaCustomOpenAICompatible(
@@ -1764,27 +1770,15 @@ export async function chatCompletion(
       // text; callers can also opt out (e.g. fast-fail diagnostics).
       { enabled: !executionPolicy && (options?.retry ?? true) && !onTextDelta, signal },
     );
-    if (executionPolicy && executionIdentity) {
-      await executionPolicy.persistSuccess(executionIdentity, response);
-    }
-    const observer = llmOutcomeObserverStorage.getStore();
-    if (observer) {
-      await observer({
-        modelCallId: executionIdentity?.logicalStepId ?? modelCall?.modelCallId ?? randomUUID(),
-        provider: client.service ?? client.provider,
-        model,
-        usage: response.usage,
-        returnedAt: new Date().toISOString(),
-      });
-    }
-    return response;
   } catch (error) {
     // 注意：中断的流（PartialResponseError）不再"打捞"半截内容当成功返回——
     // 那会产出写到一半就结束的章节/设定文件。重试由 withTransientLLMRetry
     // 负责（完整重新生成）；重试耗尽后如实抛错。
     const wrapped = wrapLLMError(error, errorCtx);
-    if (executionIdentity && !(wrapped instanceof LLMCallExecutionError)) {
-      const classified = classifyLLMCallFailure(error);
+    if (executionIdentity && transportInvocationStarted && !(wrapped instanceof LLMCallExecutionError)) {
+      const classified = signal?.aborted
+        ? { classification: "AMBIGUOUS_PROVIDER_OUTCOME" as const, transportStarted: true, transportReturned: false }
+        : classifyLLMCallFailure(error);
       const executionError = new LLMCallExecutionError(wrapped.message, {
         ...executionIdentity,
         ...classified,
@@ -1794,6 +1788,21 @@ export async function chatCompletion(
     }
     throw wrapped;
   }
+  if (executionPolicy && executionIdentity) {
+    await executionPolicy.markTransportReturned?.(executionIdentity);
+    await executionPolicy.persistSuccess(executionIdentity, response);
+  }
+  const observer = llmOutcomeObserverStorage.getStore();
+  if (observer) {
+    await observer({
+      modelCallId: executionIdentity?.logicalStepId ?? modelCall?.modelCallId ?? randomUUID(),
+      provider: client.service ?? client.provider,
+      model,
+      usage: response.usage,
+      returnedAt: new Date().toISOString(),
+    });
+  }
+  return response;
 }
 
 // === pi-ai Unified Implementation ===

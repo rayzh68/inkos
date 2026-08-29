@@ -221,6 +221,129 @@ describe("chatCompletion via pi-ai", () => {
     expect(order).toEqual(["attempt-started", "transport", "failure-returned"]);
   });
 
+  it("does not classify a local success-persistence failure as a Provider failure after transport returned", async () => {
+    mockStreamSimple.mockReturnValue(makeTextStream("persisted response"));
+    const order: string[] = [];
+    const persistFailure = vi.fn();
+    const task = runWithLLMCallExecutionPolicy({
+      prepare: async ({ inputFingerprint, provider, model }) => ({
+        identity: { logicalStepId: "local-persist-step", inputFingerprint, provider, model, role: "writer", stage: "WRITING" },
+      }),
+      markTransportStarted: async () => { order.push("transport-started"); },
+      markTransportReturned: async () => { order.push("transport-returned"); },
+      persistSuccess: async () => {
+        order.push("persist-success");
+        throw new Error("local success persistence failed");
+      },
+      persistFailure,
+    }, () => chatCompletion(makeClient(), "test-model", [{ role: "user", content: "ping" }]));
+
+    const error = await captureError(task);
+    expect(error).not.toBeInstanceOf(LLMCallExecutionError);
+    expect(error.message).toContain("local success persistence failed");
+    expect(persistFailure).not.toHaveBeenCalled();
+    expect(mockStreamSimple).toHaveBeenCalledOnce();
+    expect(order).toEqual(["transport-started", "transport-returned", "persist-success"]);
+  });
+
+  it("does not classify a local outcome-observer failure as a Provider failure after transport returned", async () => {
+    mockStreamSimple.mockReturnValue(makeTextStream("observe me"));
+    const order: string[] = [];
+    const persistFailure = vi.fn();
+    const task = runWithLLMOutcomeObserver(async () => {
+      order.push("observer");
+      throw new Error("local outcome observer failed");
+    }, () => runWithLLMCallExecutionPolicy({
+      prepare: async ({ inputFingerprint, provider, model }) => ({
+        identity: { logicalStepId: "local-observer-step", inputFingerprint, provider, model, role: "writer", stage: "WRITING" },
+      }),
+      markTransportStarted: async () => { order.push("transport-started"); },
+      markTransportReturned: async () => { order.push("transport-returned"); },
+      persistSuccess: async () => { order.push("persist-success"); },
+      persistFailure,
+    }, () => chatCompletion(makeClient(), "test-model", [{ role: "user", content: "ping" }])));
+
+    const error = await captureError(task);
+    expect(error).not.toBeInstanceOf(LLMCallExecutionError);
+    expect(error.message).toContain("local outcome observer failed");
+    expect(persistFailure).not.toHaveBeenCalled();
+    expect(mockStreamSimple).toHaveBeenCalledOnce();
+    expect(order).toEqual(["transport-started", "transport-returned", "persist-success", "observer"]);
+  });
+
+  it("does not classify the context-window guard as a Provider failure before transport", async () => {
+    const persistFailure = vi.fn();
+    const markTransportStarted = vi.fn();
+    const task = runWithLLMCallExecutionPolicy({
+      prepare: async ({ inputFingerprint, provider, model }) => ({
+        identity: { logicalStepId: "local-context-guard-step", inputFingerprint, provider, model, role: "writer", stage: "WRITING" },
+      }),
+      markTransportStarted,
+      persistSuccess: vi.fn(),
+      persistFailure,
+    }, () => chatCompletion(makeClient(0.7, {
+      _piModel: { ...MOCK_PI_MODEL, contextWindow: 20 },
+    }), "test-model", [{ role: "user", content: "ping" }]));
+
+    const error = await captureError(task);
+    expect(error).not.toBeInstanceOf(LLMCallExecutionError);
+    expect(error.name).toBe("ContextWindowExceededError");
+    expect(markTransportStarted).not.toHaveBeenCalled();
+    expect(mockStreamSimple).not.toHaveBeenCalled();
+    expect(persistFailure).not.toHaveBeenCalled();
+  });
+
+  it("does not classify a pre-aborted signal as a Provider failure before transport", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("local request aborted"));
+    const persistFailure = vi.fn();
+    const markTransportStarted = vi.fn();
+    const task = runWithLLMCallExecutionPolicy({
+      prepare: async ({ inputFingerprint, provider, model }) => ({
+        identity: { logicalStepId: "local-abort-step", inputFingerprint, provider, model, role: "writer", stage: "WRITING" },
+      }),
+      markTransportStarted,
+      persistSuccess: vi.fn(),
+      persistFailure,
+    }, () => chatCompletion(makeClient(), "test-model", [{ role: "user", content: "ping" }], { signal: controller.signal }));
+
+    const error = await captureError(task);
+    expect(error).not.toBeInstanceOf(LLMCallExecutionError);
+    expect(error.message).toContain("local request aborted");
+    expect(markTransportStarted).not.toHaveBeenCalled();
+    expect(mockStreamSimple).not.toHaveBeenCalled();
+    expect(persistFailure).not.toHaveBeenCalled();
+  });
+
+  it("records an in-flight abort as an ambiguous Provider outcome after transport starts", async () => {
+    const controller = new AbortController();
+    const markTransportStarted = vi.fn();
+    const persistFailure = vi.fn();
+    mockStreamSimple.mockImplementation(() => {
+      queueMicrotask(() => controller.abort(new Error("in-flight transport aborted")));
+      return makeNeverStream();
+    });
+    const task = runWithLLMCallExecutionPolicy({
+      prepare: async ({ inputFingerprint, provider, model }) => ({
+        identity: { logicalStepId: "in-flight-abort-step", inputFingerprint, provider, model, role: "writer", stage: "WRITING" },
+      }),
+      markTransportStarted,
+      persistSuccess: vi.fn(),
+      persistFailure,
+    }, () => chatCompletion(makeClient(), "test-model", [{ role: "user", content: "ping" }], { signal: controller.signal }));
+
+    const error = await captureError(task);
+    expect(error).toBeInstanceOf(LLMCallExecutionError);
+    expect((error as LLMCallExecutionError).metadata).toMatchObject({
+      classification: "AMBIGUOUS_PROVIDER_OUTCOME",
+      transportStarted: true,
+      transportReturned: false,
+    });
+    expect(markTransportStarted).toHaveBeenCalledOnce();
+    expect(persistFailure).toHaveBeenCalledOnce();
+    expect(mockStreamSimple).toHaveBeenCalledOnce();
+  });
+
   it("persists an empty HTTP-200 response as returned retryable transport evidence", async () => {
     mockStreamSimple.mockReturnValue(makeEmptyStream());
     const persistFailure = vi.fn();
