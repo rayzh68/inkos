@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StateManager } from "../state/manager.js";
@@ -44,16 +44,42 @@ describe("chapter transaction convergence", () => {
   const body = Array.from({ length: 2200 }, (_, index) => `w${index}`).join(" ");
   const lengthSpec = { target: 2200, softMin: 1980, softMax: 2420, hardMin: 1760, hardMax: 2640, countingMode: "en_words" as const };
 
-  async function stagePassing(bookDir: string, chapterNumber = 5) {
+  async function stagePassing(
+    bookDir: string,
+    chapterNumber = 5,
+    transform?: (input: Parameters<typeof stageChapterCommitCandidate>[0]) => Parameters<typeof stageChapterCommitCandidate>[0],
+  ) {
     const transaction = await beginChapterTransaction({
       bookDir, bookId: "book-a", chapterNumber, productionAuthority: "blueprint:v1",
     });
-    const logicalOperationId = `provider-step-${transaction.hash(`${transaction.transactionId}:writer`)}`;
-    const artifactRelativePath = `story/runtime/bounded-autonomous/provider-responses/${logicalOperationId}.json`;
-    const artifactBytes = Buffer.from(JSON.stringify({ logicalOperationId, chapterNumber }));
-    await mkdir(join(bookDir, "story", "runtime", "bounded-autonomous", "provider-responses"), { recursive: true });
-    await writeFile(join(bookDir, artifactRelativePath), artifactBytes);
-    await stageChapterCommitCandidate({
+    const responseDir = join(bookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
+    await mkdir(responseDir, { recursive: true });
+    const providerReferences = [];
+    for (const operation of [
+      { role: "writer", stage: "WRITING", provider: "test-provider", model: "test-model" },
+      { role: "auditor", stage: "LOGIC_REVIEW", provider: "test-provider", model: "logic-model" },
+      { role: "commercial-reader", stage: "READER_REVIEW", provider: "test-provider", model: "commercial-model" },
+    ]) {
+      const logicalOperationId = `provider-step-${transaction.hash(`${transaction.transactionId}:${operation.role}:${operation.stage}`)}`;
+      const artifactRelativePath = `story/runtime/bounded-autonomous/provider-responses/${logicalOperationId}.json`;
+      const responseContent = `${operation.role} model output for chapter ${chapterNumber}`;
+      const inputFingerprint = transaction.hash(`${transaction.transactionId}:${operation.role}:input`);
+      const artifact = {
+        schema_version: "1.0", job_id: "test-job", logical_step_id: logicalOperationId, usage_identity: logicalOperationId,
+        transaction_id: transaction.transactionId, chapter_number: chapterNumber, role: operation.role, stage: operation.stage,
+        provider: operation.provider, requested_model: operation.model, input_fingerprint: inputFingerprint,
+        response_artifact_status: "COMPLETE", content_sha256: transaction.hash(responseContent), response: { content: responseContent },
+        completed_at: "2026-08-28T00:00:00.000Z",
+      };
+      const artifactBytes = Buffer.from(`${JSON.stringify(artifact, null, 2)}\n`);
+      await writeFile(join(bookDir, artifactRelativePath), artifactBytes);
+      providerReferences.push({
+        transactionId: transaction.transactionId, logicalOperationId, chapterNumber, role: operation.role, stage: operation.stage,
+        provider: operation.provider, requestedModel: operation.model, inputFingerprint, artifactRelativePath,
+        artifactSha256: transaction.hash(artifactBytes), responseContentSha256: transaction.hash(responseContent), responseArtifactStatus: "COMPLETE" as const,
+      });
+    }
+    const stageInput: Parameters<typeof stageChapterCommitCandidate>[0] = {
       bookDir,
       transactionId: transaction.transactionId,
       title: `Chapter ${chapterNumber}`,
@@ -61,8 +87,22 @@ describe("chapter transaction convergence", () => {
       lengthSpec,
       review: {
         status: "APPROVED",
+        grade: "A",
+        revisionCount: 1,
         finalCandidateSha256: transaction.hash(body),
         findings: [],
+        reviewerEvidence: [
+          {
+            reviewerRole: "logic-canon-auditor", provider: "test-provider", model: "logic-model",
+            totalScore: 92, dimensionScores: { causal_logic: 92 }, decision: "APPROVED",
+            findings: [], reviewedCandidateSha: transaction.hash(body),
+          },
+          {
+            reviewerRole: "commercial-reader", provider: "test-provider", model: "commercial-model",
+            totalScore: 90, dimensionScores: { commercial_appeal: 90 }, decision: "APPROVED_WITH_NOTES",
+            findings: [], reviewedCandidateSha: transaction.hash(body),
+          },
+        ],
       },
       stateFiles: {
         "manifest.json": JSON.stringify({ schemaVersion: 2, lastAppliedChapter: chapterNumber, candidateSha256: transaction.hash(body), previousAuthoritySha256: transaction.previousAuthoritySha256 }),
@@ -75,11 +115,152 @@ describe("chapter transaction convergence", () => {
         "current_state.md": `state ${chapterNumber}`,
       },
       usage: { totalTokens: 42 },
-      providerReferences: [{ logicalOperationId, responseArtifactStatus: "COMPLETE", responseSha256: transaction.hash(artifactBytes), artifactRelativePath }],
+      stateValidation: {
+        chapterNumber,
+        finalCandidateSha256: transaction.hash(body),
+        previousAuthoritySha256: transaction.previousAuthoritySha256,
+        passed: true,
+        warnings: [],
+      },
+      providerReferences,
       completedAt: `2026-08-28T00:00:0${chapterNumber}.000Z`,
-    });
+    };
+    await stageChapterCommitCandidate(transform ? transform(stageInput) : stageInput);
     return transaction;
   }
+
+  it("makes immutable final-path staging markers crash-safe and convergent", async () => {
+    const { bookDir } = await fixture();
+    const transactionRoot = join(bookDir, "story", "runtime", "chapter-transactions", "chapter-0005");
+    await mkdir(transactionRoot, { recursive: true });
+    await writeFile(join(transactionRoot, "transaction.json"), "{\"truncated\"", "utf-8");
+
+    const transaction = await beginChapterTransaction({
+      bookDir, bookId: "book-a", chapterNumber: 5, productionAuthority: "blueprint:v1",
+      createdAt: "2026-08-28T00:00:00.000Z",
+    });
+    expect(JSON.parse(await readFile(join(transactionRoot, "transaction.json"), "utf-8"))).toMatchObject({
+      transactionId: transaction.transactionId,
+      state: "STAGING",
+    });
+    expect((await readdir(transactionRoot)).filter((name) => name.includes(".tmp-"))).toEqual([]);
+  });
+
+  it("recovers a truncated genesis final marker through atomic replacement", async () => {
+    const bookDir = await mkdtemp(join(tmpdir(), "inkos-chapter-genesis-crash-"));
+    roots.push(bookDir);
+    await mkdir(join(bookDir, "story", "snapshots", "0", "state"), { recursive: true });
+    await mkdir(join(bookDir, "story", "commits"), { recursive: true });
+    await mkdir(join(bookDir, "chapters"), { recursive: true });
+    await writeFile(join(bookDir, "chapters", "index.json"), "[]", "utf-8");
+    await writeFile(join(bookDir, "story", "snapshots", "0", "state", "manifest.json"), JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 0 }), "utf-8");
+    await writeFile(join(bookDir, "story", "commits", "genesis.json"), "{", "utf-8");
+    const genesis = await createChapterGenesis({ bookDir, bookId: "book-zero", lastTrustedChapter: 0, trustedSnapshotDir: join(bookDir, "story", "snapshots", "0"), createdAt: "2026-08-28T00:00:00.000Z" });
+    expect(genesis.genesisSha256).toMatch(/^[a-f0-9]{64}$/u);
+    expect(JSON.parse(await readFile(join(bookDir, "story", "commits", "genesis.json"), "utf-8"))).toMatchObject({ kind: "CHAPTER_GENESIS" });
+  });
+
+  it.each(["body-only", "metadata-only"])("recovers %s partial candidate staging", async (partial) => {
+    const { bookDir } = await fixture();
+    const transaction = await beginChapterTransaction({ bookDir, bookId: "book-a", chapterNumber: 5, productionAuthority: "blueprint:v1" });
+    const candidateRoot = join(bookDir, "story", "runtime", "chapter-transactions", "chapter-0005", "staging", "evidence", "candidates", "INITIAL");
+    await mkdir(candidateRoot, { recursive: true });
+    if (partial === "body-only") await writeFile(join(candidateRoot, "body.md"), body, "utf-8");
+    else await writeFile(join(candidateRoot, "metadata.json"), JSON.stringify({ schemaVersion: 1, label: "INITIAL", sha256: transaction.hash(body) }), "utf-8");
+
+    const { recordChapterTransactionCandidate } = await import("../production/chapter-transaction.js");
+    await recordChapterTransactionCandidate({ bookDir, transactionId: transaction.transactionId, label: "INITIAL", content: body, sha256: transaction.hash(body) });
+    await expect(readFile(join(candidateRoot, "body.md"), "utf-8")).resolves.toBe(body);
+    await expect(readFile(join(candidateRoot, "metadata.json"), "utf-8")).resolves.toContain(transaction.hash(body));
+  });
+
+  it("recovers truncated bounded result and staged commit but rejects conflicting completed bytes", async () => {
+    const { bookDir } = await fixture();
+    const transaction = await beginChapterTransaction({ bookDir, bookId: "book-a", chapterNumber: 5, productionAuthority: "blueprint:v1" });
+    const evidenceRoot = join(bookDir, "story", "runtime", "chapter-transactions", "chapter-0005", "staging", "evidence");
+    await mkdir(evidenceRoot, { recursive: true });
+    await writeFile(join(evidenceRoot, "review-result.json"), "{", "utf-8");
+    await recordChapterTransactionReviewResult({ bookDir, transactionId: transaction.transactionId, result: { status: "APPROVED" } });
+    await expect(readFile(join(evidenceRoot, "review-result.json"), "utf-8")).resolves.toContain("APPROVED");
+
+    const stagedBundle = join(bookDir, "story", "runtime", "chapter-transactions", "chapter-0005", "staging", "bundle");
+    await mkdir(stagedBundle, { recursive: true });
+    await writeFile(join(stagedBundle, "commit.json"), "{", "utf-8");
+    await stagePassing(bookDir);
+    await expect(readFile(join(stagedBundle, "commit.json"), "utf-8")).resolves.toContain("CHAPTER_COMMIT");
+
+    const operation = {
+      bookDir, transactionId: transaction.transactionId, logicalOperationId: "provider-step-conflict",
+      stage: "WRITING", inputFingerprint: "b".repeat(64), responseArtifactStatus: "COMPLETE" as const, responseSha256: "c".repeat(64),
+    };
+    await recordChapterTransactionOperation(operation);
+    await expect(recordChapterTransactionOperation({ ...operation, responseSha256: "d".repeat(64) })).rejects.toThrow(/immutable|conflict/i);
+  });
+
+  it("requires complete self-proving literary, state-validation, revision, and Provider authority", async () => {
+    const { bookDir } = await fixture();
+    const transaction = await stagePassing(bookDir);
+    const commit = await finalizeChapterTransaction({ bookDir, transactionId: transaction.transactionId });
+    expect(commit.productionAuthority).toBe("blueprint:v1");
+    expect(commit.revisionCount).toBe(1);
+    expect(commit.stateValidationSha256).toMatch(/^[a-f0-9]{64}$/u);
+    expect(commit.providerReferenceCount).toBe(3);
+    await reconcileChapterProjections({ bookDir });
+    const index = JSON.parse(await readFile(join(bookDir, "chapters", "index.json"), "utf-8"));
+    expect(index.at(-1).autonomousReview.revisionCount).toBe(1);
+  });
+
+  it("rejects a Commit without both final reviewer authorities bound to the final candidate", async () => {
+    const { bookDir } = await fixture();
+    await expect(stagePassing(bookDir, 5, (input) => ({
+      ...input,
+      review: { ...input.review, reviewerEvidence: input.review.reviewerEvidence.filter((reviewer) => reviewer.reviewerRole !== "commercial-reader") },
+    }) as unknown as Parameters<typeof stageChapterCommitCandidate>[0])).rejects.toThrow(/exactly two final reviewer authorities/i);
+  });
+
+  it("rejects a Commit without canonical passing state-validation authority", async () => {
+    const { bookDir } = await fixture();
+    await expect(stagePassing(bookDir, 5, (input) => ({
+      ...input,
+      stateValidation: { ...input.stateValidation, passed: false },
+    }) as unknown as Parameters<typeof stageChapterCommitCandidate>[0])).rejects.toThrow(/state validation authority/i);
+  });
+
+  it("rejects a Commit without complete transaction-scoped Provider references", async () => {
+    const { bookDir } = await fixture();
+    await expect(stagePassing(bookDir, 5, (input) => ({ ...input, providerReferences: [] })))
+      .rejects.toThrow(/Provider operation authority/i);
+  });
+
+  it("fails semantic verification when a referenced Provider artifact is tampered", async () => {
+    const { bookDir } = await fixture();
+    const transaction = await stagePassing(bookDir);
+    await finalizeChapterTransaction({ bookDir, transactionId: transaction.transactionId });
+    const providerDir = join(bookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
+    const artifactName = (await readdir(providerDir)).find((name) => name.endsWith(".json"))!;
+    const artifactPath = join(providerDir, artifactName);
+    const artifact = JSON.parse(await readFile(artifactPath, "utf-8"));
+    artifact.role = "tampered-role";
+    await writeFile(artifactPath, `${JSON.stringify(artifact, null, 2)}\n`, "utf-8");
+    await expect(verifyChapterCommit({ bookDir, chapterNumber: 5 })).rejects.toThrow(/Provider artifact hash mismatch/i);
+  });
+
+  it("makes committed state and snapshot projections exact without deleting unrelated story assets", async () => {
+    const { bookDir } = await fixture();
+    const transaction = await stagePassing(bookDir);
+    await finalizeChapterTransaction({ bookDir, transactionId: transaction.transactionId });
+    await mkdir(join(bookDir, "story", "state"), { recursive: true });
+    await mkdir(join(bookDir, "story", "snapshots", "5"), { recursive: true });
+    await writeFile(join(bookDir, "story", "state", "stale.json"), "stale", "utf-8");
+    await writeFile(join(bookDir, "story", "snapshots", "5", "stale.json"), "stale", "utf-8");
+    await writeFile(join(bookDir, "story", "particle_ledger.md"), "stale", "utf-8");
+    await writeFile(join(bookDir, "story", "author_intent.md"), "preserve", "utf-8");
+    await reconcileChapterProjections({ bookDir });
+    await expect(stat(join(bookDir, "story", "state", "stale.json"))).rejects.toThrow();
+    await expect(stat(join(bookDir, "story", "snapshots", "5", "stale.json"))).rejects.toThrow();
+    await expect(stat(join(bookDir, "story", "particle_ledger.md"))).rejects.toThrow();
+    await expect(readFile(join(bookDir, "story", "author_intent.md"), "utf-8")).resolves.toBe("preserve");
+  });
 
   it("A commits one verified chapter and rebuilds every public projection", async () => {
     const { bookDir, genesis } = await fixture();
@@ -103,8 +284,8 @@ describe("chapter transaction convergence", () => {
     const tx = await beginChapterTransaction({ bookDir, bookId: "book-a", chapterNumber: 5, productionAuthority: "blueprint:v1" });
     await expect(stageChapterCommitCandidate({
       bookDir, transactionId: tx.transactionId, title: "held", body, lengthSpec,
-      review: { status: "HELD_AFTER_TWO_REVISIONS", finalCandidateSha256: tx.hash(body), findings: [] },
-      stateFiles: {}, snapshotFiles: {}, usage: {}, providerReferences: [], completedAt: "2026-08-28T00:00:05.000Z",
+      review: { status: "HELD_AFTER_TWO_REVISIONS", finalCandidateSha256: tx.hash(body), findings: [] } as never,
+      stateFiles: {}, snapshotFiles: {}, usage: {}, stateValidation: {} as never, providerReferences: [], completedAt: "2026-08-28T00:00:05.000Z",
     })).rejects.toThrow(/terminal review/i);
     const writer6 = vi.fn();
     expect((await inspectChapterAuthority({ bookDir })).nextChapter).toBe(5);
@@ -117,8 +298,8 @@ describe("chapter transaction convergence", () => {
     const short = Array.from({ length: 700 }, (_, index) => `w${index}`).join(" ");
     await expect(stageChapterCommitCandidate({
       bookDir, transactionId: tx.transactionId, title: "short", body: short, lengthSpec,
-      review: { status: "APPROVED", finalCandidateSha256: tx.hash(short), findings: [] },
-      stateFiles: {}, snapshotFiles: {}, usage: {}, providerReferences: [], completedAt: "2026-08-28T00:00:05.000Z",
+      review: { status: "APPROVED", finalCandidateSha256: tx.hash(short), findings: [] } as never,
+      stateFiles: {}, snapshotFiles: {}, usage: {}, stateValidation: {} as never, providerReferences: [], completedAt: "2026-08-28T00:00:05.000Z",
     })).rejects.toThrow(/hard range/i);
     expect((await inspectChapterAuthority({ bookDir })).nextChapter).toBe(5);
   });
@@ -128,8 +309,16 @@ describe("chapter transaction convergence", () => {
     const tx = await beginChapterTransaction({ bookDir, bookId: "book-a", chapterNumber: 5, productionAuthority: "blueprint:v1" });
     await expect(stageChapterCommitCandidate({
       bookDir, transactionId: tx.transactionId, title: "state failed", body, lengthSpec,
-      review: { status: "APPROVED", finalCandidateSha256: tx.hash(body), findings: [] },
-      stateFiles: { "manifest.json": "{}" }, snapshotFiles: {}, usage: {}, providerReferences: [], completedAt: "2026-08-28T00:00:05.000Z",
+      review: {
+        status: "APPROVED", grade: "A", revisionCount: 0, finalCandidateSha256: tx.hash(body), findings: [],
+        reviewerEvidence: [
+          { reviewerRole: "logic-canon-auditor", provider: "test", model: "logic", totalScore: 90, dimensionScores: { logic: 90 }, decision: "APPROVED", findings: [], reviewedCandidateSha: tx.hash(body) },
+          { reviewerRole: "commercial-reader", provider: "test", model: "commercial", totalScore: 90, dimensionScores: { commercial: 90 }, decision: "APPROVED", findings: [], reviewedCandidateSha: tx.hash(body) },
+        ],
+      },
+      stateFiles: { "manifest.json": "{}" }, snapshotFiles: {}, usage: {},
+      stateValidation: { chapterNumber: 5, finalCandidateSha256: tx.hash(body), previousAuthoritySha256: tx.previousAuthoritySha256, passed: true },
+      providerReferences: [], completedAt: "2026-08-28T00:00:05.000Z",
     })).rejects.toThrow(/state|snapshot/i);
     expect((await inspectChapterAuthority({ bookDir })).nextChapter).toBe(5);
   });

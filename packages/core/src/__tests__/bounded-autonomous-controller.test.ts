@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { claimAutonomousJob, correctLegacyPendingChapterArtifactBindings, createAutonomousPipelineActions, createAutonomousProviderExecution, deriveAutonomousJobIdentity, finalizePendingChapterOfflinePlan, refreshAutonomousJobClaim, releaseAutonomousJob, resolveFormalPendingChapterRecoveryPlan, runBoundedAutonomousScope, verifyFormalPendingChapterRecoveryEvidence } from "../production/bounded-autonomous-controller.js";
+import { claimAutonomousJob, correctLegacyPendingChapterArtifactBindings, createAutonomousPipelineActions, createAutonomousProviderExecution, deriveAutonomousJobIdentity, finalizePendingChapterOfflinePlan, refreshAutonomousJobClaim, releaseAutonomousJob, resolveFormalPendingChapterRecoveryPlan, runBoundedAutonomousScope, saveAutonomousProductionState, verifyFormalPendingChapterRecoveryEvidence } from "../production/bounded-autonomous-controller.js";
 import { LLMCallExecutionError } from "../llm/provider.js";
 import type { BookProductionMap } from "../production/book-production-map.js";
 import type { ChapterMeta } from "../models/chapter.js";
@@ -285,6 +285,61 @@ describe("bounded autonomous production controller", () => {
       expect(firstPath).not.toBe(secondPath);
       await first.runProviderCall(5, async () => ({ content: "first", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } }), { provider: "test", model: "model", inputFingerprint: "a".repeat(64) });
       expect(JSON.parse(await readFile(firstPath, "utf-8"))).toMatchObject({ transaction_id: "chapter-txn-one", response_artifact_status: "COMPLETE" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("never reuses an old v1 Chapter artifact as a new transaction operation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-v1-quarantine-"));
+    try {
+      const base = { projectRoot: root, bookId: "book", jobId: "same-job" };
+      const fingerprint = "f".repeat(64);
+      const legacy = createAutonomousProviderExecution({
+        ...base,
+        getActiveStage: () => ({ stage: "PREPARING", role: "planner", provider: "test", model: "model" }),
+      });
+      await legacy.runProviderCall(5, async () => ({ content: "legacy-v1", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } }), {
+        provider: "test", model: "model", inputFingerprint: fingerprint,
+      });
+      let transactionalTransportCalls = 0;
+      const transactional = createAutonomousProviderExecution({
+        ...base,
+        getActiveStage: () => ({ stage: "PREPARING", role: "planner", provider: "test", model: "model", transactionId: "chapter-txn-cutover" }),
+      });
+      const result = await transactional.runProviderCall(5, async () => {
+        transactionalTransportCalls += 1;
+        return { content: "transaction-v2", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "test", model: "model", inputFingerprint: fingerprint });
+      expect(result.content).toBe("transaction-v2");
+      expect(transactionalTransportCalls).toBe(1);
+      expect(transactional.responseArtifactPath(fingerprint, "test", "model", 5)).not.toBe(legacy.responseArtifactPath(fingerprint, "test", "model", 5));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed before transport when a transaction operation was durably started but has no COMPLETE artifact", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-ambiguous-transaction-"));
+    try {
+      const stage = { stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId: "chapter-txn-ambiguous" };
+      const execution = createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId: "job", getActiveStage: () => stage });
+      const fingerprint = "a".repeat(64);
+      const logicalStepId = execution.responseArtifactPath(fingerprint, "test", "model", 5).split(/[\\/]/u).at(-1)!.replace(/\.json$/u, "");
+      await saveAutonomousProductionState(root, "book", {
+        jobId: "job", status: "RUNNING", mode: "current-volume", nextChapter: 5, updatedAt: "2026-08-28T00:00:00.000Z",
+        providerAttemptHistory: [{
+          transportAttemptId: `${logicalStepId}:transport-attempt:1`, logicalStepId, chapterNumber: 5, role: "writer",
+          provider: "test", requestedModel: "model", attempt: 1, classification: "TRANSPORT_STARTED",
+          transportStarted: true, transportReturned: false, recordedAt: "2026-08-28T00:00:00.000Z",
+        }],
+      });
+      let transportCalls = 0;
+      await expect(execution.runProviderCall(5, async () => {
+        transportCalls += 1;
+        return { content: "must-not-run", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "test", model: "model", inputFingerprint: fingerprint })).rejects.toThrow(/AMBIGUOUS/i);
+      expect(transportCalls).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

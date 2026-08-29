@@ -2915,7 +2915,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const recoveringProviderWait = persistedRuntime?.status === "WAITING_PROVIDER_RETRY"
       && persistedRuntime.mode === mode;
     const { view: admission, offlineFinalizationPlan: admittedOfflineFinalizationPlan } = await loadAutonomousProjection(bookId);
-    if (persistedRecoveryOwnership && !admittedOfflineFinalizationPlan) {
+    if (persistedRecoveryOwnership && !admittedOfflineFinalizationPlan && !admission.chapterTransaction) {
       throw new ApiError(409, "FORMAL_RECOVERY_AUTHORITY_INVALID", "Persisted recovery ownership no longer has valid formal authority.");
     }
     if (!admission.startEnabled && !recoveringProviderWait && !recoveringOwnedFormalRecovery) {

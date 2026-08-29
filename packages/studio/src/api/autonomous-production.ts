@@ -304,7 +304,7 @@ export function projectAutonomousProductionView(params: {
   if (!transactionEnabled && params.runtime?.status === "REVIEW_OUTPUT_INVALID" && !finalReviewRecovery) blockers.push("REVIEW_OUTPUT_INVALID");
   if (!transactionEnabled && params.runtime?.status === "REVIEW_DECISION_CONTRADICTORY") blockers.push("REVIEW_DECISION_CONTRADICTORY");
   if (!transactionEnabled && params.runtime?.status === "BLOCKED_CRITICAL_FINDINGS" && !finalReviewRecovery) blockers.push("BLOCKED_CRITICAL_FINDINGS");
-  if (recoveryOwnership?.kind === "FORMAL_BOUNDED_STATE_REBASELINE"
+  if (!transactionEnabled && recoveryOwnership?.kind === "FORMAL_BOUNDED_STATE_REBASELINE"
     && (params.runtime?.lastError === "STATE_REBASELINE_VALIDATION_FAILED" || params.runtime?.reason === "STATE_REBASELINE_VALIDATION_FAILED")) {
     blockers.push("STATE_REBASELINE_VALIDATION_FAILED");
   }

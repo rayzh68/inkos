@@ -34,7 +34,14 @@ describe("autonomous production Studio projection", () => {
       chapters: [{ number: 5, status: "state-degraded" }],
       config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini", reviser: "gpt", "observer-reflector": "flash" } },
       catalog,
-      runtime: { status: "REVIEW_EXHAUSTED", mode: "current-volume", nextChapter: 99, updatedAt: "now", phase: "LOGIC_REVIEW" },
+      runtime: {
+        jobId: "legacy-job", status: "REVIEW_EXHAUSTED", mode: "current-volume", nextChapter: 99, updatedAt: "now", phase: "LOGIC_REVIEW",
+        lastError: "STATE_REBASELINE_VALIDATION_FAILED",
+        recoveryOwnership: {
+          kind: "FORMAL_BOUNDED_STATE_REBASELINE", recoveryClass: "ORIGINAL_REVIEW_EXHAUSTED",
+          bookId: map.bookId, jobId: "legacy-job", pendingChapterNumber: 4,
+        },
+      },
       active: false,
       transactionAuthority: { state: "STAGING", latestChapter: 4, nextChapter: 5, latestAuthoritySha256: "a".repeat(64), activeTransactionId: "chapter-txn-test" },
     });
@@ -43,6 +50,7 @@ describe("autonomous production Studio projection", () => {
     expect(view.runtimeBlockers).not.toContain("REVIEW_EXHAUSTED");
     expect(view.runtimeBlockers).not.toContain("PENDING_STATE_REPAIR_CHAPTER_5");
     expect(view.runtimeBlockers).not.toContain("CHAPTER_CURSOR_INTEGRITY_MISMATCH");
+    expect(view.runtimeBlockers).not.toContain("STATE_REBASELINE_VALIDATION_FAILED");
     expect(view.chapterTransaction).toMatchObject({ state: "STAGING", latestChapter: 4, nextChapter: 5, currentStage: "LOGIC_REVIEW" });
     expect(view.finalReviewRecovery).toBeUndefined();
   });

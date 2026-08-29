@@ -2857,12 +2857,27 @@ export class PipelineRunner {
   ): Promise<ChapterPipelineResult> {
     const book = await this.state.loadBookConfig(bookId);
     const bookDir = this.state.bookDir(bookId);
-    if (await isChapterTransactionEnabled(bookDir)) {
+    const transactionEnabled = await isChapterTransactionEnabled(bookDir);
+    if (transactionEnabled) {
       if (preservedReviewPlan) throw new Error("TRANSACTION_BOOK_LEGACY_RECOVERY_FORBIDDEN");
       const chain = await verifyChapterCommitChain({ bookDir });
       await reconcileChapterProjections({ bookDir });
       await this.syncNarrativeMemoryIndex(bookId);
       await this.syncCurrentStateFactHistory(bookId, chain.latestChapter);
+    }
+    const chapterNumber = await this.state.getNextChapterNumber(bookId);
+    let chapterTransaction: ChapterTransactionHandle | undefined;
+    if (transactionEnabled) {
+      const productionMapBytes = await readFile(join(bookDir, "story", "outline", "book-production-map.json")).catch(() => null);
+      const productionAuthority = `pipeline:${createHash("sha256").update(JSON.stringify({
+        bookId,
+        genre: book.genre,
+        language: book.language ?? null,
+        targetChapters: book.targetChapters,
+        chapterWordCount: book.chapterWordCount,
+        productionMapSha256: productionMapBytes ? createHash("sha256").update(productionMapBytes).digest("hex") : null,
+      })).digest("hex")}`;
+      chapterTransaction = await beginChapterTransaction({ bookDir, bookId, chapterNumber, productionAuthority });
     }
     if (this.config.boundedAutonomousReview && !preservedReviewPlan) {
       const identity = this.resolveOverride("writer");
@@ -2871,9 +2886,9 @@ export class PipelineRunner {
         role: "writer",
         provider: identity.client.service ?? identity.client.provider,
         model: identity.model,
+        ...(chapterTransaction ? { transactionId: chapterTransaction.transactionId } : {}),
       });
     }
-    const chapterNumber = await this.state.getNextChapterNumber(bookId);
     const paddedChapter = String(chapterNumber).padStart(4, "0");
     if (preservedReviewPlan && chapterNumber !== preservedReviewPlan.pendingChapterNumber) {
       throw new Error("PRESERVED_CANDIDATE_CURSOR_CHANGED");
@@ -2909,6 +2924,7 @@ export class PipelineRunner {
         temperatureOverride,
         externalContext,
         preservedReviewPlan,
+        chapterTransaction,
       );
       if (result.status === "held-after-two-revisions" || result.status === "blocked-critical-findings" || result.status === "review-output-invalid") {
         await writeProductionRunSnapshot({
@@ -2984,6 +3000,7 @@ export class PipelineRunner {
     temperatureOverride?: number,
     externalContext?: string,
     preservedReviewPlan?: FormalPreservedBoundedReviewResumePlan,
+    existingChapterTransaction?: ChapterTransactionHandle,
   ): Promise<ChapterPipelineResult> {
     this.throwIfOperationAborted();
     await this.state.ensureControlDocuments(bookId);
@@ -2991,22 +3008,12 @@ export class PipelineRunner {
     const bookDir = this.state.bookDir(bookId);
     await this.assertNoPendingStateRepair(bookId);
     const chapterNumber = await this.state.getNextChapterNumber(bookId);
-    let chapterTransaction: ChapterTransactionHandle | undefined;
+    let chapterTransaction = existingChapterTransaction;
     if (await isChapterTransactionEnabled(bookDir)) {
       if (!this.config.boundedAutonomousReview || (this.config.chapterReviewMode ?? "auto") !== "auto") {
         throw new Error("TRANSACTION_BOOK_REQUIRES_BOUNDED_AUTONOMOUS_REVIEW");
       }
-      chapterTransaction = await beginChapterTransaction({
-        bookDir,
-        bookId,
-        chapterNumber,
-        productionAuthority: `pipeline:${createHash("sha256").update(JSON.stringify({
-          bookId,
-          genre: book.genre,
-          targetChapters: book.targetChapters,
-          chapterWordCount: book.chapterWordCount,
-        })).digest("hex")}`,
-      });
+      if (!chapterTransaction || chapterTransaction.chapterNumber !== chapterNumber) throw new Error("CHAPTER_TRANSACTION_MUST_EXIST_BEFORE_PREPARING");
     }
     const stageLanguage = await this.resolveBookLanguage(book);
     this.logStage(stageLanguage, { zh: "准备章节输入", en: "preparing chapter inputs" });
@@ -3015,6 +3022,7 @@ export class PipelineRunner {
       bookDir,
       chapterNumber,
       externalContext,
+      chapterTransaction?.transactionId,
     );
     const reducedControlInput = {
       chapterIntent: writeInput.chapterIntent,
@@ -3529,6 +3537,25 @@ export class PipelineRunner {
     if (chapterTransaction) {
       if (resolvedStatus === "state-degraded") throw new Error("STATE_SETTLEMENT_FAILED_BEFORE_CHAPTER_COMMIT");
       if (!autonomousReviewResult) throw new Error("CHAPTER_COMMIT_REQUIRES_BOUNDED_REVIEW_EVIDENCE");
+      if (autonomousReviewResult.status !== "APPROVED" && autonomousReviewResult.status !== "ACCEPTED_WITH_FINDINGS") {
+        throw new Error("CHAPTER_COMMIT_REQUIRES_TERMINAL_BOUNDED_REVIEW");
+      }
+      if (truthValidation.validation.passed !== true || truthValidation.validation.repairRequired === true) {
+        throw new Error("STATE_VALIDATION_FAILED_BEFORE_CHAPTER_COMMIT");
+      }
+      const logicAuthority = autonomousReviewResult.bestCandidate.reviews.find((review) => review.reviewerRole === "logic-canon-auditor");
+      const commercialAuthority = autonomousReviewResult.bestCandidate.reviews.find((review) => review.reviewerRole === "commercial-reader");
+      if (!logicAuthority?.provider || !logicAuthority.model || !commercialAuthority?.provider || !commercialAuthority.model) {
+        throw new Error("CHAPTER_COMMIT_REQUIRES_FINAL_REVIEWER_IDENTITIES");
+      }
+      if (!["APPROVED", "APPROVED_WITH_NOTES"].includes(logicAuthority.decision)
+        || !["APPROVED", "APPROVED_WITH_NOTES"].includes(commercialAuthority.decision)) {
+        throw new Error("CHAPTER_COMMIT_REQUIRES_TERMINAL_REVIEWER_DECISIONS");
+      }
+      const reviewerEvidence = [
+        { ...this.stableChapterTransactionReview(logicAuthority), provider: logicAuthority.provider, model: logicAuthority.model, decision: logicAuthority.decision as "APPROVED" | "APPROVED_WITH_NOTES" },
+        { ...this.stableChapterTransactionReview(commercialAuthority), provider: commercialAuthority.provider, model: commercialAuthority.model, decision: commercialAuthority.decision as "APPROVED" | "APPROVED_WITH_NOTES" },
+      ] as const;
       const stagingBookDir = chapterTransactionStagingBookDir(bookDir, chapterNumber);
       await rm(stagingBookDir, { recursive: true, force: true });
       await writer.saveChapter(stagingBookDir, persistenceOutput, gp.numericalSystem, pipelineLang);
@@ -3545,15 +3572,17 @@ export class PipelineRunner {
         lengthSpec,
         review: {
           status: autonomousReviewResult.status,
+          grade: autonomousReviewResult.grade,
+          revisionCount: autonomousReviewResult.revisionCount,
           finalCandidateSha256: createHash("sha256").update(finalContent, "utf-8").digest("hex"),
           findings: autonomousReviewResult.bestCandidate.reviews.flatMap((review) => review.findings).map((finding) => ({
             severity: finding.severity,
           })),
-          reviewerEvidence: autonomousReviewResult.bestCandidate.reviews.map((review) => ({
-            reviewerRole: review.reviewerRole,
-            reviewedCandidateSha: review.reviewedCandidateSha,
-            decision: review.decision,
-          })),
+          reviewerEvidence,
+        },
+        stateValidation: {
+          passed: true,
+          warnings: truthValidation.validation.warnings,
         },
         usage: { totalUsage, roleUsage: roleUsage ?? {} },
       });
@@ -4640,6 +4669,7 @@ ${matrix}`,
     bookDir: string,
     chapterNumber: number,
     externalContext?: string,
+    transactionId?: string,
   ): Promise<Pick<WriteChapterInput, "externalContext" | "chapterIntent" | "chapterMemo" | "chapterIntentData" | "contextPackage" | "ruleStack"> & {
     readonly contextTrace?: ChapterContextTraceSummary;
   }> {
@@ -4648,7 +4678,7 @@ ${matrix}`,
       bookDir,
       chapterNumber,
       externalContext,
-      { reuseExistingIntentWhenContextMissing: true },
+      { reuseExistingIntentWhenContextMissing: transactionId === undefined, ...(transactionId ? { transactionId } : {}) },
     );
 
     return {
@@ -5170,6 +5200,7 @@ ${matrix}`,
     externalContext?: string,
     options?: {
       readonly reuseExistingIntentWhenContextMissing?: boolean;
+      readonly transactionId?: string;
     },
   ): Promise<{
     plan: PlanChapterOutput;
@@ -5178,6 +5209,13 @@ ${matrix}`,
     const plan = await this.resolveGovernedPlan(book, bookDir, chapterNumber, externalContext, options);
     const composerCtx = this.agentCtxFor("composer", book.id);
     const composer = new ComposerAgent(composerCtx);
+    if (options?.transactionId) {
+      const identity = this.resolveOverride("composer");
+      await this.config.onAutonomousStage?.({
+        stage: "PREPARING", role: "composer", provider: identity.client.service ?? identity.client.provider,
+        model: identity.model, transactionId: options.transactionId,
+      });
+    }
     const composed = await composeGovernedChapter({
       book,
       bookDir,
@@ -5206,6 +5244,7 @@ ${matrix}`,
     externalContext?: string,
     options?: {
       readonly reuseExistingIntentWhenContextMissing?: boolean;
+      readonly transactionId?: string;
     },
   ): Promise<PlanChapterOutput> {
     if (
@@ -5216,6 +5255,13 @@ ${matrix}`,
       if (persisted) return persisted;
     }
 
+    if (options?.transactionId) {
+      const identity = this.resolveOverride("planner");
+      await this.config.onAutonomousStage?.({
+        stage: "PREPARING", role: "planner", provider: identity.client.service ?? identity.client.provider,
+        model: identity.model, transactionId: options.transactionId,
+      });
+    }
     const planner = new PlannerAgent(this.agentCtxFor("planner", book.id));
     const plan = await planner.planChapter({
       book,
