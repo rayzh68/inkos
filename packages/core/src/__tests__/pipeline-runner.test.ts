@@ -461,9 +461,18 @@ describe("PipelineRunner", () => {
         writeFile(join(storyDir, "current_state.md"), createStateCard({ chapter: 0, location: "Gate", protagonistState: "Ready", goal: "Begin", conflict: "Clock" })),
         writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n"),
       ]);
+      await mkdir(join(storyDir, "outline"), { recursive: true });
+      await Promise.all([
+        writeFile(join(storyDir, "outline", "story_frame.md"), "# Frame\n\n## Rule\nKeep the gate.\n\n## Ending\nReach the clock."),
+        writeFile(join(storyDir, "outline", "volume_map.md"), "# Volume\n\n## Chapter 1\nOpen the gate.\n\n## Chapter 2\nFollow the clock."),
+      ]);
+      vi.spyOn(ComposerModule.ComposerAgent.prototype, "selectOutlineSections").mockImplementation(async (request) =>
+        request.fileName.includes("story_frame")
+          ? ["story/outline/story_frame.md#rule"]
+          : ["story/outline/volume_map.md#chapter-1"]);
       await state.snapshotState(bookId, 0);
       await createChapterGenesis({ bookDir, bookId, lastTrustedChapter: 0, trustedSnapshotDir: join(storyDir, "snapshots", "0"), createdAt: "2026-08-28T00:00:00.000Z" });
-      vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(createWriterOutput({
+      const writeChapter = vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(createWriterOutput({
         chapterNumber: 1, title: "Transaction One", content: body, wordCount: 2200,
         updatedState: createStateCard({ chapter: 1, location: "Gate", protagonistState: "Moving", goal: "Proceed", conflict: "Clock" }),
         updatedHooks: "# Pending Hooks\n",
@@ -475,19 +484,56 @@ describe("PipelineRunner", () => {
         decision: "APPROVED", findings: [], reviewedCandidateSha: input.candidateSha,
         reviewedAt: "2026-08-28T00:00:00.000Z", tokenUsage: ZERO_USAGE,
       }));
-      vi.spyOn(ChapterAnalyzerAgent.prototype, "analyzeChapter").mockResolvedValue(createAnalyzedOutput({
+      const analyzeChapter = vi.spyOn(ChapterAnalyzerAgent.prototype, "analyzeChapter").mockResolvedValue(createAnalyzedOutput({
         chapterNumber: 1, title: "Transaction One", content: body, wordCount: 2200,
         updatedState: createStateCard({ chapter: 1, location: "Gate", protagonistState: "Moving", goal: "Proceed", conflict: "Clock" }),
         updatedHooks: "# Pending Hooks\n",
+        tokenUsage: { promptTokens: 2, completionTokens: 3, totalTokens: 5, actualCostUsd: 0.01 },
+      }));
+      vi.mocked(StateValidatorAgent.prototype.validate).mockResolvedValue({
+        warnings: [], passed: true,
+        tokenUsage: { promptTokens: 7, completionTokens: 11, totalTokens: 18 },
+      });
+      vi.mocked(StateValidatorAgent.prototype.validate)
+        .mockResolvedValueOnce({
+          warnings: [{ category: "missing_state_update", description: "repair fixture" }],
+          passed: false, repairRequired: true,
+          tokenUsage: { promptTokens: 7, completionTokens: 11, totalTokens: 18, actualCostUsd: 0.03 },
+        })
+        .mockResolvedValueOnce({
+          warnings: [], passed: true,
+          tokenUsage: { promptTokens: 1, completionTokens: 1, totalTokens: 2, actualCostUsd: 0.04 },
+        });
+      vi.mocked(WriterAgent.prototype.settleChapterState).mockResolvedValue(createWriterOutput({
+        chapterNumber: 1, title: "Transaction One", content: body, wordCount: 2200,
+        updatedState: createStateCard({ chapter: 1, location: "Gate", protagonistState: "Moving", goal: "Proceed", conflict: "Clock" }),
+        updatedHooks: "# Pending Hooks\n",
+        tokenUsage: { promptTokens: 4, completionTokens: 6, totalTokens: 10, actualCostUsd: 0.02 },
       }));
 
       const result = await runner.writeNextChapter(bookId, 2200);
       expect(result.status).toBe("ready-for-review");
+      expect(writeChapter).toHaveBeenCalledWith(expect.objectContaining({ deferStateSettlement: true }));
+      expect(analyzeChapter).toHaveBeenCalledTimes(1);
+      expect(analyzeChapter).toHaveBeenCalledWith(expect.objectContaining({ chapterContent: body }));
       const commit = await verifyChapterCommit({ bookDir, chapterNumber: 1 });
       expect(commit.finalLengthCount).toBe(2200);
       expect(commit.providerReferenceCount).toBeGreaterThanOrEqual(5);
+      const committedUsage = JSON.parse(await readFile(join(bookDir, "story", "commits", "chapter-0001", "usage.json"), "utf-8"));
+      expect(committedUsage.roleUsage).toMatchObject({
+        "final-state-extractor": { promptTokens: 6, completionTokens: 9, totalTokens: 15, actualCostUsd: 0.03 },
+        "state-validator": { promptTokens: 8, completionTokens: 12, totalTokens: 20, actualCostUsd: 0.07 },
+      });
+      expect(committedUsage.totalUsage).toMatchObject({ promptTokens: 14, completionTokens: 21, totalTokens: 35 });
       expect(stages[0]).toMatchObject({ stage: "PREPARING", transactionId: expect.stringMatching(/^chapter-txn-/u) });
-      expect(stages.filter((event) => event.stage === "PREPARING").map((event) => event.role)).toEqual(expect.arrayContaining(["writer", "planner", "composer"]));
+      expect(stages.filter((event) => event.stage === "PREPARING").map((event) => event.role)).toEqual(expect.arrayContaining(["writer", "planner"]));
+      expect(stages.filter((event) => event.stage === "PREPARING").map((event) => event.role)).toEqual(expect.arrayContaining(["story-frame-selector", "volume-map-selector"]));
+      expect(stages.filter((event) => event.stage === "SETTLING_STATE").map((event) => event.role)).toEqual(expect.arrayContaining([
+        "final-state-extractor",
+        "state-validator",
+        "final-state-extractor-settlement-repair",
+        "state-validator-settlement-repair",
+      ]));
       const logicEvidenceDir = join(
         bookDir, "story", "runtime", "chapter-transactions", "chapter-0001", "staging", "evidence",
         "reviews", commit.finalBodySha256, "logic-canon-auditor",
@@ -527,7 +573,7 @@ describe("PipelineRunner", () => {
           return { content: `complete:${operationKey}`, usage: ZERO_USAGE };
         }, { provider: event.provider, model: event.model, inputFingerprint });
         const crash = boundary === "PREPARING"
-          ? event.stage === "PREPARING" && event.role === "composer"
+          ? event.stage === "PREPARING" && event.role === "planner"
           : boundary === "WRITER" ? event.stage === "LOGIC_REVIEW" && occurrence === 1
             : boundary === "REVIEW" ? event.stage === "SETTLING_STATE"
               : boundary === "REVISION" ? event.stage === "LOGIC_REVIEW" && occurrence === 2

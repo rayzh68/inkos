@@ -1,6 +1,6 @@
 import type { AuditIssue, AuditResult } from "../agents/continuity.js";
 import type { StateValidationAuthorityContext, ValidationResult, StateValidatorAgent } from "../agents/state-validator.js";
-import type { WriteChapterOutput, WriterAgent } from "../agents/writer.js";
+import type { TokenUsage, WriteChapterOutput, WriterAgent } from "../agents/writer.js";
 import type { BookConfig } from "../models/book.js";
 import type { ContextPackage, RuleStack } from "../models/input-governance.js";
 import type { Logger } from "../utils/logger.js";
@@ -34,13 +34,39 @@ export async function validateChapterTruthPersistence(params: {
   readonly language: LengthLanguage;
   readonly logWarn: (message: { zh: string; en: string }) => void;
   readonly logger?: Pick<Logger, "warn">;
+  readonly semanticRecovery?: {
+    readonly allowSemanticRetry?: boolean;
+    readonly onSemanticRetry?: () => Promise<void> | void;
+    readonly onSettlementExtractorRetry?: () => Promise<void> | void;
+    readonly onSettlementValidatorRetry?: () => Promise<void> | void;
+  };
 }): Promise<{
   readonly validation: ValidationResult;
   readonly chapterStatus: "state-degraded" | null;
   readonly degradedIssues: ReadonlyArray<AuditIssue>;
   readonly persistenceOutput: WriteChapterOutput;
   readonly auditResult: AuditResult;
+  readonly stateUsage: {
+    readonly extractor: TokenUsage;
+    readonly validator: TokenUsage;
+  };
 }> {
+  const zeroUsage = (): TokenUsage => ({ promptTokens: 0, completionTokens: 0, totalTokens: 0 });
+  const addUsage = (left: TokenUsage, right: TokenUsage | undefined): TokenUsage => {
+    if (!right) return left;
+    const leftHasUsage = left.promptTokens > 0 || left.completionTokens > 0 || left.totalTokens > 0;
+    const actualCostUsd = right.actualCostUsd !== undefined && (!leftHasUsage || left.actualCostUsd !== undefined)
+      ? (left.actualCostUsd ?? 0) + right.actualCostUsd
+      : undefined;
+    return {
+      promptTokens: left.promptTokens + right.promptTokens,
+      completionTokens: left.completionTokens + right.completionTokens,
+      totalTokens: left.totalTokens + right.totalTokens,
+      ...(actualCostUsd !== undefined ? { actualCostUsd } : {}),
+    };
+  };
+  let extractorUsage = addUsage(zeroUsage(), params.persistenceOutput.tokenUsage);
+  let validatorUsage = zeroUsage();
   let validation: ValidationResult;
   let chapterStatus: "state-degraded" | null = null;
   let degradedIssues: ReadonlyArray<AuditIssue> = [];
@@ -57,7 +83,9 @@ export async function validateChapterTruthPersistence(params: {
       persistenceOutput.updatedHooks,
       params.language,
       params.authorityContext,
+      params.semanticRecovery,
     );
+    validatorUsage = addUsage(validatorUsage, validation.tokenUsage);
   } catch (error) {
     params.logger?.warn(`State validation error for chapter ${params.chapterNumber}: ${String(error)}`);
     const errorDescription = params.language === "en"
@@ -85,6 +113,7 @@ export async function validateChapterTruthPersistence(params: {
         ...params.auditResult,
         issues: [...params.auditResult.issues, errorIssue],
       },
+      stateUsage: { extractor: extractorUsage, validator: validatorUsage },
     };
   }
 
@@ -114,9 +143,13 @@ export async function validateChapterTruthPersistence(params: {
       language: params.language,
       logWarn: params.logWarn,
       logger: params.logger,
+      onExtractorRetry: params.semanticRecovery?.onSettlementExtractorRetry,
+      onValidatorRetry: params.semanticRecovery?.onSettlementValidatorRetry,
     });
 
     if (recovery.kind === "recovered") {
+      extractorUsage = addUsage(extractorUsage, recovery.output.tokenUsage);
+      validatorUsage = addUsage(validatorUsage, recovery.validation.tokenUsage);
       persistenceOutput = recovery.output;
       validation = recovery.validation;
     } else {
@@ -141,5 +174,6 @@ export async function validateChapterTruthPersistence(params: {
     degradedIssues,
     persistenceOutput,
     auditResult,
+    stateUsage: { extractor: extractorUsage, validator: validatorUsage },
   };
 }

@@ -7,43 +7,42 @@ const catalog = ["openai/gpt", "deepseek/chat", "google/gemini"];
 describe("production role model configuration", () => {
   it("maps fixed UI roles to the existing model override contract", () => {
     expect(buildProductionRoleOverrides({
-      writer: "openai/gpt",
-      logicAuditor: "deepseek/chat",
-      commercialReader: "google/gemini",
-      reviser: "openai/gpt",
-      observerReflector: "deepseek/chat",
+      production: "openai/gpt",
+      review: "deepseek/chat",
+      reader: "google/gemini",
     }, { unrelated: "preserved" })).toEqual({
       defaultModel: "openai/gpt",
       modelOverrides: {
         unrelated: "preserved",
         auditor: "deepseek/chat",
         "commercial-reader": "google/gemini",
+        planner: "openai/gpt",
+        composer: "openai/gpt",
+        writer: "openai/gpt",
         reviser: "openai/gpt",
-        "observer-reflector": "deepseek/chat",
+        "chapter-analyzer": "openai/gpt",
+        "state-validator": "openai/gpt",
+        "observer-reflector": "openai/gpt",
       },
     });
   });
 
   it("allows an explicit OpenRouter slug even when it is not in the current catalog", () => {
     expect(validateProductionRoleSelection({
-      writer: "new-provider/new-model",
-      logicAuditor: "deepseek/chat",
-      commercialReader: "google/gemini",
-      reviser: "openai/gpt",
-      observerReflector: "deepseek/chat",
-    }, catalog).writer).toBe("new-provider/new-model");
+      production: "new-provider/new-model",
+      review: "deepseek/chat",
+      reader: "google/gemini",
+    }, catalog).production).toBe("new-provider/new-model");
   });
 
   it("rejects blank or malformed manual model ids", () => {
     const selection = {
-      writer: "openai/gpt",
-      logicAuditor: "deepseek/chat",
-      commercialReader: "google/gemini",
-      reviser: "openai/gpt",
-      observerReflector: "deepseek/chat",
+      production: "openai/gpt",
+      review: "deepseek/chat",
+      reader: "google/gemini",
     };
-    expect(() => validateProductionRoleSelection({ ...selection, writer: "" }, catalog)).toThrow(/required/i);
-    expect(() => validateProductionRoleSelection({ ...selection, writer: "not a slug" }, catalog)).toThrow(/model id/i);
+    expect(() => validateProductionRoleSelection({ ...selection, production: "" }, catalog)).toThrow(/required/i);
+    expect(() => validateProductionRoleSelection({ ...selection, production: "not a slug" }, catalog)).toThrow(/model id/i);
   });
 
   it("searches a live catalog by model id and display name", () => {
@@ -62,11 +61,9 @@ describe("production role model configuration", () => {
 
   it("binds every saved role to exact live-catalog pricing without treating it as provider actual", () => {
     const selection = {
-      writer: "openai/gpt-5.6-terra",
-      logicAuditor: "deepseek/deepseek-v4-pro-0813",
-      commercialReader: "google/gemini-3.7-flash",
-      reviser: "openai/gpt-5.6-terra",
-      observerReflector: "deepseek/deepseek-v4-flash-0731",
+      production: "openai/gpt-5.6-terra",
+      review: "deepseek/deepseek-v4-pro-0813",
+      reader: "google/gemini-3.7-flash",
     };
     const liveCatalog = [...new Set(Object.values(selection))].map((id, index) => ({
       id,
@@ -81,9 +78,9 @@ describe("production role model configuration", () => {
 
     const bound = roleModels.bindProductionRolePricing(selection, liveCatalog);
 
-    expect(Object.values(bound)).toHaveLength(5);
+    expect(Object.values(bound)).toHaveLength(3);
     expect(Object.values(bound).every((entry) => entry.status === "VERIFIED_IN_CURRENT_CATALOG")).toBe(true);
-    expect(bound.writer).toMatchObject({
+    expect(bound.production).toMatchObject({
       modelId: "openai/gpt-5.6-terra",
       inputUsdPerToken: 0.000001,
       outputUsdPerToken: 0.000011,
@@ -94,10 +91,17 @@ describe("production role model configuration", () => {
   });
 
   it("fails pricing closed for an unknown model or missing price", () => {
-    const selection = { writer: "missing/model", logicAuditor: "priced/model", commercialReader: "priced/model", reviser: "priced/model", observerReflector: "priced/model" };
+    const selection = { production: "missing/model", review: "priced/model", reader: "priced/model" };
     const liveCatalog = [{ id: "priced/model", name: "Priced", contextWindow: 1, inputPrice: "0.1", inputModalities: ["text"], outputModalities: ["text"] }];
     const bound = roleModels.bindProductionRolePricing(selection, liveCatalog);
-    expect(bound.writer.status).toBe("MODEL_NOT_IN_CURRENT_CATALOG");
-    expect(bound.logicAuditor.status).toBe("PRICING_UNAVAILABLE");
+    expect(bound.production.status).toBe("MODEL_NOT_IN_CURRENT_CATALOG");
+    expect(bound.review.status).toBe("PRICING_UNAVAILABLE");
+  });
+
+  it("migrates a legacy five-role selection with writer as the single Production authority", () => {
+    expect(roleModels.migrateLegacyProductionRoleSelection({
+      writer: "openai/production", logicAuditor: "deepseek/review", commercialReader: "google/reader",
+      reviser: "other/legacy-split", observerReflector: "other/hidden",
+    })).toEqual({ production: "openai/production", review: "deepseek/review", reader: "google/reader" });
   });
 });

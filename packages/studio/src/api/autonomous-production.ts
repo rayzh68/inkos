@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import {
   autonomousProductionStatePath,
@@ -41,7 +41,7 @@ export async function resolveOfflineFinalizationPlan(params: {
   const ownedReentry = ownership?.bookId === params.bookId
     && ownership.jobId === params.runtime?.jobId
     && ownership.pendingChapterNumber === params.pendingChapter
-    && ["RUNNING", "WAITING_PROVIDER_RETRY", "PAUSED_PROVIDER_UNAVAILABLE", "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", "PAUSED_DETERMINISTIC_PROVIDER_ERROR"].includes(params.runtime?.status ?? "");
+    && ["RUNNING", "WAITING_PROVIDER_RETRY", "PAUSED_PROVIDER_UNAVAILABLE", "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", "PAUSED_DETERMINISTIC_PROVIDER_ERROR", "PAUSED_PIPELINE_ERROR"].includes(params.runtime?.status ?? "");
   const terminalPreservedRestartWindow = ownedReentry
     && ownership?.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
     && params.runtime?.nextChapter === params.pendingChapter
@@ -183,6 +183,72 @@ interface SafeConfigProjection {
   readonly modelOverrides: Readonly<Record<string, unknown>>;
 }
 
+export interface CurrentAttemptUsageRecord {
+  readonly identity: string;
+  readonly role: string;
+  readonly promptTokens: number;
+  readonly completionTokens: number;
+  readonly totalTokens: number;
+  readonly actualCostUsd?: number;
+}
+
+export interface CurrentTransactionUsageResult {
+  readonly records: ReadonlyArray<CurrentAttemptUsageRecord>;
+  readonly integrityWarnings: ReadonlyArray<string>;
+}
+
+export async function loadCurrentTransactionUsage(
+  projectRoot: string,
+  bookId: string,
+  transactionId: string | undefined,
+): Promise<CurrentTransactionUsageResult> {
+  if (!transactionId) return { records: [], integrityWarnings: [] };
+  const dir = join(projectRoot, "books", bookId, "story", "runtime", "bounded-autonomous", "provider-responses");
+  const files = (await readdir(dir).catch(() => [] as string[])).filter((name) => name.endsWith(".json") && !name.endsWith(".binding.json"));
+  const records: CurrentAttemptUsageRecord[] = [];
+  const integrityWarnings: string[] = [];
+  for (const file of files) {
+    let artifact: {
+      transaction_id?: string;
+      response_artifact_status?: string;
+      logical_step_id?: string;
+      role?: string;
+      response?: { usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number; actualCostUsd?: number } };
+    };
+    try {
+      artifact = JSON.parse(await readFile(join(dir, file), "utf-8")) as typeof artifact;
+    } catch {
+      integrityWarnings.push(`PROVIDER_USAGE_ARTIFACT_INVALID:${file}`);
+      continue;
+    }
+    if (artifact.transaction_id !== transactionId || artifact.response_artifact_status !== "COMPLETE") continue;
+    const usage = artifact.response?.usage;
+    const tokenValues = usage ? [usage.promptTokens, usage.completionTokens, usage.totalTokens] : [];
+    const invalidShape = artifact.logical_step_id !== file.slice(0, -5)
+      || !artifact.role
+      || tokenValues.length !== 3
+      || tokenValues.some((value) => typeof value !== "number" || !Number.isFinite(value) || value < 0)
+      || (usage?.actualCostUsd !== undefined
+        && (typeof usage.actualCostUsd !== "number" || !Number.isFinite(usage.actualCostUsd) || usage.actualCostUsd < 0));
+    if (invalidShape) {
+      integrityWarnings.push(`PROVIDER_USAGE_ARTIFACT_INVALID:${file}`);
+      continue;
+    }
+    records.push({
+      identity: artifact.logical_step_id!,
+      role: artifact.role!,
+      promptTokens: usage!.promptTokens!,
+      completionTokens: usage!.completionTokens!,
+      totalTokens: usage!.totalTokens!,
+      ...(typeof usage!.actualCostUsd === "number" ? { actualCostUsd: usage!.actualCostUsd } : {}),
+    });
+  }
+  return {
+    records: records.sort((left, right) => left.identity.localeCompare(right.identity)),
+    integrityWarnings,
+  };
+}
+
 export function autonomousRuntimePath(projectRoot: string, bookId: string): string {
   return autonomousProductionStatePath(projectRoot, bookId);
 }
@@ -227,24 +293,22 @@ export function projectAutonomousProductionView(params: {
     readonly latestAuthoritySha256: string;
     readonly activeTransactionId?: string;
   } | null;
+  readonly currentAttemptUsage?: ReadonlyArray<CurrentAttemptUsageRecord>;
+  readonly currentAttemptTelemetryWarnings?: ReadonlyArray<string>;
 }) {
   const transactionEnabled = params.transactionAuthority !== null && params.transactionAuthority !== undefined;
   const authoritativeNextChapter = params.transactionAuthority?.nextChapter ?? params.nextChapter;
   const scope = resolveProductionScope(params.map, authoritativeNextChapter, "current-volume");
   const overrides = params.config.modelOverrides;
   const roles = {
-    writer: params.config.defaultModel,
-    logicAuditor: configuredModel(overrides.auditor),
-    commercialReader: configuredModel(overrides["commercial-reader"]),
-    reviser: configuredModel(overrides.reviser),
-    observerReflector: configuredModel(overrides["observer-reflector"]),
+    production: params.config.defaultModel,
+    review: configuredModel(overrides.auditor),
+    reader: configuredModel(overrides["commercial-reader"]),
   };
   const rolePricing = bindProductionRolePricing({
-    writer: roles.writer ?? "",
-    logicAuditor: roles.logicAuditor ?? "",
-    commercialReader: roles.commercialReader ?? "",
-    reviser: roles.reviser ?? "",
-    observerReflector: roles.observerReflector ?? "",
+    production: roles.production ?? "",
+    review: roles.review ?? "",
+    reader: roles.reader ?? "",
   } satisfies ProductionRoleSelection, params.catalog ?? []);
   const blockers: string[] = [];
   if (params.targetChapters !== params.map.totalChapters) blockers.push("BOOK_TARGET_CHAPTERS_MISMATCH");
@@ -292,11 +356,9 @@ export function projectAutonomousProductionView(params: {
           recoveryClass: formalRecoveryPlan.recoveryClass,
         }
       : undefined;
-  if (!roles.writer) blockers.push("WRITER_MODEL_NOT_CONFIGURED");
-  if (!roles.logicAuditor) blockers.push("LOGIC_AUDITOR_MODEL_NOT_CONFIGURED");
-  if (!roles.commercialReader) blockers.push("COMMERCIAL_READER_MODEL_NOT_CONFIGURED");
-  if (!roles.reviser) blockers.push("REVISER_MODEL_NOT_CONFIGURED");
-  if (!roles.observerReflector) blockers.push("OBSERVER_REFLECTOR_MODEL_NOT_CONFIGURED");
+  if (!roles.production) blockers.push("PRODUCTION_MODEL_NOT_CONFIGURED");
+  if (!roles.review) blockers.push("REVIEW_MODEL_NOT_CONFIGURED");
+  if (!roles.reader) blockers.push("READER_MODEL_NOT_CONFIGURED");
   if (params.active) blockers.push("AUTONOMOUS_JOB_ALREADY_RUNNING");
   if (!transactionEnabled && ((params.runtime?.status === "REVIEW_EXHAUSTED" && !finalReviewRecovery) || (params.runtime?.status === "HELD_AFTER_TWO_REVISIONS" && !finalReviewRecovery))) {
     blockers.push("REVIEW_EXHAUSTED");
@@ -327,12 +389,9 @@ export function projectAutonomousProductionView(params: {
       ? undefined
       : promptTokens * maxInputUsdPerToken + completionTokens * maxOutputUsdPerToken;
   const exactRoleCost = (role: string, promptTokens: number, completionTokens: number) => {
-    const price = role === "writer" ? rolePricing.writer
-      : role === "logic-canon-auditor" || role === "auditor" ? rolePricing.logicAuditor
-        : role === "commercial-reader" ? rolePricing.commercialReader
-          : role === "reviser" ? rolePricing.reviser
-            : role === "observer-reflector" || role === "state-validator" ? rolePricing.observerReflector
-              : null;
+    const price = role === "logic-canon-auditor" || role === "auditor" ? rolePricing.review
+      : role === "commercial-reader" ? rolePricing.reader
+        : rolePricing.production;
     return price?.status === "VERIFIED_IN_CURRENT_CATALOG"
       ? promptTokens * price.inputUsdPerToken! + completionTokens * price.outputUsdPerToken!
       : undefined;
@@ -431,8 +490,8 @@ export function projectAutonomousProductionView(params: {
   const historicalCalculatedEstimateUsd = economics.actual.historicalCalculatedEstimateUsd;
   const currentVolumeHistoricalCalculatedEstimateUsd = currentVolumeEconomics.actual.historicalCalculatedEstimateUsd;
   const degradedChapter = degraded?.tokenUsage;
-  const writerPrice = rolePricing.writer;
-  const observerPrice = rolePricing.observerReflector;
+  const writerPrice = rolePricing.production;
+  const observerPrice = rolePricing.production;
   const observedOperationCost = (price: typeof writerPrice) => degradedChapter && price.status === "VERIFIED_IN_CURRENT_CATALOG"
     ? degradedChapter.promptTokens * price.inputUsdPerToken! + degradedChapter.completionTokens * price.outputUsdPerToken!
     : null;
@@ -456,6 +515,24 @@ export function projectAutonomousProductionView(params: {
     highUsd: repairHighUsd,
     sampleSize: repairBaseUsd === null ? 0 : 1,
     confidence: "LOW" as const,
+  };
+  const currentAttemptUsage = params.currentAttemptUsage ?? [];
+  const currentAttemptEstimatedCosts = currentAttemptUsage.map((record) => exactRoleCost(record.role, record.promptTokens, record.completionTokens));
+  const currentAttemptActualCosts = currentAttemptUsage.map((record) => record.actualCostUsd);
+  const currentAttempt = {
+    providerCalls: currentAttemptUsage.length,
+    promptTokens: currentAttemptUsage.reduce((sum, record) => sum + record.promptTokens, 0),
+    completionTokens: currentAttemptUsage.reduce((sum, record) => sum + record.completionTokens, 0),
+    totalTokens: currentAttemptUsage.reduce((sum, record) => sum + record.totalTokens, 0),
+    tokenDiscrepancy: currentAttemptUsage.reduce((sum, record) => sum + record.totalTokens - record.promptTokens - record.completionTokens, 0),
+    estimatedCostUsd: currentAttemptEstimatedCosts.every((cost): cost is number => cost !== undefined)
+      ? currentAttemptEstimatedCosts.reduce((sum, cost) => sum + cost, 0)
+      : null,
+    actualCostUsd: currentAttemptActualCosts.every((cost): cost is number => cost !== undefined)
+      ? currentAttemptActualCosts.reduce((sum, cost) => sum + cost, 0)
+      : null,
+    unknownLegacyTotal: currentAttemptUsage.filter((record) => record.role === "legacy-total").length,
+    integrityWarnings: params.currentAttemptTelemetryWarnings ?? [],
   };
 
   return {
@@ -512,6 +589,8 @@ export function projectAutonomousProductionView(params: {
       repairForecast,
       currentVolumeActual: currentVolumeEconomics.actual,
       budget: currentVolumeEconomics.budget,
+      currentAttempt,
+      historicalBook: economics.actual,
     },
     repairOutcome: params.runtime?.repairOutcome,
     chapterAttention: auditFailed

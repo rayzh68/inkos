@@ -12,6 +12,51 @@ describe("StateValidatorAgent", () => {
     vi.restoreAllMocks();
   });
 
+  it("uses at most one distinct semantic retry for a returned whitespace result", async () => {
+    const agent = new StateValidatorAgent({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model",
+      projectRoot: process.cwd(),
+    });
+    const chat = vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValueOnce({ content: "   \n", usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3, actualCostUsd: 0.01 } })
+      .mockResolvedValueOnce({ content: "PASS", usage: { promptTokens: 4, completionTokens: 5, totalTokens: 9 } });
+    const onSemanticRetry = vi.fn();
+
+    const result = await agent.validate(
+      "Chapter body.", 5, "old", "new", "old hooks", "new hooks", "en", undefined,
+      { allowSemanticRetry: true, onSemanticRetry },
+    );
+    expect(result).toMatchObject({ passed: true, tokenUsage: { promptTokens: 5, completionTokens: 7, totalTokens: 12 } });
+    expect(result.tokenUsage?.actualCostUsd).toBeUndefined();
+    expect(chat).toHaveBeenCalledTimes(2);
+    expect(onSemanticRetry).toHaveBeenCalledTimes(1);
+    const retryMessages = chat.mock.calls[1]![0] as ReadonlyArray<{ content: string }>;
+    expect(retryMessages.at(-1)?.content).toContain("SEMANTIC_RETRY_1");
+  });
+
+  it("stops after the second semantically invalid validator result", async () => {
+    const agent = new StateValidatorAgent({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model",
+      projectRoot: process.cwd(),
+    });
+    const chat = vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({ content: "not a verdict", usage: ZERO_USAGE });
+
+    await expect(agent.validate(
+      "Chapter body.", 5, "old", "new", "old hooks", "new hooks", "en", undefined,
+      { allowSemanticRetry: true },
+    )).rejects.toThrow("State validator returned invalid response");
+    expect(chat).toHaveBeenCalledTimes(2);
+  });
+
   it("accepts a valid JSON object even when the model appends markdown with extra braces", async () => {
     const agent = new StateValidatorAgent({
       client: {
@@ -52,6 +97,7 @@ describe("StateValidatorAgent", () => {
       warnings: [],
       passed: true,
       repairRequired: false,
+      tokenUsage: ZERO_USAGE,
     });
   });
 
@@ -82,6 +128,7 @@ describe("StateValidatorAgent", () => {
     )).resolves.toEqual({
       passed: false,
       repairRequired: true,
+      tokenUsage: ZERO_USAGE,
       warnings: [{
         category: "missing_state_update",
         description: "角色已到码头，但状态卡仍在车站",

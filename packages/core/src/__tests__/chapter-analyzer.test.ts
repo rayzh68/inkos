@@ -12,9 +12,59 @@ const ZERO_USAGE = {
   totalTokens: 0,
 } as const;
 
+function validAnalyzerResponse(content: string): string {
+  return [
+    "=== CHAPTER_TITLE ===", "Recovered State", "", "=== CHAPTER_CONTENT ===", content, "",
+    "=== PRE_WRITE_CHECK ===", "", "=== POST_SETTLEMENT ===", "done", "",
+    "=== UPDATED_STATE ===", "| Field | Value |", "| --- | --- |", "| Chapter | 5 |", "",
+    "=== UPDATED_LEDGER ===", "", "=== UPDATED_HOOKS ===", "# Pending Hooks", "",
+    "=== CHAPTER_SUMMARY ===", "| 5 | Recovered State |", "", "=== UPDATED_SUBPLOTS ===", "",
+    "=== UPDATED_EMOTIONAL_ARCS ===", "", "=== UPDATED_CHARACTER_MATRIX ===", "",
+  ].join("\n");
+}
+
 describe("ChapterAnalyzerAgent", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it("uses one distinct semantic retry for a COMPLETE whitespace final-state extraction", async () => {
+    const bookDir = await mkdtemp(join(tmpdir(), "inkos-chapter-analyzer-semantic-retry-"));
+    const content = "Final candidate remains byte-identical.";
+    const agent = new ChapterAnalyzerAgent({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model",
+      projectRoot: process.cwd(),
+    });
+    const book: BookConfig = {
+      id: "book", title: "Book", platform: "other", genre: "other", status: "active",
+      targetChapters: 10, chapterWordCount: 2200, language: "en",
+      createdAt: "2026-08-30T00:00:00.000Z", updatedAt: "2026-08-30T00:00:00.000Z",
+    };
+    const chat = vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValueOnce({ content: " \n", usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3, actualCostUsd: 0.01 } })
+      .mockResolvedValueOnce({ content: validAnalyzerResponse(content), usage: { promptTokens: 4, completionTokens: 5, totalTokens: 9 } });
+    const onSemanticRetry = vi.fn();
+    try {
+      const output = await agent.analyzeChapter({
+        book, bookDir, chapterNumber: 5, chapterContent: content,
+        semanticRecovery: { allowSemanticRetry: true, onSemanticRetry },
+      });
+      expect(output).toMatchObject({
+        content, updatedState: expect.stringContaining("Chapter"),
+        tokenUsage: { promptTokens: 5, completionTokens: 7, totalTokens: 12 },
+      });
+      expect(output.tokenUsage?.actualCostUsd).toBeUndefined();
+      expect(chat).toHaveBeenCalledTimes(2);
+      expect(onSemanticRetry).toHaveBeenCalledTimes(1);
+      const retryMessages = chat.mock.calls[1]![0] as ReadonlyArray<{ content: string }>;
+      expect(retryMessages.at(-1)?.content).toContain("SEMANTIC_RETRY_1");
+    } finally {
+      await rm(bookDir, { recursive: true, force: true });
+    }
   });
 
   it("counts English chapter content using words instead of characters", async () => {

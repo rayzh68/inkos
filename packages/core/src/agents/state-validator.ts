@@ -1,4 +1,5 @@
 import { BaseAgent } from "./base.js";
+import type { TokenUsage } from "./writer.js";
 
 export interface ValidationWarning {
   readonly category: string;
@@ -9,6 +10,7 @@ export interface ValidationResult {
   readonly warnings: ReadonlyArray<ValidationWarning>;
   readonly passed: boolean;
   readonly repairRequired?: boolean;
+  readonly tokenUsage?: TokenUsage;
 }
 
 export interface StateValidationAuthorityContext {
@@ -39,6 +41,10 @@ export class StateValidatorAgent extends BaseAgent {
     newHooks: string,
     language: "zh" | "en" = "zh",
     authorityContext?: StateValidationAuthorityContext,
+    semanticRecovery?: {
+      readonly allowSemanticRetry?: boolean;
+      readonly onSemanticRetry?: () => Promise<void> | void;
+    },
   ): Promise<ValidationResult> {
     const stateDiff = this.computeDiff(oldState, newState, "State Card");
     const hooksDiff = this.computeDiff(oldHooks, newHooks, "Hooks Pool");
@@ -116,7 +122,30 @@ ${chapterContent}`;
         { temperature: 0.1 },
       );
 
-      return this.parseResult(response.content);
+      try {
+        return { ...this.parseResult(response.content), tokenUsage: response.usage };
+      } catch (semanticError) {
+        if (!semanticRecovery?.allowSemanticRetry) throw semanticError;
+        await semanticRecovery.onSemanticRetry?.();
+        const retryResponse = await this.chat(
+          [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: `${userPrompt}\n\nSEMANTIC_RETRY_1: The prior returned output could not be parsed. Return exactly PASS, REPAIR, or FAIL followed only by optional warning lines.` },
+          ],
+          { temperature: 0.1 },
+        );
+        return {
+          ...this.parseResult(retryResponse.content),
+          tokenUsage: {
+            promptTokens: response.usage.promptTokens + retryResponse.usage.promptTokens,
+            completionTokens: response.usage.completionTokens + retryResponse.usage.completionTokens,
+            totalTokens: response.usage.totalTokens + retryResponse.usage.totalTokens,
+            ...(response.usage.actualCostUsd !== undefined && retryResponse.usage.actualCostUsd !== undefined
+              ? { actualCostUsd: response.usage.actualCostUsd + retryResponse.usage.actualCostUsd }
+              : {}),
+          },
+        };
+      }
     } catch (error) {
       this.log?.warn(`State validation failed: ${error}`);
       throw error;

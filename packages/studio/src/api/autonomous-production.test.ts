@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAutonomousProviderExecution, deriveAutonomousJobIdentity } from "@actalk/inkos-core";
-import { AUTONOMOUS_BUDGET_NOT_CONFIGURED, AutonomousJobRegistry, classifyStateRepairError, projectAutonomousProductionView, resolveOfflineFinalizationPlan, verifyOfflineFinalizationEvidence } from "./autonomous-production.js";
+import { AUTONOMOUS_BUDGET_NOT_CONFIGURED, AutonomousJobRegistry, classifyStateRepairError, loadCurrentTransactionUsage, projectAutonomousProductionView, resolveOfflineFinalizationPlan, verifyOfflineFinalizationEvidence } from "./autonomous-production.js";
 
 const map = {
   schemaVersion: "1.0" as const,
@@ -28,6 +28,62 @@ const catalog = [
 ];
 
 describe("autonomous production Studio projection", () => {
+  it("keeps current-attempt telemetry available and reports a malformed artifact warning", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-usage-integrity-"));
+    try {
+      const dir = join(root, "books", "book", "story", "runtime", "bounded-autonomous", "provider-responses");
+      await mkdir(dir, { recursive: true });
+      const logicalStepId = `provider-step-${"a".repeat(64)}`;
+      await writeFile(join(dir, `${logicalStepId}.json`), JSON.stringify({
+        transaction_id: "chapter-txn-test", response_artifact_status: "COMPLETE",
+        logical_step_id: logicalStepId, role: "writer",
+        response: { usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 } },
+      }));
+      await writeFile(join(dir, "broken.json"), "{not-json");
+      await writeFile(join(dir, "wrong-name.json"), JSON.stringify({
+        transaction_id: "chapter-txn-test", response_artifact_status: "COMPLETE",
+        logical_step_id: `provider-step-${"b".repeat(64)}`, role: "writer",
+        response: { usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } },
+      }));
+      await writeFile(join(dir, "bad-tokens.json"), JSON.stringify({
+        transaction_id: "chapter-txn-test", response_artifact_status: "COMPLETE",
+        logical_step_id: "bad-tokens", role: "writer",
+        response: { usage: { promptTokens: "bad", completionTokens: -1, totalTokens: 2 } },
+      }));
+      const usage = await loadCurrentTransactionUsage(root, "book", "chapter-txn-test");
+      expect(usage.records).toHaveLength(1);
+      expect(usage.records[0]).toMatchObject({ identity: logicalStepId, totalTokens: 15 });
+      expect(usage.integrityWarnings).toEqual(expect.arrayContaining([
+        "PROVIDER_USAGE_ARTIFACT_INVALID:broken.json",
+        "PROVIDER_USAGE_ARTIFACT_INVALID:wrong-name.json",
+        "PROVIDER_USAGE_ARTIFACT_INVALID:bad-tokens.json",
+      ]));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports 14 active transaction calls separately from six historical aggregate rows", () => {
+    const capabilities = ["planner", "story-frame-selector", "volume-map-selector", "memory-selector", "writer", "logic-canon-auditor", "commercial-reader", "reviser", "final-state-extractor", "state-validator"];
+    const view = projectAutonomousProductionView({
+      map, targetChapters: 156, nextChapter: 7,
+      chapters: Array.from({ length: 6 }, (_, index) => ({
+        number: index + 1, status: "approved",
+        roleUsage: { "legacy-total": { promptTokens: 10, completionTokens: 5, totalTokens: 15 } },
+      })),
+      config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini" } },
+      catalog, runtime: null, active: false,
+      currentAttemptUsage: Array.from({ length: 14 }, (_, index) => ({
+        identity: `provider-step-${String(index).padStart(64, "0")}`,
+        role: capabilities[index % capabilities.length]!, promptTokens: 10, completionTokens: 5, totalTokens: index === 13 ? 18 : 15,
+      })),
+    });
+
+    expect(view.economics.currentAttempt).toMatchObject({ providerCalls: 14, totalTokens: 213, tokenDiscrepancy: 3, actualCostUsd: null });
+    expect(view.economics.historicalBook.providerCalls).toBe(6);
+    expect(view.economics.currentAttempt.unknownLegacyTotal).toBe(0);
+  });
+
   it("uses Chapter Commit authority instead of stale legacy chapter/runtime recovery state", () => {
     const view = projectAutonomousProductionView({
       map, targetChapters: 156, nextChapter: 99,
@@ -454,7 +510,7 @@ describe("autonomous production Studio projection", () => {
     expect(view.economics.remainingVolumeForecast.highUsd).toBeGreaterThan(0);
     expect(view.economics.currentVolumeEstimatedTotal.highUsd!).toBeGreaterThan(view.economics.remainingVolumeForecast.highUsd!);
     expect(view.economics.fullBookForecast.highUsd!).toBeGreaterThan(view.economics.currentVolumeEstimatedTotal.highUsd!);
-    expect(view.economics.repairForecast.highUsd).toBeCloseTo(0.4288, 10);
+    expect(view.economics.repairForecast.highUsd).toBeCloseTo(0.704, 10);
     expect(view.runtimeBlockers).not.toContain("COST_GUARD_UNAVAILABLE");
     expect(view.runtimeBlockers).toContain("PENDING_STATE_REPAIR_CHAPTER_4");
   });
@@ -510,8 +566,8 @@ describe("autonomous production Studio projection", () => {
     expect(view.runtimeStatus).toBe("BLOCKED");
     expect(view.runtimeBlockers).toEqual(expect.arrayContaining([
       "PENDING_STATE_REPAIR_CHAPTER_4",
-      "LOGIC_AUDITOR_MODEL_NOT_CONFIGURED",
-      "COMMERCIAL_READER_MODEL_NOT_CONFIGURED",
+      "REVIEW_MODEL_NOT_CONFIGURED",
+      "READER_MODEL_NOT_CONFIGURED",
     ]));
   });
 

@@ -1,18 +1,28 @@
 export interface ProductionRoleSelection {
-  readonly writer: string;
-  readonly logicAuditor: string;
-  readonly commercialReader: string;
-  readonly reviser: string;
-  readonly observerReflector: string;
+  readonly production: string;
+  readonly review: string;
+  readonly reader: string;
 }
 
 export const PRODUCTION_ROLE_KEYS = [
-  "writer",
-  "logicAuditor",
-  "commercialReader",
-  "reviser",
-  "observerReflector",
+  "production",
+  "review",
+  "reader",
 ] as const;
+
+export function migrateLegacyProductionRoleSelection(selection: Partial<ProductionRoleSelection> & {
+  readonly writer?: string;
+  readonly logicAuditor?: string;
+  readonly commercialReader?: string;
+  readonly reviser?: string;
+  readonly observerReflector?: string;
+}): ProductionRoleSelection {
+  return {
+    production: selection.production ?? selection.writer ?? "",
+    review: selection.review ?? selection.logicAuditor ?? "",
+    reader: selection.reader ?? selection.commercialReader ?? "",
+  };
+}
 
 export interface ProductionModelCatalogEntry {
   readonly id: string;
@@ -71,13 +81,18 @@ export function buildProductionRoleOverrides(
   existingOverrides: Readonly<Record<string, unknown>>,
 ) {
   return {
-    defaultModel: selection.writer,
+    defaultModel: selection.production,
     modelOverrides: {
       ...existingOverrides,
-      auditor: selection.logicAuditor,
-      "commercial-reader": selection.commercialReader,
-      reviser: selection.reviser,
-      "observer-reflector": selection.observerReflector,
+      planner: selection.production,
+      composer: selection.production,
+      writer: selection.production,
+      reviser: selection.production,
+      "chapter-analyzer": selection.production,
+      "state-validator": selection.production,
+      "observer-reflector": selection.production,
+      auditor: selection.review,
+      "commercial-reader": selection.reader,
     },
   };
 }

@@ -72,6 +72,8 @@ export interface WriteChapterInput {
   readonly lengthSpec?: LengthSpec;
   readonly wordCountOverride?: number;
   readonly temperatureOverride?: number;
+  /** Formal transaction flow defers paid truth extraction until literary review selects final prose. */
+  readonly deferStateSettlement?: boolean;
 }
 
 export interface SettleChapterStateInput {
@@ -246,6 +248,33 @@ export class WriterAgent extends BaseAgent {
     // the LLM self-check may have skipped or abbreviated a row.
     if (input.chapterMemo) {
       this.verifyPreWriteCheckAlignsWithMemo(creative.preWriteCheck, chapterNumber, resolvedLanguage);
+    }
+
+    if (input.deferStateSettlement) {
+      const surfaceNormalizedContent = normalizePostWriteSurface(creative.content, resolvedLanguage);
+      const ruleViolations = [
+        ...validatePostWrite(surfaceNormalizedContent, genreProfile, bookRules, resolvedLanguage),
+        ...detectCrossChapterRepetition(surfaceNormalizedContent, fingerprintChapters, resolvedLanguage),
+        ...detectParagraphLengthDrift(surfaceNormalizedContent, fingerprintChapters, resolvedLanguage),
+      ];
+      return {
+        chapterNumber,
+        title: creative.title,
+        content: surfaceNormalizedContent,
+        wordCount: countChapterLength(surfaceNormalizedContent, resolvedLengthSpec.countingMode),
+        preWriteCheck: creative.preWriteCheck,
+        postSettlement: "",
+        updatedState: "",
+        updatedLedger: "",
+        updatedHooks: "",
+        chapterSummary: "",
+        updatedSubplots: "",
+        updatedEmotionalArcs: "",
+        updatedCharacterMatrix: "",
+        postWriteErrors: ruleViolations.filter((violation) => violation.severity === "error"),
+        postWriteWarnings: ruleViolations.filter((violation) => violation.severity === "warning"),
+        tokenUsage: creativeUsage,
+      };
     }
 
     // ── Phase 2: State settlement (temperature 0.3) ──

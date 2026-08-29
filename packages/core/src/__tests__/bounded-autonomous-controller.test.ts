@@ -423,6 +423,145 @@ describe("bounded autonomous production controller", () => {
     }
   });
 
+  it("enforces the fixed 18 logical-call budget per chapter transaction without charging COMPLETE replay", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-logical-budget-"));
+    try {
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      await mkdir(runtimeDir, { recursive: true });
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId: "job", status: "RUNNING", mode: "current-volume", nextChapter: 5,
+      }));
+      const stage = { stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId: "chapter-txn-budget" };
+      const execution = createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId: "job", getActiveStage: () => stage });
+      let transports = 0;
+      const requests = Array.from({ length: 18 }, (_, index) => ({
+        provider: "test", model: "model", inputFingerprint: index.toString(16).padStart(64, "0"),
+      }));
+      for (const request of requests) {
+        await execution.runProviderCall(5, async () => {
+          transports += 1;
+          return { content: request.inputFingerprint, usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+        }, request);
+      }
+      const replay = await execution.runProviderCall(5, async () => {
+        transports += 1;
+        throw new Error("COMPLETE replay must not use transport");
+      }, requests[0]!);
+      expect(replay.content).toBe(requests[0]!.inputFingerprint);
+
+      await expect(execution.runProviderCall(5, async () => {
+        transports += 1;
+        return { content: "over budget", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "test", model: "model", inputFingerprint: "f".repeat(64) }))
+        .rejects.toThrow("CHAPTER_LOGICAL_MODEL_CALL_LIMIT_REACHED");
+      expect(transports).toBe(18);
+      const runtime = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
+      expect(new Set(runtime.providerAttemptHistory.map((entry: { logicalStepId: string }) => entry.logicalStepId)).size).toBe(18);
+      expect(runtime.providerAttemptHistory.every((entry: { transactionId?: string }) => entry.transactionId === stage.transactionId)).toBe(true);
+
+      // COMPLETE artifacts are the durable transaction authority. A restart from
+      // pre-ceiling history that lacks transactionId must not reset admission.
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        ...runtime,
+        providerAttemptHistory: runtime.providerAttemptHistory.map(({ transactionId: _ignored, ...entry }: { transactionId?: string }) => entry),
+      }));
+      const restarted = createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId: "job", getActiveStage: () => stage });
+      await expect(restarted.runProviderCall(5, async () => {
+        transports += 1;
+        return { content: "restart must remain capped", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "test", model: "model", inputFingerprint: "e".repeat(64) }))
+        .rejects.toThrow("CHAPTER_LOGICAL_MODEL_CALL_LIMIT_REACHED");
+      expect(transports).toBe(18);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("enforces the fixed 24 transport budget per transaction and resets it for a fresh attempt", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-transport-budget-"));
+    try {
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      await mkdir(runtimeDir, { recursive: true });
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId: "job", status: "RUNNING", mode: "current-volume", nextChapter: 5,
+      }));
+      let transactionId = "chapter-txn-attempt-1";
+      const execution = createAutonomousProviderExecution({
+        projectRoot: root, bookId: "book", jobId: "job",
+        getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId }),
+      });
+      let transports = 0;
+      for (let logical = 0; logical < 8; logical += 1) {
+        const request = { provider: "test", model: "model", inputFingerprint: logical.toString(16).padStart(64, "a") };
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          await expect(execution.runProviderCall(5, async () => {
+            transports += 1;
+            throw Object.assign(new Error("HTTP 503 bounded retry"), { status: 503 });
+          }, request)).rejects.toThrow("503");
+        }
+      }
+      await expect(execution.runProviderCall(5, async () => {
+        transports += 1;
+        return { content: "must not run", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "test", model: "model", inputFingerprint: "f".repeat(64) }))
+        .rejects.toThrow("CHAPTER_PROVIDER_TRANSPORT_LIMIT_REACHED");
+      expect(transports).toBe(24);
+
+      transactionId = "chapter-txn-attempt-2";
+      const fresh = await execution.runProviderCall(5, async () => {
+        transports += 1;
+        return { content: "fresh attempt", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "test", model: "model", inputFingerprint: "f".repeat(64) });
+      expect(fresh.content).toBe("fresh attempt");
+      expect(transports).toBe(25);
+      const runtime = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
+      expect(runtime.providerAttemptHistory.filter((entry: { transactionId?: string }) => entry.transactionId === "chapter-txn-attempt-1")).toHaveLength(24);
+      expect(runtime.providerAttemptHistory.filter((entry: { transactionId?: string }) => entry.transactionId === "chapter-txn-attempt-2")).toHaveLength(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("charges pre-upgrade unbound returned failures to the active chapter transaction transport cap", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-upgrade-budget-"));
+    try {
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      await mkdir(runtimeDir, { recursive: true });
+      const transactionId = "chapter-txn-upgrade";
+      const history = Array.from({ length: 24 }, (_, index) => ({
+        transportAttemptId: `legacy-step-${Math.floor(index / 3)}:transport-attempt:${index % 3 + 1}`,
+        logicalStepId: `legacy-step-${Math.floor(index / 3)}`,
+        chapterNumber: 5,
+        role: "writer",
+        provider: "test",
+        requestedModel: "model",
+        ...(index < 21 ? { transactionId } : {}),
+        attempt: index % 3 + 1,
+        classification: "RETRYABLE_PROVIDER_HTTP",
+        transportStarted: true,
+        transportReturned: true,
+        recordedAt: "2026-08-30T00:00:00.000Z",
+      }));
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId: "job", status: "RUNNING", mode: "current-volume", nextChapter: 5,
+        chapterNumber: 5, providerAttemptHistory: history,
+      }));
+      const execution = createAutonomousProviderExecution({
+        projectRoot: root, bookId: "book", jobId: "job",
+        getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId }),
+      });
+      let transports = 0;
+      await expect(execution.runProviderCall(5, async () => {
+        transports += 1;
+        return { content: "must not run", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "test", model: "model", inputFingerprint: "d".repeat(64) }))
+        .rejects.toThrow("CHAPTER_PROVIDER_TRANSPORT_LIMIT_REACHED");
+      expect(transports).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("normalizes one provable legacy empty-response record before a truthful bounded retry", async () => {
     const root = await mkdtemp(join(tmpdir(), "inkos-provider-legacy-empty-"));
     try {
@@ -994,7 +1133,7 @@ describe("bounded autonomous production controller", () => {
       providerRecovery: { execute: async (_chapter, task) => task(), loadPersistedProgress: async () => null, now: () => 0, sleep },
     });
     expect(result).toMatchObject({
-      status: "PAUSED_DETERMINISTIC_PROVIDER_ERROR",
+      status: "PAUSED_PIPELINE_ERROR",
       checkpoint: "DETERMINISTIC_PIPELINE_ERROR",
       lastErrorClassification: "DETERMINISTIC_PIPELINE_ERROR",
     });
@@ -1071,6 +1210,65 @@ describe("bounded autonomous production controller", () => {
       const runtime = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
       expect(runtime.providerAttemptHistory).toHaveLength(2);
       expect(new Set(runtime.providerAttemptHistory.map((entry: { logicalStepId: string }) => entry.logicalStepId)).size).toBe(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves two semantically invalid state COMPLETE artifacts and repeated Resume creates no third call", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-autonomous-state-semantic-exhaustion-"));
+    try {
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      await mkdir(runtimeDir, { recursive: true });
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId: "job", status: "RUNNING", mode: "current-volume", nextChapter: 5,
+      }));
+      let role = "final-state-extractor";
+      const transactionId = "chapter-txn-semantic-state";
+      const execution = createAutonomousProviderExecution({
+        projectRoot: root, bookId: "book", jobId: "job",
+        getActiveStage: () => ({ stage: "SETTLING_STATE", role, provider: "test", model: "model", transactionId }),
+      });
+      const fingerprint = "9".repeat(64);
+      let transports = 0;
+      const first = await execution.runProviderCall(5, async () => {
+        transports += 1;
+        return { content: " ", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "test", model: "model", inputFingerprint: fingerprint });
+      const firstPath = execution.responseArtifactPath(fingerprint, "test", "model", 5);
+      const firstBytes = await readFile(firstPath);
+
+      role = "final-state-extractor-semantic-retry";
+      const second = await execution.runProviderCall(5, async () => {
+        transports += 1;
+        return { content: "\n", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "test", model: "model", inputFingerprint: fingerprint });
+      const secondPath = execution.responseArtifactPath(fingerprint, "test", "model", 5);
+      const secondBytes = await readFile(secondPath);
+
+      role = "final-state-extractor";
+      const replayedFirst = await execution.runProviderCall(5, async () => {
+        transports += 1;
+        throw new Error("Resume must not transport first semantic identity");
+      }, { provider: "test", model: "model", inputFingerprint: fingerprint });
+      role = "final-state-extractor-semantic-retry";
+      const replayedSecond = await execution.runProviderCall(5, async () => {
+        transports += 1;
+        throw new Error("Resume must not create semantic call three");
+      }, { provider: "test", model: "model", inputFingerprint: fingerprint });
+
+      expect(first.content).toBe(" ");
+      expect(second.content).toBe("\n");
+      expect(replayedFirst).toEqual(first);
+      expect(replayedSecond).toEqual(second);
+      expect(firstPath).not.toBe(secondPath);
+      expect(await readFile(firstPath)).toEqual(firstBytes);
+      expect(await readFile(secondPath)).toEqual(secondBytes);
+      expect(transports).toBe(2);
+      const runtime = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
+      expect(runtime.providerAttemptHistory).toHaveLength(2);
+      expect(new Set(runtime.providerAttemptHistory.map((entry: { logicalStepId: string }) => entry.logicalStepId)).size).toBe(2);
+      await expect(readdir(join(root, "books", "book", "story", "commits"))).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -27,6 +27,7 @@ export type AutonomousRunStatus =
   | "PAUSED_PROVIDER_UNAVAILABLE"
   | "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME"
   | "PAUSED_DETERMINISTIC_PROVIDER_ERROR"
+  | "PAUSED_PIPELINE_ERROR"
   | "BLOCKED_CRITICAL_FINDINGS"
   | "REVIEW_DECISION_CONTRADICTORY"
   | "REVIEW_EXHAUSTED"
@@ -74,6 +75,7 @@ export interface AutonomousRunProgress {
     readonly role: string;
     readonly provider: string;
     readonly requestedModel: string;
+    readonly transactionId?: string;
     readonly attempt: number;
     readonly classification: string;
     readonly transportStarted: boolean;
@@ -470,6 +472,39 @@ interface PersistedProviderResponseArtifact {
   readonly transaction_id?: string;
 }
 
+const MAX_CHAPTER_TRANSACTION_LOGICAL_CALLS = 18;
+const MAX_CHAPTER_TRANSACTION_PROVIDER_TRANSPORTS = 24;
+
+async function loadTransactionCompleteLogicalStepIds(
+  projectRoot: string,
+  bookId: string,
+  transactionId: string,
+): Promise<ReadonlySet<string>> {
+  const dir = providerResponseArtifactDir(projectRoot, bookId);
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Set();
+    throw error;
+  }
+  const ids = new Set<string>();
+  for (const name of names.filter((entry) => entry.endsWith(".json") && !entry.endsWith(".binding.json"))) {
+    try {
+      const artifact = JSON.parse(await readFile(join(dir, name), "utf-8")) as PersistedProviderResponseArtifact;
+      if (artifact.response_artifact_status === "COMPLETE"
+        && artifact.transaction_id === transactionId
+        && artifact.logical_step_id === name.slice(0, -5)) {
+        ids.add(artifact.logical_step_id);
+      }
+    } catch {
+      // Invalid artifacts are handled fail-closed by the normal replay path. They
+      // cannot contribute trusted budget authority here.
+    }
+  }
+  return ids;
+}
+
 interface CorrectedProviderArtifactBinding {
   readonly schema_version: "1.0";
   readonly binding_type: "CORRECTED_PENDING_CHAPTER_REFERENCE";
@@ -595,7 +630,7 @@ async function resolveFormalPendingChapterRecoveryEvidence(params: {
     && ownership.jobId === params.jobId
     && ownership.pendingChapterNumber === params.pendingChapterNumber
     && ownership.recoveryClass === "ORIGINAL_REVIEW_EXHAUSTED"
-    && ["RUNNING", "WAITING_PROVIDER_RETRY", "PAUSED_PROVIDER_UNAVAILABLE", "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", "PAUSED_DETERMINISTIC_PROVIDER_ERROR"].includes(runtime?.status ?? "");
+    && ["RUNNING", "WAITING_PROVIDER_RETRY", "PAUSED_PROVIDER_UNAVAILABLE", "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", "PAUSED_DETERMINISTIC_PROVIDER_ERROR", "PAUSED_PIPELINE_ERROR"].includes(runtime?.status ?? "");
   const originalRuntime = runtime?.status === "REVIEW_EXHAUSTED"
     && runtime.chapterNumber === sourceChapter
     && runtime.responseArtifactStatus === "COMPLETE";
@@ -1160,7 +1195,7 @@ async function resolvePreservedBoundedReviewResumePlan(params: {
   const ownedReentry = ownership?.kind === "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME"
     && ownership.bookId === params.bookId && ownership.jobId === params.jobId
     && ownership.pendingChapterNumber === params.pendingChapterNumber
-    && ["RUNNING", "WAITING_PROVIDER_RETRY", "PAUSED_PROVIDER_UNAVAILABLE", "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", "PAUSED_DETERMINISTIC_PROVIDER_ERROR"].includes(runtime.status);
+    && ["RUNNING", "WAITING_PROVIDER_RETRY", "PAUSED_PROVIDER_UNAVAILABLE", "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", "PAUSED_DETERMINISTIC_PROVIDER_ERROR", "PAUSED_PIPELINE_ERROR"].includes(runtime.status);
   if (!ownedReentry && runtime.status !== "REVIEW_OUTPUT_INVALID" && runtime.status !== "HELD_AFTER_TWO_REVISIONS") return null;
   if (runtime.jobId !== params.jobId) {
     throw new Error("PRESERVED_CANDIDATE_RUNTIME_IDENTITY_MISMATCH");
@@ -1399,6 +1434,7 @@ async function resolveFormalPendingChapterRecoveryPlanUnsafe(params: {
       "PAUSED_PROVIDER_UNAVAILABLE",
       "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME",
       "PAUSED_DETERMINISTIC_PROVIDER_ERROR",
+      "PAUSED_PIPELINE_ERROR",
     ].includes(runtime?.status ?? "");
   const recoveryClass = runtime?.status === "REVIEW_EXHAUSTED"
     ? "ORIGINAL_REVIEW_EXHAUSTED" as const
@@ -1863,6 +1899,7 @@ export function createAutonomousProviderExecution(params: {
         role: identity.role,
         provider: identity.provider,
         requestedModel: identity.model,
+        ...(identity.transactionId ? { transactionId: identity.transactionId } : {}),
         attempt,
         classification: "SUCCESS",
         transportStarted: true,
@@ -2031,12 +2068,38 @@ export function createAutonomousProviderExecution(params: {
         transportStarted: true, transportReturned: false,
       });
     }
+    if (identity.transactionId) {
+      const completeLogicalStepIds = await loadTransactionCompleteLogicalStepIds(
+        params.projectRoot,
+        params.bookId,
+        identity.transactionId,
+      );
+      const transactionHistory = history.filter((entry) => entry.transactionId === identity.transactionId
+        || completeLogicalStepIds.has(entry.logicalStepId)
+        // Pre-ceiling runtime rows have no transactionId. The active runtime is
+        // chapter-scoped, so conservatively charge unbound rows for this chapter
+        // rather than allowing already-spent transports to disappear on upgrade.
+        || (entry.transactionId === undefined && entry.chapterNumber === activeChapter));
+      const admittedLogicalCalls = new Set([
+        ...completeLogicalStepIds,
+        ...transactionHistory.map((entry) => entry.logicalStepId),
+      ]);
+      if (!admittedLogicalCalls.has(identity.logicalStepId)
+        && admittedLogicalCalls.size >= MAX_CHAPTER_TRANSACTION_LOGICAL_CALLS) {
+        throw new Error("CHAPTER_LOGICAL_MODEL_CALL_LIMIT_REACHED");
+      }
+      if (transactionHistory.filter((entry) => entry.transportStarted).length
+        >= MAX_CHAPTER_TRANSACTION_PROVIDER_TRANSPORTS) {
+        throw new Error("CHAPTER_PROVIDER_TRANSPORT_LIMIT_REACHED");
+      }
+    }
     const attempt = Math.max(0, ...history.filter((entry) => entry.logicalStepId === identity.logicalStepId).map((entry) => entry.attempt)) + 1;
     if (attempt > 3) throw new Error("PROVIDER_RETRY_EXHAUSTED");
     const transportAttemptId = `${identity.logicalStepId}:transport-attempt:${attempt}`;
     history.push({
       transportAttemptId, logicalStepId: identity.logicalStepId, chapterNumber: activeChapter, role: identity.role,
       provider: identity.provider, requestedModel: identity.model, attempt, classification: "TRANSPORT_STARTED",
+      ...(identity.transactionId ? { transactionId: identity.transactionId } : {}),
       transportStarted: true, transportReturned: false, recordedAt: new Date(params.now?.() ?? Date.now()).toISOString(),
     });
     await saveAutonomousProductionState(params.projectRoot, params.bookId, {
@@ -2399,7 +2462,7 @@ export async function runBoundedAutonomousScope(params: {
         if (!params.providerRecovery) throw error;
         if (!(error instanceof LLMCallExecutionError)) {
           const paused = project(
-            "PAUSED_DETERMINISTIC_PROVIDER_ERROR",
+            "PAUSED_PIPELINE_ERROR",
             durableNextChapter,
             error instanceof Error ? error.message : String(error),
             {
