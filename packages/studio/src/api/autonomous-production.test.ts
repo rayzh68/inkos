@@ -52,7 +52,18 @@ describe("autonomous production Studio projection", () => {
     expect(view.runtimeBlockers).not.toContain("CHAPTER_CURSOR_INTEGRITY_MISMATCH");
     expect(view.runtimeBlockers).not.toContain("STATE_REBASELINE_VALIDATION_FAILED");
     expect(view.chapterTransaction).toMatchObject({ state: "STAGING", latestChapter: 4, nextChapter: 5, currentStage: "LOGIC_REVIEW" });
+    expect(view.chapterTransaction?.canAbandonAttempt).toBe(true);
     expect(view.finalReviewRecovery).toBeUndefined();
+  });
+
+  it.each(["NOT_STARTED", "COMMITTED"] as const)("does not project abandon for %s authority", (state) => {
+    const view = projectAutonomousProductionView({
+      map, targetChapters: 156, nextChapter: 5, chapters: [],
+      config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini", reviser: "gpt", "observer-reflector": "flash" } },
+      catalog, runtime: null, active: false,
+      transactionAuthority: { state, latestChapter: state === "COMMITTED" ? 5 : 4, nextChapter: state === "COMMITTED" ? 6 : 5, latestAuthoritySha256: "a".repeat(64) },
+    });
+    expect(view.chapterTransaction?.canAbandonAttempt).toBe(false);
   });
 
   it("projects an unindexed preserved candidate as resumable without prose regeneration", () => {

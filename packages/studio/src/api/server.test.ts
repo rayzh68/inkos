@@ -356,6 +356,8 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
     reconcileChapterProjections: actual.reconcileChapterProjections,
     createAutonomousProviderExecution: actual.createAutonomousProviderExecution,
     createChapterGenesis: actual.createChapterGenesis,
+    beginChapterTransaction: actual.beginChapterTransaction,
+    abandonChapterTransactionAttempt: actual.abandonChapterTransactionAttempt,
     resolveFormalPendingChapterRecoveryPlan: resolveFormalPendingChapterRecoveryPlanMock,
     claimAutonomousJob: actual.claimAutonomousJob,
     deriveAutonomousJobIdentity: actual.deriveAutonomousJobIdentity,
@@ -6631,6 +6633,47 @@ describe("createStudioServer daemon lifecycle", () => {
       const runtime = JSON.parse(await readFile(join(root, "books", "demo-book", "story", "runtime", "bounded-autonomous", "production-state.json"), "utf-8"));
       expect(runtime.repairOutcome.status).toBe("STATE_REPAIRED");
     });
+  });
+
+  it("abandons the active transaction attempt without starting Provider work and leaves the same chapter ready", async () => {
+    const bookDir = join(root, "books", "demo-book");
+    await rm(join(bookDir, "chapters", "0003_Demo.md"), { force: true });
+    await mkdir(join(bookDir, "story", "snapshots", "4", "state"), { recursive: true });
+    await mkdir(join(bookDir, "story", "outline"), { recursive: true });
+    for (const chapter of [1, 2, 3, 4]) await writeFile(join(bookDir, "chapters", `${String(chapter).padStart(4, "0")}_Legacy.md`), `legacy ${chapter}`);
+    await writeFile(join(bookDir, "chapters", "index.json"), JSON.stringify([1, 2, 3, 4].map((number) => ({ number, title: `Chapter ${number}`, status: "approved" }))));
+    await writeFile(join(bookDir, "story", "snapshots", "4", "current_state.md"), "state 4");
+    await writeFile(join(bookDir, "story", "snapshots", "4", "state", "manifest.json"), JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 4 }));
+    await writeFile(join(bookDir, "story", "outline", "book-production-map.json"), JSON.stringify({
+      schema_version: "1.0", book_id: "demo-book", authority_book_id: "authority", title: "Demo", total_chapters: 6,
+      volumes: [{ volume_id: "volume-001", volume_number: 1, title: "One", start_chapter: 1, end_chapter: 6, chapter_count: 6 }],
+    }));
+    const { beginChapterTransaction, createChapterGenesis, inspectChapterAuthority } = await import("@actalk/inkos-core");
+    await createChapterGenesis({ bookDir, bookId: "demo-book", lastTrustedChapter: 4, trustedSnapshotDir: join(bookDir, "story", "snapshots", "4") });
+    const transaction = await beginChapterTransaction({ bookDir, bookId: "demo-book", chapterNumber: 5, productionAuthority: "blueprint:v1" });
+    const runtimeDir = join(bookDir, "story", "runtime", "bounded-autonomous");
+    await mkdir(runtimeDir, { recursive: true });
+    await writeFile(join(runtimeDir, "production-state.json"), `${JSON.stringify({
+      jobId: "old-job", status: "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", mode: "current-volume", nextChapter: 5,
+      chapterNumber: 5, phase: "LOGIC_REVIEW", logicalStepId: "old-logical-step", providerAttemptHistory: [{ attempt: 1 }],
+    })}\n`);
+    loadBookConfigMock.mockResolvedValue({ id: "demo-book", title: "Demo", genre: "urban", targetChapters: 6 });
+    loadChapterIndexMock.mockResolvedValue([1, 2, 3, 4].map((number) => ({ number, title: `Chapter ${number}`, status: "approved", wordCount: 1, auditIssues: [], lengthWarnings: [] })));
+    getNextChapterNumberMock.mockResolvedValue(5);
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+    const response = await app.request("http://localhost/api/v1/books/demo-book/autonomous-production/abandon-attempt", { method: "POST" });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: "READY_TO_REWRITE_SAME_CHAPTER", nextChapter: 5, abandonedTransactionId: transaction.transactionId });
+    expect(await inspectChapterAuthority({ bookDir })).toMatchObject({ state: "NOT_STARTED", latestChapter: 4, nextChapter: 5 });
+    const resetRuntime = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
+    expect(resetRuntime).toMatchObject({ status: "READY_TO_REWRITE_SAME_CHAPTER", nextChapter: 5, responseArtifactStatus: "NONE" });
+    expect(resetRuntime).not.toHaveProperty("jobId");
+    expect(resetRuntime).not.toHaveProperty("logicalStepId");
+    expect(resetRuntime).not.toHaveProperty("providerAttemptHistory");
+    expect(writeNextChapterMock).not.toHaveBeenCalled();
+    expect(createLLMClientMock).not.toHaveBeenCalled();
   });
 
   it("routes one Studio start through the shared Core controller, reuses an audit-failed draft, and persists the dynamic-volume checkpoint", async () => {

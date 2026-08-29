@@ -83,6 +83,22 @@ export interface ChapterTransactionRecord {
   readonly productionAuthority: string;
   readonly state: "STAGING";
   readonly createdAt: string;
+  /** Legacy single-directory transactions are attempt 1 when this field is absent. */
+  readonly attemptNumber?: number;
+}
+
+export interface ChapterAttemptAbandonment {
+  readonly schemaVersion: 1;
+  readonly kind: "CHAPTER_ATTEMPT_ABANDONMENT";
+  readonly transactionId: string;
+  readonly bookId: string;
+  readonly chapterNumber: number;
+  readonly attemptNumber: number;
+  readonly previousAuthoritySha256: string;
+  readonly reason: "OPERATOR_DISCARDED_STAGING_ATTEMPT";
+  readonly abandonedBy: "operator/product-action";
+  readonly runtimeSnapshotSha256: string;
+  readonly abandonedAt: string;
 }
 
 export interface ChapterCommit {
@@ -145,6 +161,13 @@ function transactionRoot(bookDir: string, chapterNumber: number): string {
   return join(bookDir, "story", "runtime", "chapter-transactions", `chapter-${String(chapterNumber).padStart(4, "0")}`);
 }
 
+function transactionAttemptRoot(bookDir: string, chapterNumber: number, attemptNumber: number): string {
+  const chapterRoot = transactionRoot(bookDir, chapterNumber);
+  return attemptNumber === 1
+    ? chapterRoot
+    : join(chapterRoot, "attempts", `attempt-${String(attemptNumber).padStart(4, "0")}`);
+}
+
 function commitRoot(bookDir: string, chapterNumber: number): string {
   return join(authorityRoot(bookDir), `chapter-${String(chapterNumber).padStart(4, "0")}`);
 }
@@ -188,6 +211,15 @@ async function writeJsonExclusive(path: string, value: unknown): Promise<void> {
     if (await exists(path) && await readFile(path, "utf-8") === content) return;
     throw error;
   }
+}
+
+async function writeBytesExclusive(path: string, content: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  if (await exists(path)) {
+    if (await readFile(path, "utf-8") === content) return;
+    throw new Error(`Immutable authority conflict at ${path}`);
+  }
+  await writeFile(path, content, { encoding: "utf-8", flag: "wx" });
 }
 
 async function readJson<T>(path: string): Promise<T> {
@@ -334,13 +366,28 @@ export async function beginChapterTransaction(input: {
 }): Promise<ChapterTransactionHandle> {
   const authority = await inspectChapterAuthority({ bookDir: input.bookDir });
   if (authority.bookId !== input.bookId || authority.nextChapter !== input.chapterNumber) throw new Error("Chapter transaction does not match authoritative next chapter");
-  const transactionId = `chapter-txn-${sha256(canonical({ bookId: input.bookId, chapterNumber: input.chapterNumber, previousAuthoritySha256: authority.latestAuthoritySha256, productionAuthority: input.productionAuthority })).slice(0, 40)}`;
-  const root = transactionRoot(input.bookDir, input.chapterNumber);
+  if (authority.activeTransactionId) {
+    const active = await findTransaction(input.bookDir, authority.activeTransactionId);
+    if (active.record.bookId !== input.bookId || active.record.chapterNumber !== input.chapterNumber
+      || active.record.previousAuthoritySha256 !== authority.latestAuthoritySha256
+      || active.record.productionAuthority !== input.productionAuthority) {
+      throw new Error("Existing chapter transaction authority mismatch");
+    }
+    return transactionHandle(active);
+  }
+  const attempts = await listChapterTransactions(input.bookDir, input.chapterNumber);
+  const attemptNumber = attempts.reduce((maximum, attempt) => Math.max(maximum, attempt.attemptNumber), 0) + 1;
+  const transactionIdentity = attemptNumber === 1
+    ? { bookId: input.bookId, chapterNumber: input.chapterNumber, previousAuthoritySha256: authority.latestAuthoritySha256, productionAuthority: input.productionAuthority }
+    : { schemaVersion: 2, bookId: input.bookId, chapterNumber: input.chapterNumber, previousAuthoritySha256: authority.latestAuthoritySha256, productionAuthority: input.productionAuthority, attemptNumber };
+  const transactionId = `chapter-txn-${sha256(canonical(transactionIdentity)).slice(0, 40)}`;
+  const root = transactionAttemptRoot(input.bookDir, input.chapterNumber, attemptNumber);
   const path = join(root, "transaction.json");
   const expected: ChapterTransactionRecord = {
     schemaVersion: 1, kind: "CHAPTER_TRANSACTION", transactionId, bookId: input.bookId,
     chapterNumber: input.chapterNumber, previousAuthoritySha256: authority.latestAuthoritySha256,
     productionAuthority: input.productionAuthority, state: "STAGING", createdAt: input.createdAt ?? new Date().toISOString(),
+    ...(attemptNumber > 1 ? { attemptNumber } : {}),
   };
   let transaction: ChapterTransactionRecord;
   if (await exists(path)) {
@@ -357,7 +404,23 @@ export async function beginChapterTransaction(input: {
     await writeJsonExclusive(path, expected);
     transaction = expected;
   }
-  return { ...transaction, completedOperations: await completedOperations(root), hash: sha256 };
+  return transactionHandle({ record: transaction, root, attemptNumber, abandoned: false });
+}
+
+interface LocatedChapterTransaction {
+  readonly record: ChapterTransactionRecord;
+  readonly root: string;
+  readonly attemptNumber: number;
+  readonly abandoned: boolean;
+}
+
+async function transactionHandle(transaction: LocatedChapterTransaction): Promise<ChapterTransactionHandle> {
+  return {
+    ...transaction.record,
+    attemptNumber: transaction.attemptNumber,
+    completedOperations: await completedOperations(transaction.root),
+    hash: sha256,
+  };
 }
 
 export async function recordChapterTransactionOperation(input: {
@@ -374,13 +437,13 @@ export async function recordChapterTransactionOperation(input: {
     schemaVersion: 1,
     transactionId: input.transactionId,
     logicalOperationId: input.logicalOperationId,
-    chapterNumber: transaction.chapterNumber,
+    chapterNumber: transaction.record.chapterNumber,
     stage: input.stage,
     inputFingerprint: input.inputFingerprint,
     responseArtifactStatus: input.responseArtifactStatus,
     responseSha256: input.responseSha256,
   };
-  const path = join(transactionRoot(input.bookDir, transaction.chapterNumber), "operations", `${sha256(input.logicalOperationId)}.json`);
+  const path = join(transaction.root, "operations", `${sha256(input.logicalOperationId)}.json`);
   try {
     await writeJsonExclusive(path, record);
   } catch (error) {
@@ -397,7 +460,7 @@ export async function recordChapterTransactionCandidate(input: {
 }): Promise<void> {
   const transaction = await findTransaction(input.bookDir, input.transactionId);
   if (sha256(input.content) !== input.sha256) throw new Error("Staged candidate hash mismatch");
-  const root = join(transactionRoot(input.bookDir, transaction.chapterNumber), "staging", "evidence", "candidates");
+  const root = join(transaction.root, "staging", "evidence", "candidates");
   const target = join(root, input.label);
   const bodyPath = join(target, "body.md");
   const metadataPath = join(target, "metadata.json");
@@ -439,13 +502,13 @@ export async function recordChapterTransactionReviewEvidence(input: {
   const reviewer = input.reviewerRole.replace(/[^a-z0-9-]/giu, "-").toLowerCase();
   const evidenceSha256 = sha256(canonical(input.evidence));
   const path = join(
-    transactionRoot(input.bookDir, transaction.chapterNumber),
+    transaction.root,
     "staging", "evidence", "reviews", input.candidateSha256, reviewer, `${evidenceSha256}.json`,
   );
   const record = {
     schemaVersion: 1,
     transactionId: input.transactionId,
-    chapterNumber: transaction.chapterNumber,
+    chapterNumber: transaction.record.chapterNumber,
     candidateSha256: input.candidateSha256,
     reviewerRole: input.reviewerRole,
     evidenceSha256,
@@ -462,11 +525,11 @@ export async function recordChapterTransactionReviewResult(input: {
   readonly result: unknown;
 }): Promise<string> {
   const transaction = await findTransaction(input.bookDir, input.transactionId);
-  const path = join(transactionRoot(input.bookDir, transaction.chapterNumber), "staging", "evidence", "review-result.json");
+  const path = join(transaction.root, "staging", "evidence", "review-result.json");
   const record = {
     schemaVersion: 1,
     transactionId: input.transactionId,
-    chapterNumber: transaction.chapterNumber,
+    chapterNumber: transaction.record.chapterNumber,
     result: input.result,
   };
   try { await writeJsonExclusive(path, record); }
@@ -474,14 +537,89 @@ export async function recordChapterTransactionReviewResult(input: {
   return path;
 }
 
-async function findTransaction(bookDir: string, transactionId: string): Promise<ChapterTransactionRecord> {
+async function listChapterTransactions(bookDir: string, chapterNumber: number): Promise<ReadonlyArray<LocatedChapterTransaction>> {
+  const chapterRoot = transactionRoot(bookDir, chapterNumber);
+  const roots = [chapterRoot];
+  const attemptsRoot = join(chapterRoot, "attempts");
+  for (const entry of await readdir(attemptsRoot, { withFileTypes: true }).catch(() => [])) {
+    if (entry.isDirectory() && /^attempt-\d+$/u.test(entry.name)) roots.push(join(attemptsRoot, entry.name));
+  }
+  const output: LocatedChapterTransaction[] = [];
+  for (const root of roots) {
+    const record = await readJson<ChapterTransactionRecord>(join(root, "transaction.json")).catch(() => null);
+    if (!record) {
+      if (await exists(join(root, "abandonment.json"))) throw new Error("CHAPTER_ATTEMPT_ABANDONMENT_AUTHORITY_MISMATCH");
+      continue;
+    }
+    const encodedAttempt = Number(basename(root).match(/^attempt-(\d+)$/u)?.[1] ?? 1);
+    const attemptNumber = record.attemptNumber ?? encodedAttempt;
+    if (!Number.isInteger(attemptNumber) || attemptNumber < 1 || (record.attemptNumber !== undefined && record.attemptNumber !== encodedAttempt)) {
+      throw new Error("Chapter transaction attempt identity mismatch");
+    }
+    const abandonmentPath = join(root, "abandonment.json");
+    let abandoned = false;
+    if (await exists(abandonmentPath)) {
+      const abandonment = await readJson<ChapterAttemptAbandonment>(abandonmentPath);
+      const runtimeSnapshot = await readFile(join(root, "runtime-at-abandon.json"));
+      if (abandonment.schemaVersion !== 1 || abandonment.kind !== "CHAPTER_ATTEMPT_ABANDONMENT"
+        || abandonment.transactionId !== record.transactionId || abandonment.bookId !== record.bookId
+        || abandonment.chapterNumber !== record.chapterNumber || abandonment.attemptNumber !== attemptNumber
+        || abandonment.previousAuthoritySha256 !== record.previousAuthoritySha256
+        || abandonment.reason !== "OPERATOR_DISCARDED_STAGING_ATTEMPT" || abandonment.abandonedBy !== "operator/product-action"
+        || abandonment.runtimeSnapshotSha256 !== sha256(runtimeSnapshot)) {
+        throw new Error("CHAPTER_ATTEMPT_ABANDONMENT_AUTHORITY_MISMATCH");
+      }
+      abandoned = true;
+    }
+    output.push({ record, root, attemptNumber, abandoned });
+  }
+  return output.sort((left, right) => left.attemptNumber - right.attemptNumber);
+}
+
+async function findTransaction(bookDir: string, transactionId: string, options?: { readonly allowAbandoned?: boolean }): Promise<LocatedChapterTransaction> {
   const base = join(bookDir, "story", "runtime", "chapter-transactions");
-  for (const entry of await readdir(base).catch(() => [])) {
-    const path = join(base, entry, "transaction.json");
-    const transaction = await readJson<ChapterTransactionRecord>(path).catch(() => null);
-    if (transaction?.transactionId === transactionId) return transaction;
+  for (const entry of await readdir(base, { withFileTypes: true }).catch(() => [])) {
+    if (!entry.isDirectory() || !/^chapter-\d+$/u.test(entry.name)) continue;
+    const chapterNumber = Number(entry.name.slice("chapter-".length));
+    for (const transaction of await listChapterTransactions(bookDir, chapterNumber)) {
+      if (transaction.record.transactionId !== transactionId) continue;
+      if (transaction.abandoned && !options?.allowAbandoned) throw new Error("CHAPTER_ATTEMPT_ABANDONED");
+      return transaction;
+    }
   }
   throw new Error(`Unknown chapter transaction: ${transactionId}`);
+}
+
+export async function abandonChapterTransactionAttempt(input: {
+  readonly bookDir: string;
+  readonly bookId: string;
+  readonly chapterNumber: number;
+  readonly transactionId: string;
+  readonly runtimeSnapshot: string;
+  readonly abandonedAt?: string;
+}): Promise<ChapterAttemptAbandonment> {
+  if (await exists(join(commitRoot(input.bookDir, input.chapterNumber), "commit.json"))) throw new Error("CHAPTER_ALREADY_COMMITTED");
+  const authority = await inspectChapterAuthority({ bookDir: input.bookDir });
+  if (authority.bookId !== input.bookId || input.chapterNumber <= authority.latestChapter) throw new Error("CHAPTER_ATTEMPT_ABANDON_NOT_ALLOWED");
+  if (authority.activeTransactionId !== input.transactionId || authority.nextChapter !== input.chapterNumber) throw new Error("CHAPTER_ATTEMPT_ABANDON_NOT_ACTIVE");
+  const transaction = await findTransaction(input.bookDir, input.transactionId, { allowAbandoned: true });
+  const runtimeSnapshotSha256 = sha256(input.runtimeSnapshot);
+  const abandonment: ChapterAttemptAbandonment = {
+    schemaVersion: 1,
+    kind: "CHAPTER_ATTEMPT_ABANDONMENT",
+    transactionId: transaction.record.transactionId,
+    bookId: transaction.record.bookId,
+    chapterNumber: transaction.record.chapterNumber,
+    attemptNumber: transaction.attemptNumber,
+    previousAuthoritySha256: transaction.record.previousAuthoritySha256,
+    reason: "OPERATOR_DISCARDED_STAGING_ATTEMPT",
+    abandonedBy: "operator/product-action",
+    runtimeSnapshotSha256,
+    abandonedAt: input.abandonedAt ?? new Date().toISOString(),
+  };
+  await writeBytesExclusive(join(transaction.root, "runtime-at-abandon.json"), input.runtimeSnapshot);
+  await writeJsonExclusive(join(transaction.root, "abandonment.json"), abandonment);
+  return abandonment;
 }
 
 export function resolveChapterProviderOperation(input: {
@@ -597,14 +735,14 @@ export async function stageChapterCommitCandidate(input: {
   if (!input.body.trim()) throw new Error("Chapter commit body is empty");
   if (isOutsideHardRange(finalLengthCount, input.lengthSpec)) throw new Error("Chapter commit candidate is outside hard range");
   validateReviewAuthority(input.review, bodySha);
-  validateStateValidationAuthority(input.stateValidation, transaction.chapterNumber, bodySha, transaction.previousAuthoritySha256);
+  validateStateValidationAuthority(input.stateValidation, transaction.record.chapterNumber, bodySha, transaction.record.previousAuthoritySha256);
   const stateManifest = input.stateFiles["manifest.json"];
   const snapshotManifest = input.snapshotFiles["state/manifest.json"];
   if (typeof stateManifest !== "string" || typeof snapshotManifest !== "string") throw new Error("State and snapshot manifests are required");
-  parseStateManifest(stateManifest, transaction.chapterNumber, bodySha, transaction.previousAuthoritySha256, "State");
-  parseStateManifest(snapshotManifest, transaction.chapterNumber, bodySha, transaction.previousAuthoritySha256, "Snapshot");
+  parseStateManifest(stateManifest, transaction.record.chapterNumber, bodySha, transaction.record.previousAuthoritySha256, "State");
+  parseStateManifest(snapshotManifest, transaction.record.chapterNumber, bodySha, transaction.record.previousAuthoritySha256, "Snapshot");
   if (input.providerReferences.length === 0) throw new Error("Chapter commit requires Provider operation authority");
-  for (const reference of input.providerReferences) await verifyProviderReference(input.bookDir, transaction, reference);
+  for (const reference of input.providerReferences) await verifyProviderReference(input.bookDir, transaction.record, reference);
   for (const reviewer of input.review.reviewerEvidence) {
     const acceptedRoles = reviewer.reviewerRole === "logic-canon-auditor" ? ["logic-canon-auditor", "auditor"] : ["commercial-reader"];
     if (!input.providerReferences.some((reference) => acceptedRoles.includes(reference.role)
@@ -613,7 +751,7 @@ export async function stageChapterCommitCandidate(input: {
     }
   }
 
-  const root = join(transactionRoot(input.bookDir, transaction.chapterNumber), "staging", "bundle");
+  const root = join(transaction.root, "staging", "bundle");
   const reviewText = `${JSON.stringify(input.review, null, 2)}\n`;
   const usageText = `${JSON.stringify(input.usage, null, 2)}\n`;
   const stateValidationText = `${JSON.stringify(input.stateValidation, null, 2)}\n`;
@@ -628,7 +766,7 @@ export async function stageChapterCommitCandidate(input: {
   const expectedSnapshotFiles = inMemoryEntries(input.snapshotFiles);
   if (await exists(root)) {
     let existing: ChapterCommit | null = null;
-    try { existing = await verifyBundle(root, transaction.chapterNumber); }
+    try { existing = await verifyBundle(root, transaction.record.chapterNumber); }
     catch (error) {
       let marker: unknown;
       try { marker = await readJson(join(root, "commit.json")); } catch { marker = null; }
@@ -636,7 +774,7 @@ export async function stageChapterCommitCandidate(input: {
       await rm(root, { recursive: true, force: true });
     }
     if (existing) {
-    if (existing.transactionId === transaction.transactionId
+    if (existing.transactionId === transaction.record.transactionId
       && existing.chapterTitle === input.title
       && existing.language === (input.language ?? "en")
       && existing.finalBodySha256 === bodySha
@@ -667,21 +805,21 @@ export async function stageChapterCommitCandidate(input: {
   const stateFiles = await writeTree(join(tempRoot, "state"), input.stateFiles);
   const snapshotFiles = await writeTree(join(tempRoot, "snapshot"), input.snapshotFiles);
   const unsigned = {
-    schemaVersion: 1 as const, kind: "CHAPTER_COMMIT" as const, bookId: transaction.bookId,
-    chapterNumber: transaction.chapterNumber, chapterTitle: input.title, language: input.language ?? "en", transactionId: transaction.transactionId,
-    productionAuthority: transaction.productionAuthority,
-    previousAuthoritySha256: transaction.previousAuthoritySha256, finalBodySha256: bodySha, finalLengthCount,
+    schemaVersion: 1 as const, kind: "CHAPTER_COMMIT" as const, bookId: transaction.record.bookId,
+    chapterNumber: transaction.record.chapterNumber, chapterTitle: input.title, language: input.language ?? "en", transactionId: transaction.record.transactionId,
+    productionAuthority: transaction.record.productionAuthority,
+    previousAuthoritySha256: transaction.record.previousAuthoritySha256, finalBodySha256: bodySha, finalLengthCount,
     lengthSpec: input.lengthSpec, boundedReviewStatus: input.review.status, revisionCount: input.review.revisionCount,
     reviewEvidenceSha256: sha256(reviewText), finalCandidateSha256: bodySha,
     stateManifestSha256: sha256(stateManifest), snapshotManifestSha256: sha256(snapshotManifest), stateValidationSha256: sha256(stateValidationText),
     stateTreeSha256: treeSha(stateFiles), snapshotTreeSha256: treeSha(snapshotFiles), stateFiles, snapshotFiles,
     usageSha256: sha256(usageText), providerReferencesSha256: sha256(providerText), providerReferenceCount: input.providerReferences.length,
-    createdAt: transaction.createdAt, completedAt: input.completedAt,
+    createdAt: transaction.record.createdAt, completedAt: input.completedAt,
   };
   const commit: ChapterCommit = { ...unsigned, commitSha256: sha256(canonical(unsigned)) };
   await writeFile(join(tempRoot, "commit.json"), `${JSON.stringify(commit, null, 2)}\n`, "utf-8");
   try {
-    await verifyBundle(tempRoot, transaction.chapterNumber);
+    await verifyBundle(tempRoot, transaction.record.chapterNumber);
     await rename(tempRoot, root);
   } catch (error) {
     await rm(tempRoot, { recursive: true, force: true });
@@ -691,18 +829,18 @@ export async function stageChapterCommitCandidate(input: {
 
 export async function finalizeChapterTransaction(input: { readonly bookDir: string; readonly transactionId: string }): Promise<ChapterCommit> {
   const transaction = await findTransaction(input.bookDir, input.transactionId);
-  const source = join(transactionRoot(input.bookDir, transaction.chapterNumber), "staging", "bundle");
-  const target = commitRoot(input.bookDir, transaction.chapterNumber);
-  await verifyBundle(source, transaction.chapterNumber);
+  const source = join(transaction.root, "staging", "bundle");
+  const target = commitRoot(input.bookDir, transaction.record.chapterNumber);
+  await verifyBundle(source, transaction.record.chapterNumber);
   if (await exists(target)) {
-    const existing = await verifyChapterCommit({ bookDir: input.bookDir, chapterNumber: transaction.chapterNumber });
+    const existing = await verifyChapterCommit({ bookDir: input.bookDir, chapterNumber: transaction.record.chapterNumber });
     const staged = await readJson<ChapterCommit>(join(source, "commit.json"));
     if (existing.commitSha256 !== staged.commitSha256) throw new Error("Immutable chapter commit conflict");
     return existing;
   }
   await mkdir(dirname(target), { recursive: true });
   await rename(source, target);
-  return verifyChapterCommit({ bookDir: input.bookDir, chapterNumber: transaction.chapterNumber });
+  return verifyChapterCommit({ bookDir: input.bookDir, chapterNumber: transaction.record.chapterNumber });
 }
 
 async function verifyBundle(root: string, chapterNumber: number): Promise<ChapterCommit> {
@@ -788,8 +926,10 @@ export async function verifyChapterCommitChain(input: { readonly bookDir: string
 
 export async function inspectChapterAuthority(input: { readonly bookDir: string }): Promise<{ readonly bookId: string; readonly state: ChapterAuthorityState; readonly latestChapter: number; readonly nextChapter: number; readonly latestAuthoritySha256: string; readonly activeTransactionId?: string }> {
   const chain = await verifyChapterCommitChain(input);
-  const root = transactionRoot(input.bookDir, chain.latestChapter + 1);
-  const transaction = await readJson<ChapterTransactionRecord>(join(root, "transaction.json")).catch(() => null);
+  const transactions = await listChapterTransactions(input.bookDir, chain.latestChapter + 1);
+  const active = transactions.filter((transaction) => !transaction.abandoned);
+  if (active.length > 1) throw new Error("MULTIPLE_ACTIVE_CHAPTER_ATTEMPTS");
+  const transaction = active[0]?.record;
   return {
     bookId: chain.bookId, state: transaction ? "STAGING" : chain.commits.length > 0 ? "COMMITTED" : "NOT_STARTED",
     latestChapter: chain.latestChapter, nextChapter: chain.latestChapter + 1, latestAuthoritySha256: chain.latestAuthoritySha256,
@@ -904,8 +1044,8 @@ export async function assertChapterWriterStartAllowed(input: { readonly bookDir:
   if (chain.latestChapter + 1 !== input.chapterNumber) throw new Error("CHAPTER_TRANSACTION_WRITER_START_AUTHORITY_MISMATCH");
 }
 
-export function chapterTransactionStagingBookDir(bookDir: string, chapterNumber: number): string {
-  return join(transactionRoot(bookDir, chapterNumber), "staging", "book");
+export function chapterTransactionStagingBookDir(bookDir: string, chapterNumber: number, attemptNumber = 1): string {
+  return join(transactionAttemptRoot(bookDir, chapterNumber, attemptNumber), "staging", "book");
 }
 
 async function projectionStateFiles(stagingBookDir: string): Promise<Record<string, string | Uint8Array>> {
@@ -971,7 +1111,7 @@ export async function stageChapterCommitFromProjection(input: {
     const raw = files[path];
     if (!raw) throw new Error(`${label} manifest is missing from staging`);
     const manifest = JSON.parse(Buffer.from(raw).toString("utf-8")) as Record<string, unknown>;
-    files[path] = JSON.stringify({ ...manifest, candidateSha256: candidateSha, previousAuthoritySha256: transaction.previousAuthoritySha256 }, null, 2);
+    files[path] = JSON.stringify({ ...manifest, candidateSha256: candidateSha, previousAuthoritySha256: transaction.record.previousAuthoritySha256 }, null, 2);
   };
   const transaction = await findTransaction(input.bookDir, input.transactionId);
   bindManifest(stateFiles, "manifest.json", "State");
@@ -981,7 +1121,7 @@ export async function stageChapterCommitFromProjection(input: {
     ...input.stateValidation,
     chapterNumber: input.chapterNumber,
     finalCandidateSha256: candidateSha,
-    previousAuthoritySha256: transaction.previousAuthoritySha256,
+    previousAuthoritySha256: transaction.record.previousAuthoritySha256,
   };
   await stageChapterCommitCandidate({
     bookDir: input.bookDir, transactionId: input.transactionId, title: input.title, language: input.language, body: input.body,
