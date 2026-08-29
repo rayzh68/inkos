@@ -261,4 +261,32 @@ describe("compact autonomous production card", () => {
     }));
     expect(readyHtml).not.toContain(">Rewrite<");
   });
+
+  it("renders logical calls and Provider transports as separate current-attempt metrics", () => {
+    const view: AutonomousView = {
+      ...blockedView,
+      economics: {
+        ...blockedView.economics,
+        currentAttempt: {
+          logicalCalls: 1,
+          providerTransports: 3,
+          promptTokens: 10,
+          completionTokens: 5,
+          totalTokens: 15,
+          tokenDiscrepancy: 0,
+          estimatedCostUsd: 0.01,
+          actualCostUsd: null,
+          unknownLegacyTotal: 0,
+        },
+      },
+    };
+    const html = renderToStaticMarkup(createElement(AutonomousProductionCard, {
+      view, pending: false, error: null, onStart: () => undefined, onStop: () => undefined,
+      onRepair: () => undefined, onConfigureModels: () => undefined,
+    }));
+
+    expect(html).toContain("Logical Calls");
+    expect(html).toContain("Provider Transports");
+    expect(html).not.toContain("Current Attempt Calls");
+  });
 });

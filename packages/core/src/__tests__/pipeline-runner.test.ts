@@ -426,11 +426,20 @@ describe("PipelineRunner", () => {
 
   it("stages a transaction-enabled chapter and promotes one verified commit before cursor advance", async () => {
     let artifactBookDir = "";
-    const stages: Array<{ stage: string; role: string; transactionId?: string }> = [];
+    const stages: Array<{ stage: string; role: string; model?: string; transactionId?: string }> = [];
     const { root, runner, state, bookId } = await createRunnerFixture({
       boundedAutonomousReview: true,
+      modelOverrides: {
+        "chapter-analyzer": "distinct-chapter-analyzer-model",
+        "state-validator": "distinct-state-validator-model",
+      },
       onAutonomousStage: async (event) => {
-        stages.push({ stage: event.stage, role: event.role, ...(event.transactionId ? { transactionId: event.transactionId } : {}) });
+        stages.push({
+          stage: event.stage,
+          role: event.role,
+          ...(event.model ? { model: event.model } : {}),
+          ...(event.transactionId ? { transactionId: event.transactionId } : {}),
+        });
         if (!event.transactionId || !event.provider || !event.model) return;
         const inputFingerprint = createHash("sha256").update(`${event.transactionId}:${event.stage}:${event.role}:input`).digest("hex");
         const logicalOperationId = `provider-step-${createHash("sha256").update(`${event.transactionId}:${event.stage}:${event.role}`).digest("hex")}`;
@@ -534,6 +543,8 @@ describe("PipelineRunner", () => {
         "final-state-extractor-settlement-repair",
         "state-validator-settlement-repair",
       ]));
+      expect(stages.find((event) => event.role === "final-state-extractor")?.model).toBe("distinct-chapter-analyzer-model");
+      expect(stages.find((event) => event.role === "state-validator")?.model).toBe("distinct-state-validator-model");
       const logicEvidenceDir = join(
         bookDir, "story", "runtime", "chapter-transactions", "chapter-0001", "staging", "evidence",
         "reviews", commit.finalBodySha256, "logic-canon-auditor",

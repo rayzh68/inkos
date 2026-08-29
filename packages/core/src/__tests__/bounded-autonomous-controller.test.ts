@@ -9,6 +9,21 @@ import type { BookProductionMap } from "../production/book-production-map.js";
 import type { ChapterMeta } from "../models/chapter.js";
 import { abandonChapterTransactionAttempt, beginChapterTransaction, createChapterGenesis } from "../production/chapter-transaction.js";
 
+const providerResponseFsReads = vi.hoisted(() => ({ directoryScans: 0 }));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    readdir: async (...args: Parameters<typeof actual.readdir>) => {
+      if (String(args[0]).replace(/\\/gu, "/").endsWith("/provider-responses")) {
+        providerResponseFsReads.directoryScans += 1;
+      }
+      return Reflect.apply(actual.readdir, actual, args);
+    },
+  };
+});
+
 const map: BookProductionMap = {
   schemaVersion: "1.0",
   bookId: "book",
@@ -517,6 +532,71 @@ describe("bounded autonomous production controller", () => {
       const runtime = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
       expect(runtime.providerAttemptHistory.filter((entry: { transactionId?: string }) => entry.transactionId === "chapter-txn-attempt-1")).toHaveLength(24);
       expect(runtime.providerAttemptHistory.filter((entry: { transactionId?: string }) => entry.transactionId === "chapter-txn-attempt-2")).toHaveLength(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("bootstraps COMPLETE admission evidence once per transaction executor instead of rescanning the book for every transport", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-admission-bootstrap-"));
+    try {
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      await mkdir(runtimeDir, { recursive: true });
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId: "job", status: "RUNNING", mode: "current-volume", nextChapter: 5,
+      }));
+      const transactionId = "chapter-txn-bootstrap";
+      const execution = createAutonomousProviderExecution({
+        projectRoot: root,
+        bookId: "book",
+        jobId: "job",
+        getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId }),
+      });
+      providerResponseFsReads.directoryScans = 0;
+
+      for (const fingerprint of ["1".repeat(64), "2".repeat(64)]) {
+        await execution.runProviderCall(5, async () => ({
+          content: fingerprint,
+          usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+        }), { provider: "test", model: "model", inputFingerprint: fingerprint });
+      }
+
+      expect(providerResponseFsReads.directoryScans).toBe(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not bootstrap the same transaction twice when one executor observes another transaction between calls", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-admission-multi-transaction-"));
+    try {
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      await mkdir(runtimeDir, { recursive: true });
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId: "job", status: "RUNNING", mode: "current-volume", nextChapter: 5,
+      }));
+      let transactionId = "chapter-txn-a";
+      const execution = createAutonomousProviderExecution({
+        projectRoot: root,
+        bookId: "book",
+        jobId: "job",
+        getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId }),
+      });
+      providerResponseFsReads.directoryScans = 0;
+
+      for (const [nextTransactionId, fingerprint] of [
+        ["chapter-txn-a", "3".repeat(64)],
+        ["chapter-txn-b", "4".repeat(64)],
+        ["chapter-txn-a", "5".repeat(64)],
+      ] as const) {
+        transactionId = nextTransactionId;
+        await execution.runProviderCall(5, async () => ({
+          content: fingerprint,
+          usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+        }), { provider: "test", model: "model", inputFingerprint: fingerprint });
+      }
+
+      expect(providerResponseFsReads.directoryScans).toBe(2);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

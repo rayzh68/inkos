@@ -1849,6 +1849,18 @@ export function createAutonomousProviderExecution(params: {
   readonly runProviderCall: (chapterNumber: number, transport: () => Promise<LLMResponse>, request: { readonly provider: string; readonly model: string; readonly inputFingerprint: string }) => Promise<LLMResponse>;
 } {
   let activeChapter = 0;
+  const completeAdmissionBootstraps = new Map<string, Promise<Set<string>>>();
+  const getCompleteAdmissionLogicalStepIds = (transactionId: string): Promise<Set<string>> => {
+    const existing = completeAdmissionBootstraps.get(transactionId);
+    if (existing) return existing;
+    const logicalStepIds = loadTransactionCompleteLogicalStepIds(
+      params.projectRoot,
+      params.bookId,
+      transactionId,
+    ).then((ids) => new Set(ids));
+    completeAdmissionBootstraps.set(transactionId, logicalStepIds);
+    return logicalStepIds;
+  };
   const identify = (request: { readonly provider: string; readonly model: string; readonly inputFingerprint: string }): LLMCallExecutionIdentity => {
     const stage = params.getActiveStage();
     const logicalStepId = logicalProviderStepId({
@@ -2055,6 +2067,12 @@ export function createAutonomousProviderExecution(params: {
       await unlink(temp).catch(() => undefined);
       throw error;
     }
+    const admissionBootstrap = identity.transactionId
+      ? completeAdmissionBootstraps.get(identity.transactionId)
+      : undefined;
+    if (admissionBootstrap) {
+      (await admissionBootstrap).add(identity.logicalStepId);
+    }
     await markResponseArtifactComplete(identity);
   };
   const markTransportStarted = async (identity: LLMCallExecutionIdentity): Promise<void> => {
@@ -2069,11 +2087,7 @@ export function createAutonomousProviderExecution(params: {
       });
     }
     if (identity.transactionId) {
-      const completeLogicalStepIds = await loadTransactionCompleteLogicalStepIds(
-        params.projectRoot,
-        params.bookId,
-        identity.transactionId,
-      );
+      const completeLogicalStepIds = await getCompleteAdmissionLogicalStepIds(identity.transactionId);
       const transactionHistory = history.filter((entry) => entry.transactionId === identity.transactionId
         || completeLogicalStepIds.has(entry.logicalStepId)
         // Pre-ceiling runtime rows have no transactionId. The active runtime is

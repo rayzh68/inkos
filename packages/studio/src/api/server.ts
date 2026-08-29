@@ -166,8 +166,8 @@ import {
   AutonomousJobRegistry,
   AUTONOMOUS_BUDGET_NOT_CONFIGURED,
   classifyStateRepairError,
+  createCurrentTransactionUsageLoader,
   loadAutonomousRuntime,
-  loadCurrentTransactionUsage,
   loadSafeAutonomousConfig,
   projectAutonomousProductionView,
   requireBookProductionMap,
@@ -2584,6 +2584,7 @@ async function probeServiceCapabilities(args: {
 // --- Server factory ---
 
 export function createStudioServer(initialConfig: ProjectConfig, root: string, overrides: { readonly nodeImageGenerator?: NodeImageDeps } = {}) {
+  const loadCurrentTransactionUsage = createCurrentTransactionUsageLoader();
   const app = new Hono();
   const state = new StateManager(root);
   let cachedConfig = initialConfig;
@@ -2776,7 +2777,12 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const offlineFinalizationPlan = !transactionEnabled && recoveryChapter
       ? await resolveOfflineFinalizationPlan({ projectRoot: root, bookId, pendingChapter: recoveryChapter, nextChapter, runtime }).catch(() => null)
       : null;
-    const currentAttemptUsage = await loadCurrentTransactionUsage(root, bookId, transactionAuthority?.activeTransactionId);
+    const currentAttemptUsage = await loadCurrentTransactionUsage(
+      root,
+      bookId,
+      transactionAuthority?.activeTransactionId,
+      runtime?.providerAttemptHistory,
+    );
     const formalRoleRouting = buildProductionRoleOverrides(productionModels.selection, safeConfig.modelOverrides);
     const view = projectAutonomousProductionView({
       map,

@@ -3341,7 +3341,7 @@ export class PipelineRunner {
     this.throwIfOperationAborted();
     this.throwIfOperationAborted();
     if (this.config.boundedAutonomousReview) {
-      const identity = this.resolveOverride("state-validator");
+      const identity = this.resolveOverride("chapter-analyzer");
       await this.config.onAutonomousStage?.({
         stage: "SETTLING_STATE",
         role: "final-state-extractor",
@@ -3470,7 +3470,7 @@ export class PipelineRunner {
     ]);
     const validator = new StateValidatorAgent(this.agentCtxFor("state-validator", bookId));
     if (chapterTransaction) {
-      const identity = this.resolveOverride("chapter-analyzer");
+      const identity = this.resolveOverride("state-validator");
       await this.config.onAutonomousStage?.({
         stage: "SETTLING_STATE",
         role: "state-validator",

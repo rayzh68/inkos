@@ -86,6 +86,7 @@ export interface AutonomousRuntimeProjection {
   readonly transportRetryCount?: number;
   readonly transportAttemptId?: string;
   readonly providerAttemptHistory?: ReadonlyArray<{
+    readonly transactionId?: string;
     readonly transportAttemptId: string;
     readonly logicalStepId: string;
     readonly chapterNumber: number;
@@ -197,56 +198,145 @@ export interface CurrentTransactionUsageResult {
   readonly integrityWarnings: ReadonlyArray<string>;
 }
 
+export interface CurrentTransactionAttemptRecord {
+  readonly transactionId?: string;
+  readonly logicalStepId: string;
+  readonly classification: string;
+  readonly transportStarted: boolean;
+  readonly transportReturned: boolean;
+}
+
+type CurrentTransactionUsageLoader = (
+  projectRoot: string,
+  bookId: string,
+  transactionId: string | undefined,
+  providerAttemptHistory?: ReadonlyArray<CurrentTransactionAttemptRecord>,
+) => Promise<CurrentTransactionUsageResult>;
+
+const MAX_TRANSACTION_USAGE_CACHE_ENTRIES = 16;
+
+interface CurrentTransactionUsageCacheEntry {
+  readonly records: Map<string, CurrentAttemptUsageRecord>;
+  readonly integrityWarnings: Set<string>;
+  readonly inspectedLogicalStepIds: Set<string>;
+}
+
+export function createCurrentTransactionUsageLoader(): CurrentTransactionUsageLoader {
+  const cache = new Map<string, Promise<CurrentTransactionUsageCacheEntry>>();
+  return async (projectRoot, bookId, transactionId, providerAttemptHistory = []) => {
+    if (!transactionId) return { records: [], integrityWarnings: [] };
+    const bookKey = `${projectRoot}\n${bookId}\n`;
+    const cacheKey = `${bookKey}${transactionId}`;
+    const dir = join(projectRoot, "books", bookId, "story", "runtime", "bounded-autonomous", "provider-responses");
+    const inspectArtifact = async (file: string, target: CurrentTransactionUsageCacheEntry): Promise<void> => {
+      let artifact: {
+        transaction_id?: string;
+        response_artifact_status?: string;
+        logical_step_id?: string;
+        role?: string;
+        response?: { usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number; actualCostUsd?: number } };
+      };
+      let serialized: string;
+      try {
+        serialized = await readFile(join(dir, file), "utf-8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        return;
+      }
+      try {
+        artifact = JSON.parse(serialized) as typeof artifact;
+      } catch {
+        target.integrityWarnings.add(`PROVIDER_USAGE_ARTIFACT_INVALID:${file}`);
+        target.inspectedLogicalStepIds.add(file.slice(0, -5));
+        return;
+      }
+      if (artifact.transaction_id !== transactionId || artifact.response_artifact_status !== "COMPLETE") {
+        target.inspectedLogicalStepIds.add(file.slice(0, -5));
+        return;
+      }
+      const usage = artifact.response?.usage;
+      const tokenValues = usage ? [usage.promptTokens, usage.completionTokens, usage.totalTokens] : [];
+      const invalidShape = artifact.logical_step_id !== file.slice(0, -5)
+        || !artifact.role
+        || tokenValues.length !== 3
+        || tokenValues.some((value) => typeof value !== "number" || !Number.isFinite(value) || value < 0)
+        || (usage?.actualCostUsd !== undefined
+          && (typeof usage.actualCostUsd !== "number" || !Number.isFinite(usage.actualCostUsd) || usage.actualCostUsd < 0));
+      if (invalidShape) {
+        target.integrityWarnings.add(`PROVIDER_USAGE_ARTIFACT_INVALID:${file}`);
+        target.inspectedLogicalStepIds.add(file.slice(0, -5));
+        return;
+      }
+      const record: CurrentAttemptUsageRecord = {
+        identity: artifact.logical_step_id!,
+        role: artifact.role!,
+        promptTokens: usage!.promptTokens!,
+        completionTokens: usage!.completionTokens!,
+        totalTokens: usage!.totalTokens!,
+        ...(typeof usage!.actualCostUsd === "number" ? { actualCostUsd: usage!.actualCostUsd } : {}),
+      };
+      target.records.set(record.identity, record);
+      target.inspectedLogicalStepIds.add(record.identity);
+    };
+    let entryPromise = cache.get(cacheKey);
+    if (!entryPromise) {
+      for (const key of cache.keys()) {
+        if (key.startsWith(bookKey)) cache.delete(key);
+      }
+      entryPromise = (async () => {
+        const entry: CurrentTransactionUsageCacheEntry = {
+          records: new Map(),
+          integrityWarnings: new Set(),
+          inspectedLogicalStepIds: new Set(),
+        };
+        let files: string[];
+        try {
+          files = await readdir(dir);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          files = [];
+        }
+        for (const file of files.filter((name) => name.endsWith(".json") && !name.endsWith(".binding.json"))) {
+          await inspectArtifact(file, entry);
+        }
+        return entry;
+      })();
+      cache.set(cacheKey, entryPromise);
+      while (cache.size > MAX_TRANSACTION_USAGE_CACHE_ENTRIES) {
+        cache.delete(cache.keys().next().value!);
+      }
+    }
+    let entry: CurrentTransactionUsageCacheEntry;
+    try {
+      entry = await entryPromise;
+    } catch (error) {
+      if (cache.get(cacheKey) === entryPromise) cache.delete(cacheKey);
+      throw error;
+    }
+    const newlyCompletedIds = new Set(providerAttemptHistory
+      .filter((attempt) => attempt.transactionId === transactionId
+        && attempt.classification === "SUCCESS"
+        && attempt.transportStarted
+        && attempt.transportReturned)
+      .map((attempt) => attempt.logicalStepId));
+    for (const logicalStepId of newlyCompletedIds) {
+      if (!entry.inspectedLogicalStepIds.has(logicalStepId)) {
+        await inspectArtifact(`${logicalStepId}.json`, entry);
+      }
+    }
+    return {
+      records: [...entry.records.values()].sort((left, right) => left.identity.localeCompare(right.identity)),
+      integrityWarnings: [...entry.integrityWarnings],
+    };
+  };
+}
+
 export async function loadCurrentTransactionUsage(
   projectRoot: string,
   bookId: string,
   transactionId: string | undefined,
 ): Promise<CurrentTransactionUsageResult> {
-  if (!transactionId) return { records: [], integrityWarnings: [] };
-  const dir = join(projectRoot, "books", bookId, "story", "runtime", "bounded-autonomous", "provider-responses");
-  const files = (await readdir(dir).catch(() => [] as string[])).filter((name) => name.endsWith(".json") && !name.endsWith(".binding.json"));
-  const records: CurrentAttemptUsageRecord[] = [];
-  const integrityWarnings: string[] = [];
-  for (const file of files) {
-    let artifact: {
-      transaction_id?: string;
-      response_artifact_status?: string;
-      logical_step_id?: string;
-      role?: string;
-      response?: { usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number; actualCostUsd?: number } };
-    };
-    try {
-      artifact = JSON.parse(await readFile(join(dir, file), "utf-8")) as typeof artifact;
-    } catch {
-      integrityWarnings.push(`PROVIDER_USAGE_ARTIFACT_INVALID:${file}`);
-      continue;
-    }
-    if (artifact.transaction_id !== transactionId || artifact.response_artifact_status !== "COMPLETE") continue;
-    const usage = artifact.response?.usage;
-    const tokenValues = usage ? [usage.promptTokens, usage.completionTokens, usage.totalTokens] : [];
-    const invalidShape = artifact.logical_step_id !== file.slice(0, -5)
-      || !artifact.role
-      || tokenValues.length !== 3
-      || tokenValues.some((value) => typeof value !== "number" || !Number.isFinite(value) || value < 0)
-      || (usage?.actualCostUsd !== undefined
-        && (typeof usage.actualCostUsd !== "number" || !Number.isFinite(usage.actualCostUsd) || usage.actualCostUsd < 0));
-    if (invalidShape) {
-      integrityWarnings.push(`PROVIDER_USAGE_ARTIFACT_INVALID:${file}`);
-      continue;
-    }
-    records.push({
-      identity: artifact.logical_step_id!,
-      role: artifact.role!,
-      promptTokens: usage!.promptTokens!,
-      completionTokens: usage!.completionTokens!,
-      totalTokens: usage!.totalTokens!,
-      ...(typeof usage!.actualCostUsd === "number" ? { actualCostUsd: usage!.actualCostUsd } : {}),
-    });
-  }
-  return {
-    records: records.sort((left, right) => left.identity.localeCompare(right.identity)),
-    integrityWarnings,
-  };
+  return createCurrentTransactionUsageLoader()(projectRoot, bookId, transactionId);
 }
 
 export function autonomousRuntimePath(projectRoot: string, bookId: string): string {
@@ -517,18 +607,27 @@ export function projectAutonomousProductionView(params: {
     confidence: "LOW" as const,
   };
   const currentAttemptUsage = params.currentAttemptUsage ?? [];
+  const activeTransactionId = params.transactionAuthority?.activeTransactionId;
+  const activeTransactionHistory = activeTransactionId
+    ? (params.runtime?.providerAttemptHistory ?? []).filter((attempt) => attempt.transactionId === activeTransactionId)
+    : [];
+  const admittedLogicalStepIds = new Set([
+    ...currentAttemptUsage.map((record) => record.identity),
+    ...activeTransactionHistory.map((attempt) => attempt.logicalStepId),
+  ]);
   const currentAttemptEstimatedCosts = currentAttemptUsage.map((record) => exactRoleCost(record.role, record.promptTokens, record.completionTokens));
   const currentAttemptActualCosts = currentAttemptUsage.map((record) => record.actualCostUsd);
   const currentAttempt = {
-    providerCalls: currentAttemptUsage.length,
+    logicalCalls: admittedLogicalStepIds.size,
+    providerTransports: activeTransactionHistory.filter((attempt) => attempt.transportStarted).length,
     promptTokens: currentAttemptUsage.reduce((sum, record) => sum + record.promptTokens, 0),
     completionTokens: currentAttemptUsage.reduce((sum, record) => sum + record.completionTokens, 0),
     totalTokens: currentAttemptUsage.reduce((sum, record) => sum + record.totalTokens, 0),
     tokenDiscrepancy: currentAttemptUsage.reduce((sum, record) => sum + record.totalTokens - record.promptTokens - record.completionTokens, 0),
-    estimatedCostUsd: currentAttemptEstimatedCosts.every((cost): cost is number => cost !== undefined)
+    estimatedCostUsd: currentAttemptUsage.length > 0 && currentAttemptEstimatedCosts.every((cost): cost is number => cost !== undefined)
       ? currentAttemptEstimatedCosts.reduce((sum, cost) => sum + cost, 0)
       : null,
-    actualCostUsd: currentAttemptActualCosts.every((cost): cost is number => cost !== undefined)
+    actualCostUsd: currentAttemptUsage.length > 0 && currentAttemptActualCosts.every((cost): cost is number => cost !== undefined)
       ? currentAttemptActualCosts.reduce((sum, cost) => sum + cost, 0)
       : null,
     unknownLegacyTotal: currentAttemptUsage.filter((record) => record.role === "legacy-total").length,
