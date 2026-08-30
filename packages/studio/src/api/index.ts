@@ -1,8 +1,7 @@
 import { startStudioServer } from "./server.js";
 import { resolve, join, dirname } from "node:path";
-import { existsSync } from "node:fs";
-import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { refreshStudioFrontend, shouldBuildStudioFrontend } from "./studio-frontend-assets.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -13,11 +12,12 @@ const port = parseInt(process.env.INKOS_STUDIO_PORT ?? "4567", 10);
 const studioRoot = resolve(__dirname, "../..");
 const distDir = join(studioRoot, "dist");
 
-// Auto-build frontend if dist/ doesn't exist
-if (!existsSync(join(distDir, "index.html"))) {
+// Source startup rebuilds only when the client inputs are newer. Packaged
+// runtime preserves the existing bundle and the missing-dist fallback.
+if (shouldBuildStudioFrontend(studioRoot)) {
   console.log("Building frontend...");
   try {
-    execSync("npx vite build", { cwd: studioRoot, stdio: "inherit" });
+    refreshStudioFrontend(studioRoot);
   } catch {
     console.error("Failed to build frontend. Run 'cd packages/studio && pnpm build' manually.");
     process.exit(1);
