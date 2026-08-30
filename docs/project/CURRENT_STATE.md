@@ -1,7 +1,7 @@
 # InkOS Current State
 
 **Snapshot date:** 2026-08-30  
-**Task:** `AUTONOMOUS_FULL_BOOK_AND_REFRESH_FINAL_LANDING` — full-book and live-refresh integration closeout
+**Task:** `CHAPTER006_SETTLEMENT_FIX_FINAL_LANDING` — externally reviewed settlement parser correction integration closeout
 **Rule:** 本文件是当前暂停点快照；继续工作前必须重新核验机器事实。
 
 ## 1. Repository
@@ -14,6 +14,7 @@
 | PR14 merge commit / integration base | `e886d96d935441e232f01b4358cb7dc157f7e93d` |
 | Post-PR14 UI convergence merge commit | `f1a63ed8145c507d00f6bb872a5cc6a6149fcd8a` |
 | Full-book and BookDetail refresh merge commit | `33979787b14f8e8b08d75f118b34852b3e01c374` |
+| Chapter 006 settlement parser correction merge commit | `4012ed1f7e6c033114a1e5d087803a6da70b6d68` |
 | Rebased authority commits | `c52dc01bb44679036126426479f03975678c2d40` → `fa35b91a0db7fe7304abbc789c3944bfa7a7735f` → `e950e1e1bb67c7b517e7f61c4595beee4187cd9a` |
 | Closeout HEAD | the commit containing this snapshot; resolve with `git rev-parse HEAD` |
 | Final synchronization | verify `master == origin/master` from Git and the final handoff; this file cannot embed its own commit SHA |
@@ -70,7 +71,32 @@ Ordinary Autonomous Production Resume/Start now defaults to `full-book`, so Volu
 
 BookDetail now refreshes its chapter list for a matching-book `autonomous:chapter-complete`. It consumes each new SSE message through the existing cursor contract, so an intermediate completion in a React batch and the first completion after an initially empty stream are not skipped. Other autonomous start/phase/progress/complete/paused/error events do not trigger chapter-list refetch, and no polling, watcher, or new SSE subsystem was added.
 
-## 5. Latest verification
+## 5. PR #17 — Chapter 006 settlement parser correction
+
+| Field | Current fact |
+| --- | --- |
+| PR | `rayzh68/inkos#17` |
+| Title | `fix: preserve modern settlement delta failures` |
+| Final externally reviewed head | `2e61e146a22709f70770c386a8f290bd14c5f3c5` |
+| GPT gate | `GPT_CHAPTER006_SETTLEMENT_FIX_SOURCE_REVIEW = PASS` |
+| Merge method | Merge commit; not squash or rebase merge |
+| Merge commit | `4012ed1f7e6c033114a1e5d087803a6da70b6d68` |
+| GitHub merged at | `2026-08-30T12:53:26Z` |
+| Merged scope | Exactly two Core production files and three focused Core tests |
+| Runtime schema modification | `0` |
+| Studio modification | `0` |
+
+The exact merged five-file scope is:
+
+- `packages/core/src/agents/settler-delta-parser.ts`;
+- `packages/core/src/agents/writer.ts`;
+- `packages/core/src/__tests__/settler-delta-parser.test.ts`;
+- `packages/core/src/__tests__/writer.test.ts`;
+- `packages/core/src/__tests__/bounded-autonomous-controller.test.ts`.
+
+The modern settlement envelope is now authoritative. An exact persisted `hookOps.upsert[*].status: "pressured"` compatibility value is normalized to canonical `"progressing"` before schema validation, while the formal runtime schema remains the canonical `open / progressing / deferred / resolved` four-state enum. A declared modern delta that is malformed or schema-invalid now fails closed and cannot fall back to legacy placeholders. Genuine legacy responses without the modern envelope remain compatible. The cached COMPLETE artifact regression proves matching replay adds zero Provider transports; Provider identity, transaction, Chapter Commit, and N+1 algorithms were not modified.
+
+## 6. Latest verification
 
 These are fresh local release checks on audited head `f0a9febc`; they are not independent CI:
 
@@ -115,22 +141,52 @@ The PR #16 release checks on reviewed head `04755e11` are fresh local Codex resu
 - Chapter 006 action: none;
 - Chapter 007 action: none.
 
-## 6. Current system-development state
+The PR #17 settlement parser correction checks on reviewed head `2e61e146` are local Codex results, not independent CI:
+
+- Settler delta parser focused: 9/9 PASS;
+- Writer focused: 11/11 PASS;
+- bounded autonomous controller focused: 62/62 PASS;
+- Chapter transaction: 31/31 PASS;
+- Pipeline runner: 114/114 PASS;
+- Core full: QUALIFIED PASS — 2045/2047; only the two established Windows symlink fixture `EPERM` baseline failures in `skill-agent-tool.test.ts`;
+- Core typecheck: PASS;
+- Core build: PASS;
+- `git diff --check`: PASS;
+- external `GPT_CHAPTER006_SETTLEMENT_FIX_SOURCE_REVIEW`: PASS;
+- real Provider/model calls: 0;
+- real-book mutation: 0;
+- Chapter 006 action: none;
+- Chapter 007 action: none.
+
+## 7. Current system-development state
 
 - PR14 is merged and its audited history is preserved.
 - Post-PR14 UI convergence PR #15 is merged; its two externally reviewed commits remain reachable from master.
 - Full-book and BookDetail refresh PR #16 is merged; reviewed head `04755e11` is reachable from master through merge commit `33979787`.
-- The real InkOS UI remains user-paused. The user-reported snapshot is Book Progress 5/156 with Current Chapter 006; it was not re-read or mutated during this Git/docs closeout.
-- The system/UI development closeout is complete. The next action is a full cold restart of InkOS by the user and return to the UI; this is not authorization for Codex to operate that UI or start production.
+- Chapter 006 settlement parser correction PR #17 is merged; externally reviewed head `2e61e146` remains directly reachable from master through merge commit `4012ed1f`.
+- The real InkOS production remains user-paused at Chapter 006 `SETTLING_STATE` / `PAUSED_PIPELINE_ERROR`; this landing performed no production action.
+- The system correction landing is complete. The critical next action is `USER_COLD_RESTARTS_LATEST_MASTER_AND_RETURNS_TO_UI`; this is not authorization for Codex to operate that UI or start production.
 - Authority documents, Development Method V1, official alignment, and the worktree lifecycle rules are the current development authority.
-- Development Method V1 has now been exercised through a complex FULL Subagent Path, scoped re-review, FAST documentation path, and release integration. The PR #16 full-book feature worktree is removed only after the final docs commit push/reachability gate; its completion is proved by the final machine handoff rather than claimed early in this embedded snapshot.
+- Development Method V1 has now been exercised through a complex FULL Subagent Path, scoped re-review, FAST documentation path, and release integration. The PR #17 feature worktree is removed only after the final docs commit push/reachability gate; its completion is proved by the final machine handoff rather than claimed early in this embedded snapshot.
 - No further PR14 business development is authorized by this snapshot.
 
-## 7. Real-book historical snapshot — not revalidated here
+## 8. Current real production pause — read-only revalidated
 
-The previously recorded Chapter 005/real-book details were **not revalidated in this closeout task**. They remain historical context only. The real production state must be re-confirmed by the user in InkOS UI; Codex must not infer Resume, Rewrite, Abandon, Commit, or Chapter 006 actions from the old snapshot.
+The following machine facts were re-read from existing real-book artifacts without mutation during this closeout:
 
-## 8. Production authorization
+- latest committed authority: Chapter 005;
+- current target: Chapter 006;
+- runtime status / phase: `PAUSED_PIPELINE_ERROR` / `SETTLING_STATE`;
+- real job: `autonomous-d69ce3bf6834220e42624eb34672b3ca`;
+- real transaction: `chapter-txn-590cbd1b1d3d3602205cf462edd5afa692c5cbb8`;
+- persisted recovery mode: `current-volume`;
+- Chapter 006 committed: no;
+- Chapter 007 started: no;
+- real production remains user-paused.
+
+The existing recovery identity must not be migrated to `full-book` during landing. No production authorization is granted to Codex.
+
+## 9. Production authorization
 
 | Action | Authorized now? |
 | --- | --- |
@@ -142,12 +198,12 @@ The previously recorded Chapter 005/real-book details were **not revalidated in 
 | Codex operation of the real InkOS UI | No |
 | NovelFactory or AI-Dev-Orchestrator modification | No |
 
-## 9. NEXT
+## 10. NEXT
 
-`USER_FULLY_RESTARTS_INKOS_AND_RETURNS_TO_UI`
+`USER_COLD_RESTARTS_LATEST_MASTER_AND_RETURNS_TO_UI`
 
 The user must inspect the UI and decide any later production action outside this Codex closeout. Codex stops here and does not execute NEXT.
 
-## 10. Update triggers
+## 11. Update triggers
 
 Update this snapshot after a later merge, real-book test, production-state revalidation, formal stop, or other major development milestone. Machine facts always override stale prose.

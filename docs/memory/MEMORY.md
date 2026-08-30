@@ -90,6 +90,15 @@
 - 该产品修正由 PR `rayzh68/inkos#16` 以 merge commit 合入；final reviewed head `04755e11ce96570a3dd720bff84f6af34ccf0538` 通过 `GPT_FULL_BOOK_AND_REFRESH_SOURCE_REVIEW`，Core source 保持 0 修改。
 - NON-BLOCKING FOLLOW-UP：historical recovery terminal-promotion 尚未统一发送 `autonomous:chapter-complete`；后续如需规范化，必须单独定界，不得把本次正常 autonomous Chapter Commit 路径的修复扩大解释为历史路径已解决。
 
+### Modern settlement delta compatibility boundary
+
+- Modern settlement envelope 是 authoritative boundary：只要响应声明 `RUNTIME_STATE_DELTA`，malformed JSON 或 schema-invalid modern data 必须 fail closed，不得静默回退到 legacy settlement parsing。
+- 历史持久化模型输出中的精确兼容别名 `hookOps.upsert[*].status: "pressured"` 只在 modern delta compatibility boundary 规范化为 canonical `"progressing"`；正式 `HookStatusSchema` 仍保持 `open / progressing / deferred / resolved`，不得扩展为双重 schema authority。
+- Legacy settlement parsing 只保留给真正未声明 modern envelope 的历史响应；invalid modern response 不得生成“状态卡未更新”或“伏笔池未更新”占位结果。
+- COMPLETE Provider artifact 在 exact identity 匹配时继续复用且不产生 duplicate transport；兼容性解析修正不得改写 Provider、job、stage、model、fingerprint 或 transaction identity。
+- Chapter authority 仍要求 final state validation 成功并形成 Chapter Commit 后才能启动 N+1；parser compatibility 不构成跳过 transaction/Commit gate 的授权。
+- 该边界修正已通过 `GPT_CHAPTER006_SETTLEMENT_FIX_SOURCE_REVIEW`，以 reviewed head `2e61e146a22709f70770c386a8f290bd14c5f3c5` 经 PR `rayzh68/inkos#17` merge；merge commit 为 `4012ed1f7e6c033114a1e5d087803a6da70b6d68`。
+
 ## 5. 不应反复重新设计的架构决定
 
 - Chapter Transaction 是章节生产和提交的正式边界。
