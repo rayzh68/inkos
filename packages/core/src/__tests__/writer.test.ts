@@ -530,7 +530,7 @@ describe("WriterAgent", () => {
     }
   });
 
-  it("falls back to legacy settlement tags when runtime-state delta JSON is malformed", async () => {
+  it("fails closed when a declared runtime-state delta contains malformed JSON even with legacy tags", async () => {
     const root = await mkdtemp(join(tmpdir(), "inkos-writer-bad-delta-test-"));
     const bookDir = join(root, "book");
     const storyDir = join(bookDir, "story");
@@ -593,7 +593,7 @@ describe("WriterAgent", () => {
       });
 
     try {
-      const output = await agent.settleChapterState({
+      await expect(agent.settleChapterState({
         book: {
           id: "writer-book",
           title: "Writer Book",
@@ -610,13 +610,7 @@ describe("WriterAgent", () => {
         chapterNumber: 3,
         title: "River Ledger",
         content: "Lin Yue follows the debt into the river-port ledger.",
-      });
-
-      expect(output.runtimeStateDelta).toBeUndefined();
-      expect(output.postSettlement).toContain("legacy settlement survived");
-      expect(output.updatedState).toContain("Keep tracing the debt");
-      expect(output.updatedHooks).toContain("mentor-debt");
-      expect(output.chapterSummary).toContain("Legacy fallback wrote summary");
+      })).rejects.toThrow(/runtime state delta is not valid JSON/i);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

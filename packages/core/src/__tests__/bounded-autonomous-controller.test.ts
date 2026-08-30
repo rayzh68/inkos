@@ -8,6 +8,7 @@ import { LLMCallExecutionError } from "../llm/provider.js";
 import type { BookProductionMap } from "../production/book-production-map.js";
 import type { ChapterMeta } from "../models/chapter.js";
 import { abandonChapterTransactionAttempt, beginChapterTransaction, createChapterGenesis } from "../production/chapter-transaction.js";
+import { parseSettlerDeltaOutput } from "../agents/settler-delta-parser.js";
 
 const providerResponseFsReads = vi.hoisted(() => ({ directoryScans: 0, failNextProductionStateRename: false }));
 
@@ -1439,6 +1440,48 @@ describe("bounded autonomous production controller", () => {
         attempt: 1,
       });
       expect(runtime.providerAttemptHistory).toHaveLength(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reuses a cached complete settlement delta with pressured status without a new transport", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-autonomous-cached-settlement-delta-"));
+    try {
+      let transportCalls = 0;
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      await mkdir(runtimeDir, { recursive: true });
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId: "job", status: "PAUSED_PIPELINE_ERROR", mode: "current-volume", volumeId: "volume-001",
+        startChapter: 6, targetChapter: 6, nextChapter: 6, chapterNumber: 6, completedThisRun: 0,
+      }), "utf-8");
+      const stage = { stage: "SETTLING_STATE", role: "settler", provider: "openrouter", model: "provider/model", transactionId: "chapter-txn-synthetic-006" } as const;
+      const execution = createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId: "job", getActiveStage: () => stage });
+      const content = [
+        "=== POST_SETTLEMENT ===",
+        "- mentor-debt advanced",
+        "",
+        "=== RUNTIME_STATE_DELTA ===",
+        JSON.stringify({
+          chapter: 6,
+          hookOps: {
+            upsert: [{ hookId: "mentor-debt", startChapter: 1, type: "relationship", status: "pressured", lastAdvancedChapter: 6, expectedPayoff: "Reveal the debt.", notes: "Pressure increases." }],
+            resolve: [],
+            defer: [],
+          },
+          notes: [],
+        }),
+      ].join("\n");
+      const run = () => execution.runProviderCall(6, async () => {
+        transportCalls += 1;
+        return { content, usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 } };
+      }, { provider: "openrouter", model: "provider/model", inputFingerprint: "c".repeat(64) });
+
+      await run();
+      const cached = await run();
+
+      expect(transportCalls).toBe(1);
+      expect(parseSettlerDeltaOutput(cached.content).runtimeStateDelta.hookOps.upsert[0]?.status).toBe("progressing");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
