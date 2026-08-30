@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { SSEMessage } from "./use-sse";
+import { collectNewSSEMessages } from "./use-sse";
+import * as bookActivityModule from "./use-book-activity";
 import {
   applyBookCollectionEvent,
   deriveActiveBookIds,
@@ -84,6 +86,52 @@ describe("shouldRefetchBookView", () => {
     expect(shouldRefetchBookView(msg("audit:complete", { bookId: "alpha", chapter: 3, passed: true }, 1), "alpha")).toBe(true);
     expect(shouldRefetchBookView(msg("audit:start", { bookId: "alpha", chapter: 3 }, 1), "alpha")).toBe(false);
     expect(shouldRefetchBookView(msg("rewrite:complete", { bookId: "beta" }, 1), "alpha")).toBe(false);
+  });
+
+  it("refreshes after an autonomous chapter commit for the matching book only", () => {
+    expect(shouldRefetchBookView(msg("autonomous:chapter-complete", { bookId: "alpha", chapterNumber: 5 }, 1), "alpha")).toBe(true);
+    expect(shouldRefetchBookView(msg("autonomous:chapter-complete", { bookId: "beta", chapterNumber: 5 }, 1), "alpha")).toBe(false);
+  });
+
+  it.each([
+    "autonomous:start",
+    "autonomous:phase",
+    "autonomous:progress",
+    "autonomous:complete",
+    "autonomous:paused",
+    "autonomous:error",
+    "llm:progress",
+  ])("does not refetch chapter data for %s", (event) => {
+    expect(shouldRefetchBookView(msg(event, { bookId: "alpha" }, 1), "alpha")).toBe(false);
+  });
+
+  it("finds a chapter completion in the middle of one cursor batch without looping on the same batch", () => {
+    const messages = [
+      msg("autonomous:phase", { bookId: "alpha" }, 2),
+      msg("autonomous:chapter-complete", { bookId: "alpha", chapterNumber: 5 }, 3),
+      msg("autonomous:phase", { bookId: "alpha" }, 4),
+    ];
+    const first = collectNewSSEMessages(messages, 1);
+    const refreshes = first.fresh.filter((message) => shouldRefetchBookView(message, "alpha"));
+    const repeated = collectNewSSEMessages(messages, first.nextCursor);
+
+    expect(refreshes).toHaveLength(1);
+    expect(repeated.fresh).toEqual([]);
+  });
+
+  it("does not drop the first chapter completion after an initially empty stream", () => {
+    const prime = (bookActivityModule as unknown as {
+      readonly primeBookViewSSEMessages?: (messages: ReadonlyArray<SSEMessage>) => ReadonlyArray<SSEMessage>;
+    }).primeBookViewSSEMessages;
+    const seeded = prime?.([]);
+
+    expect(seeded).toEqual([{ event: "book-view:cursor-seed", data: null, timestamp: 0, seq: 0 }]);
+    const initial = collectNewSSEMessages(seeded ?? [], null);
+    const firstEvent = msg("autonomous:chapter-complete", { bookId: "alpha", chapterNumber: 5 }, 1);
+    const firstFresh = collectNewSSEMessages(prime?.([firstEvent]) ?? [], initial.nextCursor);
+
+    expect(firstFresh.fresh).toEqual([firstEvent]);
+    expect(firstFresh.fresh.filter((message) => shouldRefetchBookView(message, "alpha"))).toHaveLength(1);
   });
 });
 
