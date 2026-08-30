@@ -81,6 +81,15 @@ FAST 仍须锁清 scope、唯一写入者、DoD、验证、allowed/forbidden fil
 - 安全、authority 和产品硬约束优先于流程便利；便利性不得伪装成 authority。
 - PR14 属于 transaction/provider/runtime 的高耦合路径；后续 Source Review 应采用并行只读调查加受控 review/bounded implementation，不应人为拆成并行 writers。
 
+### 4.5 Worktree lifecycle / use-and-burn
+
+- Active isolated worktree 是正式受控开发环境；任务、PR gate 或集成尚未结束时，不属于 TEMP/orphan。
+- 存在任一条件时禁止删除 worktree：有 uncommitted changes、unpushed unique commit、active task、未结束的 PR gate、commit 尚未进入目标 Git authority，或无法证明删除不会损失唯一 evidence/commit。
+- 当 commits 已进入正式 authority、必要 push 与 merge 已完成、worktree clean、无 active task 且无 unique commit 时，该 worktree 已完成使命；必须使用 `git worktree remove <path>` 删除，再执行 `git worktree prune`，不得长期堆积。
+- “用过即焚”默认覆盖已完成使命且 ownership/disposable status 已证明的 temporary ZIP、Source Review package、patch、diff、logs、screenshots、extracted directories、evidence copies、debug output、one-off evidence-generation scripts 和 isolated worktrees。
+- production source、formal tests、project authority docs、formal schemas/manifests、required formal evidence、commits 和 merged PR history 是正式资产，不得作为 cleanup 对象删除。
+- Cleanup 必须同时证明 ownership 与 disposable status。不得因名称或时间“像临时文件”就删除；不得粗暴 recursive delete 未确认目录、destructive Git cleanup、reset 未知修改，或新建 cleanup subsystem、daemon、worktree manager。
+
 ## 5. 实现与审查
 
 - 功能修改和 bugfix 使用 TDD：先写能证明问题的失败测试，确认按预期失败，再做最小实现并确认通过；文档小修按其文档检查验证。

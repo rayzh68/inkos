@@ -54,11 +54,25 @@
 - 主要方向：加入 bounded chapter attempt abandonment，并在 Core transaction、autonomous production、Studio API/UI 中表达 abandoned attempt 与 fresh attempt 的隔离。
 - 长期约束：abandoned attempt 的 staging、telemetry 和 evidence 不得污染新的 attempt。
 
-## 4. PR #14 的受控方向
+## 4. PR #14 — production safety and UI convergence
 
-- PR `rayzh68/inkos#14` 仍是 Draft、未 merge，因此不得把其实现描述为 master 已落地里程碑。
-- 已被产品确认且不应反复重新设计的方向包括：三产品模型角色；Writer/Reviser 归属 Production；final-prose-only state settlement；有界 semantic retry；Logical Calls 与 Provider Transports 分离；普通 pipeline/local error 不冒充 Provider error；用户 UI 使用短状态、短按钮和单一语言。
-- PR14 是否正确实现这些方向，仍由独立 GPT Source Review 和最终 merge 证据决定。Draft head、Codex 本地报告或 GitHub mergeable 均不等于 PASS。
+- PR `rayzh68/inkos#14` 已通过 `GPT_FINAL_PR14_REVIEW` 并以 merge commit 合入 master。
+- Final audited head：`f0a9febcfafbf50294ccd6403c9a80e5c5a10260`；merge commit：`e886d96d935441e232f01b4358cb7dc157f7e93d`。Audited head 保持为 merged authority history 的 ancestor。
+- 产品层正式收敛为 Production、Review、Reader 三个模型角色；Writer/Reviser 属于 Production 内部能力。
+- 单章状态结算只接受 final prose；semantic retry 有界；Logical Calls 与 Provider Transports 分离计量。
+- repeated O(N-book) Provider scanning 已关闭；正常调用路径不得通过反复全书扫描重建 evidence。
+- Provider transport exception 与 post-transport local/pipeline failure 的分类边界已关闭：本地 persistence/observer failure 不得冒充 Provider failure。
+- returned-transport checkpoint failure 使用既有 error/progress authority 保留 truthful returned evidence，并在恢复时阻止 duplicate transport；没有为此新增 database、journal、recovery subsystem 或平行 authority。
+- UI convergence 方向保持：普通用户只面对三个产品模型角色、短状态、短按钮和单一语言；高级 evidence 留在审计层。
+
+### Development Method V1 实战事实
+
+- PR14 是第一次正式通过复杂 FULL Subagent Path 完成 Source Review、bounded repair、scoped re-review 和 release landing 的大型任务；本次最终收尾同时把 cleanup 确立为 push/reachability 后的正式 gate。
+- 并行只读 review 找出了旧审核遗漏的 Provider safety blockers；所有 blocker 都在锁定范围内由 same-worktree sole Implementer 依 TDD 完成。
+- Scoped re-review 只重审受影响的 root cause/safety boundary，避免每轮重新启动完整调查团队。
+- FAST/FULL/MULTI-WORKTREE 必须在正式任务提示词中显式指定；parallelism follows independence；same-worktree one writer。
+- 隔离 worktree 并行写入只适用于真正独立、有 ownership 与 integration contract 的任务；worktree lifecycle 必须包含任务完成后的 cleanup。
+- Active worktree 在任务期间不是 TEMP/orphan；完成使命且 commits 已进入 authority 后应使用 `git worktree remove` 与 `git worktree prune`，并以 ownership + disposable status 证明清理安全。
 
 ## 5. 不应反复重新设计的架构决定
 
