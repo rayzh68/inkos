@@ -64,7 +64,8 @@ interface Nav {
   toProjectSettings: () => void;
 }
 
-function translateChapterStatus(status: string, t: TFunction): string {
+export function translateChapterStatus(status: string, t: TFunction): string {
+  const isZh = t("nav.connected") === "已连接";
   const map: Record<string, () => string> = {
     "ready-for-review": () => t("chapter.readyForReview"),
     "approved": () => t("chapter.approved"),
@@ -72,6 +73,9 @@ function translateChapterStatus(status: string, t: TFunction): string {
     "needs-revision": () => t("chapter.needsRevision"),
     "imported": () => t("chapter.imported"),
     "audit-failed": () => t("chapter.auditFailed"),
+    "accepted-with-findings": () => isZh ? "有备注" : "Notes",
+    "ACCEPTED_WITH_FINDINGS": () => isZh ? "有备注" : "Notes",
+    "APPROVED": () => isZh ? "通过" : "Approved",
   };
   return map[status]?.() ?? status;
 }
@@ -82,7 +86,12 @@ const STATUS_CONFIG: Record<string, { color: string; icon: React.ReactNode }> = 
   drafted: { color: "text-muted-foreground bg-muted/20", icon: <FileText size={12} /> },
   "needs-revision": { color: "text-destructive bg-destructive/10", icon: <RotateCcw size={12} /> },
   imported: { color: "text-blue-500 bg-blue-500/10", icon: <Download size={12} /> },
+  "accepted-with-findings": { color: "text-amber-600 bg-amber-500/10", icon: <Check size={12} /> },
+  ACCEPTED_WITH_FINDINGS: { color: "text-amber-600 bg-amber-500/10", icon: <Check size={12} /> },
+  APPROVED: { color: "text-emerald-500 bg-emerald-500/10", icon: <Check size={12} /> },
 };
+
+export const CHAPTER_STATUS_PILL_GEOMETRY = "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-tight";
 
 export function BookDetail({
   bookId,
@@ -98,6 +107,7 @@ export function BookDetail({
   sse: { messages: ReadonlyArray<SSEMessage> };
 }) {
   const c = useColors(theme);
+  const isZh = t("nav.connected") === "已连接";
   const { data, loading, error, refetch } = useApi<BookData>(`/books/${bookId}`);
   const [writeRequestPending, setWriteRequestPending] = useState(false);
   const [draftRequestPending, setDraftRequestPending] = useState(false);
@@ -494,12 +504,12 @@ export function BookDetail({
           <button
             onClick={handleToggleReviewMode}
             title={reviewMode === "manual"
-              ? "手动审查：写完即停，由你点 审稿/修订/通过（更快、更可控）。点此切回自动。"
-              : "自动审查：写完自动审校并按需重写（更省心，但更慢）。点此切到手动·写完即停。"}
+              ? (isZh ? "手动审查：写完即停。点击切回自动审查。" : "Manual review stops after writing. Click to switch to automatic review.")
+              : (isZh ? "自动审查：写完后自动审校并按需重写。" : "Automatic review checks and revises after writing when needed.")}
             className="flex items-center gap-2 px-4 py-2.5 text-sm font-medium bg-secondary/60 text-foreground rounded-xl border border-border/50 hover:bg-secondary transition-all"
           >
             {reviewMode === "manual" ? <Hand size={16} /> : <Settings2 size={16} />}
-            {reviewMode === "manual" ? "审查：手动·写完即停" : "审查：自动"}
+            {isZh ? "审查" : "Review"}
           </button>
           <button
             onClick={() => setConfirmDeleteOpen(true)}
@@ -512,7 +522,7 @@ export function BookDetail({
         </div>
       </div>
 
-      <AutonomousProductionPanel bookId={bookId} messages={sse.messages} onConfigureModels={nav.toProjectSettings} />
+      <AutonomousProductionPanel bookId={bookId} messages={sse.messages} onConfigureModels={nav.toProjectSettings} language={t("nav.connected") === "已连接" ? "zh" : "en"} />
 
       {(writing || drafting || activity.lastError) && (
         <div
@@ -715,7 +725,7 @@ export function BookDetail({
                   </td>
                   <td className="px-6 py-4 text-muted-foreground font-medium tabular-nums text-xs">{(ch.wordCount ?? 0).toLocaleString()}</td>
                   <td className="px-6 py-4">
-                    <div className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-tight ${STATUS_CONFIG[ch.status]?.color ?? "bg-muted text-muted-foreground"}`}>
+                    <div className={`${CHAPTER_STATUS_PILL_GEOMETRY} ${STATUS_CONFIG[ch.status]?.color ?? "bg-muted text-muted-foreground"}`}>
                       {STATUS_CONFIG[ch.status]?.icon}
                       {translateChapterStatus(ch.status, t)}
                     </div>

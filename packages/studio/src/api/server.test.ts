@@ -6679,7 +6679,8 @@ describe("createStudioServer daemon lifecycle", () => {
   it("routes one Studio start through the shared Core controller, reuses an audit-failed draft, and persists the dynamic-volume checkpoint", async () => {
     const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
     raw.llm = { ...raw.llm, service: "openrouter", defaultModel: "openai/gpt", model: "openai/gpt", services: [{ service: "openrouter" }] };
-    raw.modelOverrides = { auditor: "deepseek/chat", "commercial-reader": "google/gemini", reviser: "openai/gpt", "observer-reflector": "deepseek/flash" };
+    raw.productionRoles = { production: "openai/gpt", review: "deepseek/chat", reader: "google/gemini" };
+    raw.modelOverrides = { auditor: "generic/wrong", "commercial-reader": "generic/wrong", reviser: "generic/wrong", "observer-reflector": "generic/wrong" };
     await writeFile(join(root, "inkos.json"), JSON.stringify(raw, null, 2), "utf-8");
     await mkdir(join(root, "books", "demo-book", "story", "outline"), { recursive: true });
     await writeFile(join(root, "books", "demo-book", "story", "outline", "book-production-map.json"), JSON.stringify({
@@ -6731,6 +6732,14 @@ describe("createStudioServer daemon lifecycle", () => {
     expect(first.status).toBe(202);
     expect(second.status).toBe(409);
     await vi.waitFor(() => expect(resumeAuditFailedChapterBoundedMock).toHaveBeenCalledTimes(1));
+    expect(pipelineConfigs.at(-1)).toMatchObject({
+      model: "openai/gpt",
+      modelOverrides: {
+        writer: "openai/gpt", reviser: "openai/gpt", "observer-reflector": "openai/gpt",
+        "chapter-analyzer": "openai/gpt", "state-validator": "openai/gpt",
+        auditor: "deepseek/chat", "commercial-reader": "google/gemini",
+      },
+    });
     expect(writeNextChapterMock).not.toHaveBeenCalled();
 
     releaseResume();
@@ -6808,7 +6817,7 @@ describe("createStudioServer daemon lifecycle", () => {
     await vi.waitFor(async () => {
       const runtime = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
       expect(runtime).toMatchObject({
-        status: "PAUSED_DETERMINISTIC_PROVIDER_ERROR",
+        status: "PAUSED_PIPELINE_ERROR",
         nextChapter: 5,
         reason: "STATE_REBASELINE_VALIDATION_FAILED",
         recoveryOwnership: {
@@ -7184,13 +7193,21 @@ describe("createStudioServer daemon lifecycle", () => {
     await writeFile(join(root, "inkos.json"), JSON.stringify(raw, null, 2), "utf-8");
     const { createStudioServer } = await import("./server.js");
     const app = createStudioServer(cloneProjectConfig() as never, root);
-    const selection = { writer: "gpt-5.4", logicAuditor: "review-model", commercialReader: "review-model", reviser: "gpt-5.4", observerReflector: "review-model" };
+    const selection = { production: "gpt-5.4", review: "review-model", reader: "review-model" };
     const saved = await app.request("http://localhost/api/v1/project/production-role-models", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ selection }) });
     expect(saved.status).toBe(200);
     await expect(saved.json()).resolves.toMatchObject({ ok: true, service: "openai", selection });
     const persisted = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
-    expect(persisted.modelOverrides).toMatchObject({ unrelated: "preserved", auditor: "review-model", "commercial-reader": "review-model", reviser: "gpt-5.4", "observer-reflector": "review-model" });
-    const manual = await app.request("http://localhost/api/v1/project/production-role-models", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ selection: { ...selection, writer: "invented/model" } }) });
+    expect(persisted.productionRoles).toEqual(selection);
+    expect(persisted.modelOverrides).toMatchObject({ unrelated: "preserved", writer: "gpt-5.4", reviser: "gpt-5.4", "observer-reflector": "gpt-5.4", "chapter-analyzer": "gpt-5.4", "state-validator": "gpt-5.4", auditor: "review-model", "commercial-reader": "review-model" });
+    const generic = await app.request("http://localhost/api/v1/project/model-overrides", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ overrides: { unrelated: "changed", writer: "wrong", reviser: "wrong", auditor: "wrong", "commercial-reader": "wrong" } }),
+    });
+    expect(generic.status).toBe(200);
+    const genericPersisted = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
+    expect(genericPersisted.modelOverrides).toMatchObject({ unrelated: "changed", writer: "gpt-5.4", reviser: "gpt-5.4", auditor: "review-model", "commercial-reader": "review-model" });
+    const manual = await app.request("http://localhost/api/v1/project/production-role-models", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ selection: { ...selection, production: "invented/model" } }) });
     expect(manual.status).toBe(200);
     const manualPersisted = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
     expect(manualPersisted.llm.defaultModel).toBe("invented/model");
@@ -7243,7 +7260,7 @@ describe("createStudioServer daemon lifecycle", () => {
 
     expect(body.catalogStatus).toBe("CATALOG_UNAVAILABLE");
     expect(body.catalog).toEqual([]);
-    expect(body.selection.writer).toBe("openai/saved-model");
+    expect(body.selection).toEqual({ production: "openai/saved-model", review: "deepseek/saved-review", reader: "google/saved-reader" });
     expect(JSON.stringify(body)).not.toContain("openrouter/auto");
   });
 

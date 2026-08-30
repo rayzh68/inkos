@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAutonomousProviderExecution, deriveAutonomousJobIdentity } from "@actalk/inkos-core";
-import { AUTONOMOUS_BUDGET_NOT_CONFIGURED, AutonomousJobRegistry, classifyStateRepairError, projectAutonomousProductionView, resolveOfflineFinalizationPlan, verifyOfflineFinalizationEvidence } from "./autonomous-production.js";
+import { AUTONOMOUS_BUDGET_NOT_CONFIGURED, AutonomousJobRegistry, classifyStateRepairError, createCurrentTransactionUsageLoader, loadCurrentTransactionUsage, projectAutonomousProductionView, resolveOfflineFinalizationPlan, verifyOfflineFinalizationEvidence } from "./autonomous-production.js";
 
 const map = {
   schemaVersion: "1.0" as const,
@@ -28,6 +28,265 @@ const catalog = [
 ];
 
 describe("autonomous production Studio projection", () => {
+  it("keeps current-attempt telemetry available and reports a malformed artifact warning", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-usage-integrity-"));
+    try {
+      const dir = join(root, "books", "book", "story", "runtime", "bounded-autonomous", "provider-responses");
+      await mkdir(dir, { recursive: true });
+      const logicalStepId = `provider-step-${"a".repeat(64)}`;
+      await writeFile(join(dir, `${logicalStepId}.json`), JSON.stringify({
+        transaction_id: "chapter-txn-test", response_artifact_status: "COMPLETE",
+        logical_step_id: logicalStepId, role: "writer",
+        response: { usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 } },
+      }));
+      await writeFile(join(dir, "broken.json"), "{not-json");
+      await writeFile(join(dir, "wrong-name.json"), JSON.stringify({
+        transaction_id: "chapter-txn-test", response_artifact_status: "COMPLETE",
+        logical_step_id: `provider-step-${"b".repeat(64)}`, role: "writer",
+        response: { usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } },
+      }));
+      await writeFile(join(dir, "bad-tokens.json"), JSON.stringify({
+        transaction_id: "chapter-txn-test", response_artifact_status: "COMPLETE",
+        logical_step_id: "bad-tokens", role: "writer",
+        response: { usage: { promptTokens: "bad", completionTokens: -1, totalTokens: 2 } },
+      }));
+      const usage = await loadCurrentTransactionUsage(root, "book", "chapter-txn-test");
+      expect(usage.records).toHaveLength(1);
+      expect(usage.records[0]).toMatchObject({ identity: logicalStepId, totalTokens: 15 });
+      expect(usage.integrityWarnings).toEqual(expect.arrayContaining([
+        "PROVIDER_USAGE_ARTIFACT_INVALID:broken.json",
+        "PROVIDER_USAGE_ARTIFACT_INVALID:wrong-name.json",
+        "PROVIDER_USAGE_ARTIFACT_INVALID:bad-tokens.json",
+      ]));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports 14 active transaction calls separately from six historical aggregate rows", () => {
+    const capabilities = ["planner", "story-frame-selector", "volume-map-selector", "memory-selector", "writer", "logic-canon-auditor", "commercial-reader", "reviser", "final-state-extractor", "state-validator"];
+    const view = projectAutonomousProductionView({
+      map, targetChapters: 156, nextChapter: 7,
+      chapters: Array.from({ length: 6 }, (_, index) => ({
+        number: index + 1, status: "approved",
+        roleUsage: { "legacy-total": { promptTokens: 10, completionTokens: 5, totalTokens: 15 } },
+      })),
+      config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini" } },
+      catalog,
+      runtime: {
+        status: "RUNNING", mode: "current-volume", nextChapter: 7, updatedAt: "now",
+        providerAttemptHistory: Array.from({ length: 14 }, (_, index) => ({
+          transactionId: "chapter-txn-active",
+          transportAttemptId: `transport-${index}`,
+          logicalStepId: `provider-step-${String(index).padStart(64, "0")}`,
+          chapterNumber: 7,
+          role: capabilities[index % capabilities.length]!,
+          provider: "test",
+          requestedModel: "model",
+          attempt: 1,
+          classification: "SUCCESS",
+          transportStarted: true,
+          transportReturned: true,
+          recordedAt: "2026-08-30T00:00:00.000Z",
+        })),
+      },
+      transactionAuthority: {
+        state: "STAGING", latestChapter: 6, nextChapter: 7,
+        latestAuthoritySha256: "a".repeat(64), activeTransactionId: "chapter-txn-active",
+      },
+      active: false,
+      currentAttemptUsage: Array.from({ length: 14 }, (_, index) => ({
+        identity: `provider-step-${String(index).padStart(64, "0")}`,
+        role: capabilities[index % capabilities.length]!, promptTokens: 10, completionTokens: 5, totalTokens: index === 13 ? 18 : 15,
+      })),
+    });
+
+    expect(view.economics.currentAttempt).toMatchObject({ logicalCalls: 14, providerTransports: 14, totalTokens: 213, tokenDiscrepancy: 3, actualCostUsd: null });
+    expect(view.economics.historicalBook.providerCalls).toBe(6);
+    expect(view.economics.currentAttempt.unknownLegacyTotal).toBe(0);
+  });
+
+  it.each([
+    { logicalCalls: 1, providerTransports: 3 },
+    { logicalCalls: 8, providerTransports: 11 },
+  ])("reports $logicalCalls admitted logical calls separately from $providerTransports started transports", ({ logicalCalls, providerTransports }) => {
+    const transactionId = "chapter-txn-counts";
+    const history = Array.from({ length: providerTransports }, (_, index) => ({
+      transactionId,
+      transportAttemptId: `transport-${index}`,
+      logicalStepId: `provider-step-${String(index % logicalCalls).padStart(64, "0")}`,
+      chapterNumber: 7,
+      role: "writer",
+      provider: "test",
+      requestedModel: "model",
+      attempt: Math.floor(index / logicalCalls) + 1,
+      classification: "RETRYABLE_PROVIDER_HTTP",
+      transportStarted: true,
+      transportReturned: true,
+      recordedAt: "2026-08-30T00:00:00.000Z",
+    }));
+    const view = projectAutonomousProductionView({
+      map, targetChapters: 156, nextChapter: 7, chapters: [], catalog,
+      config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini" } },
+      runtime: { status: "RUNNING", mode: "current-volume", nextChapter: 7, updatedAt: "now", providerAttemptHistory: history },
+      transactionAuthority: { state: "STAGING", latestChapter: 6, nextChapter: 7, latestAuthoritySha256: "a".repeat(64), activeTransactionId: transactionId },
+      active: true,
+    });
+
+    expect(view.economics.currentAttempt).toMatchObject({ logicalCalls, providerTransports, totalTokens: 0, estimatedCostUsd: null, actualCostUsd: null });
+  });
+
+  it("counts an ambiguous started transport without fabricating COMPLETE usage", () => {
+    const transactionId = "chapter-txn-ambiguous";
+    const view = projectAutonomousProductionView({
+      map, targetChapters: 156, nextChapter: 7, chapters: [], catalog,
+      config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini" } },
+      runtime: {
+        status: "PAUSED", mode: "current-volume", nextChapter: 7, updatedAt: "now",
+        providerAttemptHistory: [{
+          transactionId,
+          transportAttemptId: "transport-1",
+          logicalStepId: `provider-step-${"a".repeat(64)}`,
+          chapterNumber: 7,
+          role: "writer",
+          provider: "test",
+          requestedModel: "model",
+          attempt: 1,
+          classification: "AMBIGUOUS_PROVIDER_OUTCOME",
+          transportStarted: true,
+          transportReturned: false,
+          recordedAt: "2026-08-30T00:00:00.000Z",
+        }],
+      },
+      transactionAuthority: { state: "STAGING", latestChapter: 6, nextChapter: 7, latestAuthoritySha256: "a".repeat(64), activeTransactionId: transactionId },
+      active: false,
+    });
+
+    expect(view.economics.currentAttempt).toMatchObject({ logicalCalls: 1, providerTransports: 1, totalTokens: 0, estimatedCostUsd: null, actualCostUsd: null });
+  });
+
+  it("bootstraps transaction usage once and incrementally reads only newly successful active identities", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-usage-cache-"));
+    try {
+      const dir = join(root, "books", "book", "story", "runtime", "bounded-autonomous", "provider-responses");
+      await mkdir(dir, { recursive: true });
+      const transactionId = "chapter-txn-cache";
+      const firstId = `provider-step-${"1".repeat(64)}`;
+      await writeFile(join(dir, `${firstId}.json`), JSON.stringify({
+        transaction_id: transactionId, response_artifact_status: "COMPLETE",
+        logical_step_id: firstId, role: "writer",
+        response: { usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 } },
+      }));
+      const loadUsage = createCurrentTransactionUsageLoader();
+      const first = await loadUsage(root, "book", transactionId, []);
+      expect(first.records.map((record) => record.identity)).toEqual([firstId]);
+
+      await writeFile(join(dir, "irrelevant-historical.json"), "{not-json");
+      const secondId = `provider-step-${"2".repeat(64)}`;
+      await writeFile(join(dir, `${secondId}.json`), JSON.stringify({
+        transaction_id: transactionId, response_artifact_status: "COMPLETE",
+        logical_step_id: secondId, role: "state-validator",
+        response: { usage: { promptTokens: 4, completionTokens: 5, totalTokens: 9 } },
+      }));
+      const second = await loadUsage(root, "book", transactionId, [{
+        transactionId,
+        logicalStepId: secondId,
+        classification: "SUCCESS",
+        transportStarted: true,
+        transportReturned: true,
+      }]);
+
+      expect(second.records.map((record) => record.identity)).toEqual([firstId, secondId]);
+      expect(second.integrityWarnings).not.toContain("PROVIDER_USAGE_ARTIFACT_INVALID:irrelevant-historical.json");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("makes concurrent view refreshes await the same completed transaction bootstrap", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-usage-concurrent-bootstrap-"));
+    try {
+      const dir = join(root, "books", "book", "story", "runtime", "bounded-autonomous", "provider-responses");
+      await mkdir(dir, { recursive: true });
+      const transactionId = "chapter-txn-concurrent";
+      for (let index = 0; index < 20; index += 1) {
+        const logicalStepId = `provider-step-${index.toString(16).padStart(64, "0")}`;
+        await writeFile(join(dir, `${logicalStepId}.json`), JSON.stringify({
+          transaction_id: transactionId, response_artifact_status: "COMPLETE",
+          logical_step_id: logicalStepId, role: "writer",
+          response: { usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } },
+        }));
+      }
+      const loadUsage = createCurrentTransactionUsageLoader();
+
+      const [first, second] = await Promise.all([
+        loadUsage(root, "book", transactionId, []),
+        loadUsage(root, "book", transactionId, []),
+      ]);
+
+      expect(first.records).toHaveLength(20);
+      expect(second.records).toHaveLength(20);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not cache a transient provider-response directory I/O failure", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-usage-directory-retry-"));
+    try {
+      const dir = join(root, "books", "book", "story", "runtime", "bounded-autonomous", "provider-responses");
+      await mkdir(join(dir, ".."), { recursive: true });
+      await writeFile(dir, "temporary non-directory fixture");
+      const transactionId = "chapter-txn-directory-retry";
+      const loadUsage = createCurrentTransactionUsageLoader();
+
+      await expect(loadUsage(root, "book", transactionId, [])).rejects.toMatchObject({ code: "ENOTDIR" });
+
+      await rm(dir, { force: true });
+      await mkdir(dir, { recursive: true });
+      const logicalStepId = `provider-step-${"d".repeat(64)}`;
+      await writeFile(join(dir, `${logicalStepId}.json`), JSON.stringify({
+        transaction_id: transactionId, response_artifact_status: "COMPLETE",
+        logical_step_id: logicalStepId, role: "writer",
+        response: { usage: { promptTokens: 2, completionTokens: 3, totalTokens: 5 } },
+      }));
+
+      await expect(loadUsage(root, "book", transactionId, [])).resolves.toMatchObject({
+        records: [expect.objectContaining({ identity: logicalStepId, totalTokens: 5 })],
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not permanently classify a transient artifact read error as invalid usage", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-usage-artifact-retry-"));
+    try {
+      const dir = join(root, "books", "book", "story", "runtime", "bounded-autonomous", "provider-responses");
+      await mkdir(dir, { recursive: true });
+      const transactionId = "chapter-txn-artifact-retry";
+      const logicalStepId = `provider-step-${"e".repeat(64)}`;
+      const artifactPath = join(dir, `${logicalStepId}.json`);
+      await mkdir(artifactPath);
+      const loadUsage = createCurrentTransactionUsageLoader();
+
+      await expect(loadUsage(root, "book", transactionId, [])).rejects.toMatchObject({ code: expect.any(String) });
+
+      await rm(artifactPath, { recursive: true, force: true });
+      await writeFile(artifactPath, JSON.stringify({
+        transaction_id: transactionId, response_artifact_status: "COMPLETE",
+        logical_step_id: logicalStepId, role: "state-validator",
+        response: { usage: { promptTokens: 3, completionTokens: 4, totalTokens: 7 } },
+      }));
+
+      await expect(loadUsage(root, "book", transactionId, [])).resolves.toMatchObject({
+        records: [expect.objectContaining({ identity: logicalStepId, totalTokens: 7 })],
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("uses Chapter Commit authority instead of stale legacy chapter/runtime recovery state", () => {
     const view = projectAutonomousProductionView({
       map, targetChapters: 156, nextChapter: 99,
@@ -454,7 +713,7 @@ describe("autonomous production Studio projection", () => {
     expect(view.economics.remainingVolumeForecast.highUsd).toBeGreaterThan(0);
     expect(view.economics.currentVolumeEstimatedTotal.highUsd!).toBeGreaterThan(view.economics.remainingVolumeForecast.highUsd!);
     expect(view.economics.fullBookForecast.highUsd!).toBeGreaterThan(view.economics.currentVolumeEstimatedTotal.highUsd!);
-    expect(view.economics.repairForecast.highUsd).toBeCloseTo(0.4288, 10);
+    expect(view.economics.repairForecast.highUsd).toBeCloseTo(0.704, 10);
     expect(view.runtimeBlockers).not.toContain("COST_GUARD_UNAVAILABLE");
     expect(view.runtimeBlockers).toContain("PENDING_STATE_REPAIR_CHAPTER_4");
   });
@@ -510,8 +769,8 @@ describe("autonomous production Studio projection", () => {
     expect(view.runtimeStatus).toBe("BLOCKED");
     expect(view.runtimeBlockers).toEqual(expect.arrayContaining([
       "PENDING_STATE_REPAIR_CHAPTER_4",
-      "LOGIC_AUDITOR_MODEL_NOT_CONFIGURED",
-      "COMMERCIAL_READER_MODEL_NOT_CONFIGURED",
+      "REVIEW_MODEL_NOT_CONFIGURED",
+      "READER_MODEL_NOT_CONFIGURED",
     ]));
   });
 

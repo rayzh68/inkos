@@ -38,8 +38,8 @@ const strings = {
   "dash.writingProgress": { zh: "写作进度", en: "Writing Progress" },
 
   // Book Detail
-  "book.writeNext": { zh: "写下一章", en: "Write Next" },
-  "book.draftOnly": { zh: "仅草稿", en: "Draft Only" },
+  "book.writeNext": { zh: "写作", en: "Write" },
+  "book.draftOnly": { zh: "草稿", en: "Draft" },
   "book.approveAll": { zh: "全部通过", en: "Approve All" },
   "book.analytics": { zh: "数据分析", en: "Analytics" },
   "book.noChapters": { zh: "暂无章节，点击「写下一章」开始", en: 'No chapters yet. Click "Write Next" to start.' },

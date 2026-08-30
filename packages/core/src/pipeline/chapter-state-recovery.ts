@@ -33,6 +33,8 @@ export interface SettlementRetryParams {
   readonly language: LengthLanguage;
   readonly logWarn?: (message: { zh: string; en: string }) => void;
   readonly logger?: Pick<Logger, "warn">;
+  readonly onExtractorRetry?: () => Promise<void> | void;
+  readonly onValidatorRetry?: () => Promise<void> | void;
 }
 
 export type SettlementRetryResult =
@@ -54,6 +56,7 @@ export async function retrySettlementAfterValidationFailure(
     en: `State validation failed; retrying settlement only for chapter ${params.chapterNumber}`,
   });
 
+  await params.onExtractorRetry?.();
   const retryOutput = await params.writer.settleChapterState({
     book: params.book,
     bookDir: params.bookDir,
@@ -74,6 +77,7 @@ export async function retrySettlementAfterValidationFailure(
 
   let retryValidation: ValidationResult;
   try {
+    await params.onValidatorRetry?.();
     retryValidation = await params.validator.validate(
       params.content,
       params.chapterNumber,

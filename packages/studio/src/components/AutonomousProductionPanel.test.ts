@@ -34,6 +34,26 @@ const blockedView: AutonomousView = {
 };
 
 describe("compact autonomous production card", () => {
+  it.each(["HELD_AFTER_TWO_REVISIONS", "REVIEW_DECISION_CONTRADICTORY"])("renders terminal review status %s as Error", (runtimeStatus) => {
+    const html = renderToStaticMarkup(createElement(AutonomousProductionCard, {
+      view: { ...blockedView, runtimeStatus }, pending: false, error: null,
+      onStart: () => undefined, onStop: () => undefined, onRepair: () => undefined,
+      onConfigureModels: () => undefined,
+    }));
+    expect(html.slice(0, html.indexOf("<details"))).toContain("Error");
+    expect(html.slice(0, html.indexOf("<details"))).not.toContain(runtimeStatus);
+  });
+
+  it.each([["en", "Paused"], ["zh", "已暂停"]] as const)("renders PAUSED_BY_USER in %s", (language, label) => {
+    const html = renderToStaticMarkup(createElement(AutonomousProductionCard, {
+      view: { ...blockedView, runtimeStatus: "PAUSED_BY_USER" }, pending: false, error: null,
+      onStart: () => undefined, onStop: () => undefined, onRepair: () => undefined,
+      onConfigureModels: () => undefined, language,
+    }));
+    expect(html.slice(0, html.indexOf("<details"))).toContain(label);
+    expect(html.slice(0, html.indexOf("<details"))).not.toContain("PAUSED_BY_USER");
+  });
+
   it("shows only operator essentials by default and keeps technical details collapsed", () => {
     const html = renderToStaticMarkup(createElement(AutonomousProductionCard, {
       view: blockedView,
@@ -47,11 +67,11 @@ describe("compact autonomous production card", () => {
     expect(html).toContain("Volume I · Chapters 001–038");
     expect(html).toContain("Current Chapter");
     expect(html).toContain("005");
-    expect(html).toContain("4 / 38 in volume");
-    expect(html).toContain("4 / 156 in book");
-    expect(html).toContain("Production role models must be configured before starting.");
-    expect(html).toContain("Configure Models");
-    expect(html).not.toContain("Repair Chapter 004 State");
+    expect(html).toContain("4 / 38");
+    expect(html).toContain("4 / 156");
+    expect(html).toContain("Configure the three production roles before starting.");
+    expect(html).toContain(">Configure<");
+    expect(html).not.toContain(">Repair<");
     expect(html).toContain("<details");
     expect(html).not.toContain("<details open");
     expect(html).not.toContain("<table");
@@ -82,12 +102,10 @@ describe("compact autonomous production card", () => {
       view, pending: false, error: null, onStart: () => undefined, onStop: () => undefined,
       onRepair: () => undefined, onConfigureModels: () => undefined,
     }));
-    expect(html).toContain("Current Volume Recorded Actual");
-    expect(html).toContain("Current Volume Forecast");
-    expect(html.indexOf("Full Book Forecast")).toBeLessThan(html.indexOf("<details"));
-    expect(html).toContain("Bounded repair forecast: $0.05–$0.16");
-    expect(html).toContain("Historical Recorded Actual: Unavailable");
-    expect(html).toContain("Historical Calculated Estimate: $0.42");
+    expect(html).toContain("Volume Actual");
+    expect(html).toContain("Volume Forecast");
+    expect(html.indexOf("Book Forecast")).toBeLessThan(html.indexOf("<details"));
+    expect(html).toContain("Chapter 004 requires state repair");
     expect(html).not.toContain("<table");
   });
 
@@ -104,7 +122,7 @@ describe("compact autonomous production card", () => {
       view, pending: false, error: null, onStart: () => undefined, onStop: () => undefined,
       onRepair: () => undefined, onConfigureModels: () => undefined,
     }));
-    expect(html).toContain("Repair Chapter 004 State");
+    expect(html).toContain(">Repair<");
     expect(html).not.toMatch(/<button disabled/);
   });
 
@@ -120,10 +138,10 @@ describe("compact autonomous production card", () => {
       view, pending: false, error: null, onStart: () => undefined, onStop: () => undefined,
       onRepair: () => undefined, onConfigureModels: () => undefined,
     }));
-    expect(html).toContain("Chapter 004 existing draft will be reused");
-    expect(html).toContain("Resume Autonomous Production");
-    expect(html).toContain("Not Configured");
-    expect(html).not.toContain("Repair Chapter 004 State");
+    expect(html).toContain("Chapter 004 will reuse its existing draft");
+    expect(html).toContain(">Resume<");
+    expect(html).toContain("not configured");
+    expect(html).not.toContain("requires state repair");
   });
 
   it("shows the preserved rescue candidate and final-review-only recovery action", () => {
@@ -155,12 +173,10 @@ describe("compact autonomous production card", () => {
       onRepair: () => undefined, onConfigureModels: () => undefined,
     }));
     expect(html).toContain("RECOVERY_READY_OFFLINE_FINALIZATION");
-    expect(html).toContain("Rescue candidate: PRESERVED");
-    expect(html).toContain("Rescue artifact identity: VERIFIED_CHAPTER_004");
-    expect(html).toContain("Decision: PASSED_WITH_NONBLOCKING_FINDINGS");
-    expect(html).toContain("Next action: FINALIZE_CHAPTER_004_AND_CONTINUE");
-    expect(html).toContain("Writer / Reviser / Reviewer calls: 0 / 0 / 0");
-    expect(html).toContain("Resume Autonomous Production");
+    expect(html.split("<details")[0]).not.toContain("RECOVERY_READY_OFFLINE_FINALIZATION");
+    expect(html).toContain("Recovery Ready");
+    expect(html).toContain("Pending Chapter 004; preserved evidence will be reused.");
+    expect(html).toContain(">Resume<");
   });
 
   it("shows a local retry countdown and disables Resume while the durable job waits", () => {
@@ -186,7 +202,7 @@ describe("compact autonomous production card", () => {
       view, pending: false, error: null, onStart: () => undefined, onStop: () => undefined,
       onRepair: () => undefined, onConfigureModels: () => undefined,
     }));
-    expect(html).toContain("Provider temporary interruption");
+    expect(html).toContain("Temporary Provider interruption");
     expect(html).toContain("Next retry");
     expect(html).toMatch(/<button disabled=""/);
     expect(autonomousFallbackPollMs("WAITING_PROVIDER_RETRY")).toBe(12_000);
@@ -205,13 +221,12 @@ describe("compact autonomous production card", () => {
       view, pending: false, error: null, onStart: () => undefined, onStop: () => undefined,
       onRepair: () => undefined, onConfigureModels: () => undefined,
     }));
-    expect(html).toContain("Provider outcome is ambiguous");
-    expect(html).toContain("may have incurred cost");
-    expect(html).toContain("check Provider logs before choosing Resume");
+    expect(html).toContain("Provider outcome is uncertain");
+    expect(html).toContain("Automatic retry is disabled");
     expect(autonomousFallbackPollMs(view.runtimeStatus)).toBeNull();
   });
 
-  it("shows one bilingual abandon-and-rewrite action only for active STAGING authority", () => {
+  it("uses locale-exclusive compact Rewrite and Resume actions for active STAGING authority", () => {
     const view: AutonomousView = {
       ...blockedView,
       runtimeStatus: "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME",
@@ -221,19 +236,57 @@ describe("compact autonomous production card", () => {
     };
     const html = renderToStaticMarkup(createElement(AutonomousProductionCard, {
       view, pending: false, error: null, onStart: () => undefined, onStop: () => undefined,
-      onRepair: () => undefined, onAbandon: () => undefined, onConfigureModels: () => undefined,
+      onRepair: () => undefined, onAbandon: () => undefined, onConfigureModels: () => undefined, language: "en",
     }));
-    expect(html).toContain("Discard Current Attempt &amp; Rewrite Chapter");
-    expect(html).toContain("放弃当前尝试并重写本章");
-    expect(ATTEMPT_ABANDON_CONFIRMATION).toContain("preserved as history");
-    expect(ATTEMPT_ABANDON_CONFIRMATION).toContain("restart from Writer");
-    expect(ATTEMPT_ABANDON_CONFIRMATION).toContain("Provider cost cannot be recovered");
+    expect(html).toContain(">Rewrite<");
+    expect(html).toContain(">Resume<");
+    expect(html).not.toMatch(/[\u3400-\u9fff]/u);
+    expect(html.split("<details")[0]).not.toContain("PAUSED_AMBIGUOUS_PROVIDER_OUTCOME");
+    expect(ATTEMPT_ABANDON_CONFIRMATION.en).toContain("preserved as history");
+
+    const zhHtml = renderToStaticMarkup(createElement(AutonomousProductionCard, {
+      view, pending: false, error: null, onStart: () => undefined, onStop: () => undefined,
+      onRepair: () => undefined, onAbandon: () => undefined, onConfigureModels: () => undefined, language: "zh",
+    }));
+    expect(zhHtml).toContain(">重写<");
+    expect(zhHtml).toContain(">继续<");
+    expect(zhHtml).not.toContain(">Rewrite<");
+    expect(zhHtml).not.toContain(">Resume<");
+    expect(zhHtml.split("<details")[0]).not.toContain("PAUSED_AMBIGUOUS_PROVIDER_OUTCOME");
 
     const readyHtml = renderToStaticMarkup(createElement(AutonomousProductionCard, {
       view: { ...view, chapterTransaction: { state: "NOT_STARTED", canAbandonAttempt: false } },
       pending: false, error: null, onStart: () => undefined, onStop: () => undefined,
       onRepair: () => undefined, onAbandon: () => undefined, onConfigureModels: () => undefined,
     }));
-    expect(readyHtml).not.toContain("Discard Current Attempt");
+    expect(readyHtml).not.toContain(">Rewrite<");
+  });
+
+  it("renders logical calls and Provider transports as separate current-attempt metrics", () => {
+    const view: AutonomousView = {
+      ...blockedView,
+      economics: {
+        ...blockedView.economics,
+        currentAttempt: {
+          logicalCalls: 1,
+          providerTransports: 3,
+          promptTokens: 10,
+          completionTokens: 5,
+          totalTokens: 15,
+          tokenDiscrepancy: 0,
+          estimatedCostUsd: 0.01,
+          actualCostUsd: null,
+          unknownLegacyTotal: 0,
+        },
+      },
+    };
+    const html = renderToStaticMarkup(createElement(AutonomousProductionCard, {
+      view, pending: false, error: null, onStart: () => undefined, onStop: () => undefined,
+      onRepair: () => undefined, onConfigureModels: () => undefined,
+    }));
+
+    expect(html).toContain("Logical Calls");
+    expect(html).toContain("Provider Transports");
+    expect(html).not.toContain("Current Attempt Calls");
   });
 });

@@ -280,7 +280,7 @@ export function Dashboard({ nav, sse, theme, t }: { nav: Nav; sse: { messages: R
                       </span>
                     )}
                   </div>
-                  {autonomous && <AutonomousDashboardSummary autonomous={autonomous} onOpen={() => nav.toBookSettings(book.id)} />}
+                  {autonomous && <AutonomousDashboardSummary autonomous={autonomous} onOpen={() => nav.toBookSettings(book.id)} language={t("nav.connected") === "已连接" ? "zh" : "en"} />}
                 </div>
 
                 <div className="flex items-center gap-3 shrink-0 ml-6">

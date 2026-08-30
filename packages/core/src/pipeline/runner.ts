@@ -3080,6 +3080,7 @@ export class PipelineRunner {
           chapterNumber,
           ...writeInput,
           lengthSpec,
+          ...(chapterTransaction ? { deferStateSettlement: true } : {}),
           ...(wordCount ? { wordCountOverride: wordCount } : {}),
           ...(temperatureOverride ? { temperatureOverride } : {}),
         });
@@ -3190,9 +3191,10 @@ export class PipelineRunner {
         },
         onStage: async (stage, detail) => {
           const role = stage === "LOGIC_REVIEW"
-            ? "auditor"
+            ? "logic-canon-auditor"
             : stage === "READER_REVIEW" ? "commercial-reader" : "reviser";
-          const identity = this.resolveOverride(role);
+          const overrideRole = role === "logic-canon-auditor" ? "auditor" : role;
+          const identity = this.resolveOverride(overrideRole);
           await this.config.onAutonomousStage?.({
             stage,
             role,
@@ -3339,10 +3341,10 @@ export class PipelineRunner {
     this.throwIfOperationAborted();
     this.throwIfOperationAborted();
     if (this.config.boundedAutonomousReview) {
-      const identity = this.resolveOverride("state-validator");
+      const identity = this.resolveOverride("chapter-analyzer");
       await this.config.onAutonomousStage?.({
         stage: "SETTLING_STATE",
-        role: "observer-reflector",
+        role: "final-state-extractor",
         provider: identity.client.service ?? identity.client.provider,
         model: identity.model,
         ...(chapterTransaction ? { transactionId: chapterTransaction.transactionId } : {}),
@@ -3370,7 +3372,8 @@ export class PipelineRunner {
       finalContent,
       lengthSpec.countingMode,
       reducedControlInput,
-      preservedReviewPlan !== undefined,
+      preservedReviewPlan !== undefined || chapterTransaction !== undefined,
+      chapterTransaction?.transactionId,
     );
     const finalTitleResolution = resolveDuplicateTitle(
       persistenceOutput.title,
@@ -3466,6 +3469,16 @@ export class PipelineRunner {
       readFile(join(storyDir, "chapter_summaries.md"), "utf-8").catch(() => ""),
     ]);
     const validator = new StateValidatorAgent(this.agentCtxFor("state-validator", bookId));
+    if (chapterTransaction) {
+      const identity = this.resolveOverride("state-validator");
+      await this.config.onAutonomousStage?.({
+        stage: "SETTLING_STATE",
+        role: "state-validator",
+        provider: identity.client.service ?? identity.client.provider,
+        model: identity.model,
+        transactionId: chapterTransaction.transactionId,
+      });
+    }
     const truthValidation = await validateChapterTruthPersistence({
       writer,
       validator,
@@ -3490,11 +3503,61 @@ export class PipelineRunner {
       language: pipelineLang,
       logWarn: (message) => this.logWarn(pipelineLang, message),
       logger: this.config.logger,
+      ...(chapterTransaction ? {
+        semanticRecovery: {
+          allowSemanticRetry: true,
+          onSemanticRetry: async () => {
+            const identity = this.resolveOverride("state-validator");
+            await this.config.onAutonomousStage?.({
+              stage: "SETTLING_STATE",
+              role: "state-validator-semantic-retry",
+              provider: identity.client.service ?? identity.client.provider,
+              model: identity.model,
+              transactionId: chapterTransaction.transactionId,
+            });
+          },
+          onSettlementExtractorRetry: async () => {
+            const identity = this.resolveOverride("writer");
+            await this.config.onAutonomousStage?.({
+              stage: "SETTLING_STATE",
+              role: "final-state-extractor-settlement-repair",
+              provider: identity.client.service ?? identity.client.provider,
+              model: identity.model,
+              transactionId: chapterTransaction.transactionId,
+            });
+          },
+          onSettlementValidatorRetry: async () => {
+            const identity = this.resolveOverride("state-validator");
+            await this.config.onAutonomousStage?.({
+              stage: "SETTLING_STATE",
+              role: "state-validator-settlement-repair",
+              provider: identity.client.service ?? identity.client.provider,
+              model: identity.model,
+              transactionId: chapterTransaction.transactionId,
+            });
+          },
+        },
+      } : {}),
     });
     let chapterStatus: ChapterPipelineResult["status"] | null = truthValidation.chapterStatus;
     let degradedIssues: ReadonlyArray<AuditIssue> = truthValidation.degradedIssues;
     persistenceOutput = truthValidation.persistenceOutput;
     auditResult = truthValidation.auditResult;
+    if (chapterTransaction) {
+      roleUsage ??= {};
+      roleUsage["final-state-extractor"] = PipelineRunner.addUsage(
+        roleUsage["final-state-extractor"] ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        truthValidation.stateUsage.extractor,
+      );
+      roleUsage["state-validator"] = PipelineRunner.addUsage(
+        roleUsage["state-validator"] ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        truthValidation.stateUsage.validator,
+      );
+      totalUsage = Object.values(roleUsage).reduce(
+        (sum, usage) => PipelineRunner.addUsage(sum, usage),
+        { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      );
+    }
 
     // 4.2 Final paragraph shape check on persisted content (post-normalize, post-revise)
     {
@@ -4624,6 +4687,7 @@ ${matrix}`,
       ruleStack: RuleStack;
     },
     forceAnalyze = false,
+    transactionId?: string,
   ): Promise<WriteChapterOutput> {
     if (!forceAnalyze && finalContent === output.content) {
       return output;
@@ -4639,6 +4703,21 @@ ${matrix}`,
       chapterIntent: reducedControlInput?.chapterIntent,
       contextPackage: reducedControlInput?.contextPackage,
       ruleStack: reducedControlInput?.ruleStack,
+      ...(transactionId ? {
+        semanticRecovery: {
+          allowSemanticRetry: true,
+          onSemanticRetry: async () => {
+            const identity = this.resolveOverride("chapter-analyzer");
+            await this.config.onAutonomousStage?.({
+              stage: "SETTLING_STATE",
+              role: "final-state-extractor-semantic-retry",
+              provider: identity.client.service ?? identity.client.provider,
+              model: identity.model,
+              transactionId,
+            });
+          },
+        },
+      } : {}),
     });
 
     return {
@@ -4648,7 +4727,7 @@ ${matrix}`,
       postWriteErrors: [],
       postWriteWarnings: [],
       hookHealthIssues: output.hookHealthIssues,
-      tokenUsage: output.tokenUsage,
+      tokenUsage: transactionId ? analyzed.tokenUsage : output.tokenUsage,
     };
   }
 
@@ -5213,27 +5292,40 @@ ${matrix}`,
     const plan = await this.resolveGovernedPlan(book, bookDir, chapterNumber, externalContext, options);
     const composerCtx = this.agentCtxFor("composer", book.id);
     const composer = new ComposerAgent(composerCtx);
-    if (options?.transactionId) {
+    const emitComposerOperation = async (role: string) => {
+      if (!options?.transactionId) return;
       const identity = this.resolveOverride("composer");
       await this.config.onAutonomousStage?.({
-        stage: "PREPARING", role: "composer", provider: identity.client.service ?? identity.client.provider,
+        stage: "PREPARING", role, provider: identity.client.service ?? identity.client.provider,
         model: identity.model, transactionId: options.transactionId,
       });
-    }
+    };
     const composed = await composeGovernedChapter({
       book,
       bookDir,
       chapterNumber,
       plan,
       contextBudget: contextBudgetFromClient(composerCtx.client),
-      compressibleContextCompiler: (request) => composer.compileCompressibleContext(request),
-      outlineSectionSelector: (request) => composer.selectOutlineSections(request),
-      memorySemanticSelector: (request) => composer.selectMemoryCandidates(request),
+      compressibleContextCompiler: async (request) => {
+        await emitComposerOperation("context-compression");
+        return composer.compileCompressibleContext(request);
+      },
+      outlineSectionSelector: async (request) => {
+        await emitComposerOperation(request.fileName.includes("story_frame") ? "story-frame-selector" : "volume-map-selector");
+        return composer.selectOutlineSections(request);
+      },
+      memorySemanticSelector: async (request) => {
+        await emitComposerOperation("memory-selector");
+        return composer.selectMemoryCandidates(request);
+      },
       referenceContextProvider: (request) => selectBookReferenceContext(
         this.config.projectRoot,
         book.id,
         request,
-        (selectionRequest) => composer.selectReferenceSections(selectionRequest),
+        async (selectionRequest) => {
+          await emitComposerOperation("reference-selector");
+          return composer.selectReferenceSections(selectionRequest);
+        },
       ),
       onContextCompression: this.config.onContextCompression,
     });

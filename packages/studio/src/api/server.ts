@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 import { serve } from "@hono/node-server";
-import { buildProductionRoleOverrides, isTextGenerationCatalogModel, validateProductionRoleSelection, type ProductionModelCatalogEntry, type ProductionRoleSelection } from "../pages/production-role-models.js";
+import { buildProductionRoleOverrides, isTextGenerationCatalogModel, migrateLegacyProductionRoleSelection, validateProductionRoleSelection, type ProductionModelCatalogEntry, type ProductionRoleSelection } from "../pages/production-role-models.js";
 import { gzipSync } from "node:zlib";
 import { randomUUID } from "node:crypto";
 import {
@@ -166,6 +166,7 @@ import {
   AutonomousJobRegistry,
   AUTONOMOUS_BUDGET_NOT_CONFIGURED,
   classifyStateRepairError,
+  createCurrentTransactionUsageLoader,
   loadAutonomousRuntime,
   loadSafeAutonomousConfig,
   projectAutonomousProductionView,
@@ -2583,6 +2584,7 @@ async function probeServiceCapabilities(args: {
 // --- Server factory ---
 
 export function createStudioServer(initialConfig: ProjectConfig, root: string, overrides: { readonly nodeImageGenerator?: NodeImageDeps } = {}) {
+  const loadCurrentTransactionUsage = createCurrentTransactionUsageLoader();
   const app = new Hono();
   const state = new StateManager(root);
   let cachedConfig = initialConfig;
@@ -2775,18 +2777,27 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const offlineFinalizationPlan = !transactionEnabled && recoveryChapter
       ? await resolveOfflineFinalizationPlan({ projectRoot: root, bookId, pendingChapter: recoveryChapter, nextChapter, runtime }).catch(() => null)
       : null;
+    const currentAttemptUsage = await loadCurrentTransactionUsage(
+      root,
+      bookId,
+      transactionAuthority?.activeTransactionId,
+      runtime?.providerAttemptHistory,
+    );
+    const formalRoleRouting = buildProductionRoleOverrides(productionModels.selection, safeConfig.modelOverrides);
     const view = projectAutonomousProductionView({
       map,
       targetChapters: book.targetChapters,
       nextChapter: nextChapterOverride ?? nextChapter,
       chapters,
-      config: safeConfig,
+      config: { ...safeConfig, defaultModel: formalRoleRouting.defaultModel, modelOverrides: formalRoleRouting.modelOverrides },
       catalog: productionModels.catalog,
       runtime,
       offlineFinalizationPlan,
       active: autonomousJobs.isActive(bookId),
       budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
       transactionAuthority,
+      currentAttemptUsage: currentAttemptUsage.records,
+      currentAttemptTelemetryWarnings: currentAttemptUsage.integrityWarnings,
     });
     return { view, offlineFinalizationPlan };
   }
@@ -2966,7 +2977,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       && persistedRecoveryOwnership?.bookId === bookId
       && persistedRecoveryOwnership.jobId === persistedRuntime.jobId
       && persistedRuntime.mode === mode
-      && ["RUNNING", "WAITING_PROVIDER_RETRY", "PAUSED_PROVIDER_UNAVAILABLE", "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", "PAUSED_DETERMINISTIC_PROVIDER_ERROR"].includes(persistedRuntime.status)
+      && ["RUNNING", "WAITING_PROVIDER_RETRY", "PAUSED_PROVIDER_UNAVAILABLE", "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", "PAUSED_DETERMINISTIC_PROVIDER_ERROR", "PAUSED_PIPELINE_ERROR"].includes(persistedRuntime.status)
       && persistedRuntime.lastError !== "STATE_REBASELINE_VALIDATION_FAILED"
       && persistedRuntime.reason !== "STATE_REBASELINE_VALIDATION_FAILED";
     const recoveringProviderWait = persistedRuntime?.status === "WAITING_PROVIDER_RETRY"
@@ -3000,8 +3011,12 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     let providerRecovery: ReturnType<typeof createAutonomousProviderExecution>;
     try {
       const pipelineConfig = await buildPipelineConfig({ bookIdForSettings: bookId });
+      const formalRoleSelection = (await loadProductionRoleModels({ probeCatalog: false })).selection;
+      const formalRoleRouting = buildProductionRoleOverrides(formalRoleSelection, pipelineConfig.modelOverrides ?? {});
       pipeline = new PipelineRunner({
         ...pipelineConfig,
+        model: formalRoleRouting.defaultModel,
+        modelOverrides: formalRoleRouting.modelOverrides,
         chapterReviewMode: "auto",
         boundedAutonomousReview: true,
         onAutonomousStage: async (event) => {
@@ -3230,6 +3245,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           latest.status === "PAUSED_PROVIDER_UNAVAILABLE"
           || latest.status === "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME"
           || latest.status === "PAUSED_DETERMINISTIC_PROVIDER_ERROR"
+          || latest.status === "PAUSED_PIPELINE_ERROR"
         );
         if (!controllerAlreadyPersistedTerminalProviderState) {
           await saveAutonomousRuntime(root, bookId, {
@@ -6027,7 +6043,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
 
   // --- Model overrides ---
 
-  async function loadProductionRoleModels() {
+  async function loadProductionRoleModels(options: { readonly probeCatalog?: boolean } = {}) {
     const raw = await loadRawConfig(root);
     const llm = raw.llm && typeof raw.llm === "object" && !Array.isArray(raw.llm) ? raw.llm as Record<string, unknown> : {};
     const service = typeof llm.service === "string" ? llm.service : "";
@@ -6044,7 +6060,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const defaultModel = typeof llm.defaultModel === "string" ? llm.defaultModel : typeof llm.model === "string" ? llm.model : null;
     let catalog: ReadonlyArray<ProductionModelCatalogEntry> = [];
     let catalogStatus: "AVAILABLE" | "CATALOG_UNAVAILABLE" = "CATALOG_UNAVAILABLE";
-    if (connected && service === "openrouter") {
+    if (options.probeCatalog !== false && connected && service === "openrouter") {
       const baseUrl = configured?.baseUrl?.trim() || resolveServicePreset(service)?.baseUrl;
       const apiKey = secrets.services[service]?.apiKey ?? "";
       if (baseUrl) {
@@ -6066,7 +6082,17 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         if (catalog.length > 0) catalogStatus = "AVAILABLE";
       }
     }
-    return { raw, llm, service, connected, registeredModels, catalog, catalogStatus, overrides, selection: { writer: defaultModel, logicAuditor: model("auditor"), commercialReader: model("commercial-reader"), reviser: model("reviser"), observerReflector: model("observer-reflector") } };
+    const storedSelection = raw.productionRoles && typeof raw.productionRoles === "object" && !Array.isArray(raw.productionRoles)
+      ? raw.productionRoles as Partial<ProductionRoleSelection>
+      : {};
+    return { raw, llm, service, connected, registeredModels, catalog, catalogStatus, overrides, selection: migrateLegacyProductionRoleSelection({
+      ...storedSelection,
+      writer: defaultModel ?? undefined,
+      logicAuditor: model("auditor") ?? undefined,
+      commercialReader: model("commercial-reader") ?? undefined,
+      reviser: model("reviser") ?? undefined,
+      observerReflector: model("observer-reflector") ?? undefined,
+    }) };
   }
 
   app.get("/api/v1/project/production-role-models", async (c) => {
@@ -6083,6 +6109,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const next = buildProductionRoleOverrides(selection, current.overrides);
     current.llm.defaultModel = next.defaultModel;
     current.raw.modelOverrides = next.modelOverrides;
+    current.raw.productionRoles = selection;
     syncTopLevelLlmMirror(current.llm);
     await saveRawConfig(root, current.raw);
     const persisted = await loadProductionRoleModels();
@@ -6096,11 +6123,9 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
 
   app.put("/api/v1/project/model-overrides", async (c) => {
     const { overrides } = await c.req.json<{ overrides: Record<string, unknown> }>();
-    const configPath = join(root, "inkos.json");
-    const raw = JSON.parse(await readFile(configPath, "utf-8"));
-    raw.modelOverrides = overrides;
-    const { writeFile: writeFileFs } = await import("node:fs/promises");
-    await writeFileFs(configPath, JSON.stringify(raw, null, 2), "utf-8");
+    const current = await loadProductionRoleModels({ probeCatalog: false });
+    current.raw.modelOverrides = buildProductionRoleOverrides(current.selection, overrides).modelOverrides;
+    await saveRawConfig(root, current.raw);
     return c.json({ ok: true });
   });
 

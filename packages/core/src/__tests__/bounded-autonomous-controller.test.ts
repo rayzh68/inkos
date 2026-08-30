@@ -9,6 +9,29 @@ import type { BookProductionMap } from "../production/book-production-map.js";
 import type { ChapterMeta } from "../models/chapter.js";
 import { abandonChapterTransactionAttempt, beginChapterTransaction, createChapterGenesis } from "../production/chapter-transaction.js";
 
+const providerResponseFsReads = vi.hoisted(() => ({ directoryScans: 0, failNextProductionStateRename: false }));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    readdir: async (...args: Parameters<typeof actual.readdir>) => {
+      if (String(args[0]).replace(/\\/gu, "/").endsWith("/provider-responses")) {
+        providerResponseFsReads.directoryScans += 1;
+      }
+      return Reflect.apply(actual.readdir, actual, args);
+    },
+    rename: async (...args: Parameters<typeof actual.rename>) => {
+      if (providerResponseFsReads.failNextProductionStateRename
+        && String(args[1]).replace(/\\/gu, "/").endsWith("/production-state.json")) {
+        providerResponseFsReads.failNextProductionStateRename = false;
+        throw new Error("synthetic returned checkpoint persistence failure");
+      }
+      return Reflect.apply(actual.rename, actual, args);
+    },
+  };
+});
+
 const map: BookProductionMap = {
   schemaVersion: "1.0",
   bookId: "book",
@@ -377,6 +400,187 @@ describe("bounded autonomous production controller", () => {
     }
   });
 
+  it("pauses as a pipeline error when local success persistence fails after one returned transport", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-local-persist-failure-"));
+    try {
+      const oneChapterMap: BookProductionMap = {
+        ...map,
+        totalChapters: 1,
+        volumes: [{ volumeId: "volume-001", volumeNumber: 1, title: "One", startChapter: 1, endChapter: 1, chapterCount: 1 }],
+      };
+      const jobId = deriveAutonomousJobIdentity({ map: oneChapterMap, mode: "current-volume", nextChapter: 1 });
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      const responseDir = join(runtimeDir, "provider-responses");
+      await mkdir(runtimeDir, { recursive: true });
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId, status: "RUNNING", mode: "current-volume", volumeId: "volume-001",
+        startChapter: 1, targetChapter: 1, nextChapter: 1, completedThisRun: 0,
+      }));
+      const stage = { stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId: "chapter-txn-local-persist" };
+      const execution = createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId, getActiveStage: () => stage });
+      let nextChapter = 1;
+      let transportCalls = 0;
+      const persisted: AutonomousRunProgress[] = [];
+      const result = await runBoundedAutonomousScope({
+        map: oneChapterMap,
+        mode: "current-volume",
+        getNextChapter: async () => nextChapter,
+        runChapter: async () => {
+          await execution.runProviderCall(1, async () => {
+            transportCalls += 1;
+            await rm(responseDir, { recursive: true, force: true });
+            await writeFile(responseDir, "provider response directory unavailable");
+            return { content: "transport returned", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+          }, { provider: "test", model: "model", inputFingerprint: "a".repeat(64) });
+          nextChapter += 1;
+          return { status: "ready-for-review" };
+        },
+        shouldStop: () => false,
+        persistProgress: async (progress) => {
+          persisted.push(progress);
+          await saveAutonomousProductionState(root, "book", progress);
+        },
+        providerRecovery: execution,
+      });
+
+      expect(result).toMatchObject({ status: "PAUSED_PIPELINE_ERROR", nextChapter: 1 });
+      expect(transportCalls).toBe(1);
+      expect(result.providerAttemptHistory).toHaveLength(1);
+      expect(result.providerAttemptHistory?.[0]).toMatchObject({
+        transactionId: stage.transactionId,
+        classification: "TRANSPORT_STARTED",
+        transportStarted: true,
+        transportReturned: true,
+      });
+      expect(persisted.at(-1)).toMatchObject({ status: "PAUSED_PIPELINE_ERROR" });
+      await expect(readdir(join(root, "books", "book", "story", "commits"))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves intended returned evidence when the returned checkpoint save fails once", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-returned-checkpoint-failure-"));
+    try {
+      const oneChapterMap: BookProductionMap = {
+        ...map,
+        totalChapters: 1,
+        volumes: [{ volumeId: "volume-001", volumeNumber: 1, title: "One", startChapter: 1, endChapter: 1, chapterCount: 1 }],
+      };
+      const jobId = deriveAutonomousJobIdentity({ map: oneChapterMap, mode: "current-volume", nextChapter: 1 });
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      await mkdir(runtimeDir, { recursive: true });
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId, status: "RUNNING", mode: "current-volume", volumeId: "volume-001",
+        startChapter: 1, targetChapter: 1, nextChapter: 1, completedThisRun: 0,
+      }));
+      const stage = { stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId: "chapter-txn-returned-checkpoint" };
+      const execution = createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId, getActiveStage: () => stage });
+      let nextChapter = 1;
+      let transportCalls = 0;
+      const result = await runBoundedAutonomousScope({
+        map: oneChapterMap,
+        mode: "current-volume",
+        getNextChapter: async () => nextChapter,
+        runChapter: async () => {
+          await execution.runProviderCall(1, async () => {
+            transportCalls += 1;
+            providerResponseFsReads.failNextProductionStateRename = true;
+            return { content: "transport returned", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+          }, { provider: "test", model: "model", inputFingerprint: "b".repeat(64) });
+          nextChapter += 1;
+          return { status: "ready-for-review" };
+        },
+        shouldStop: () => false,
+        persistProgress: async (progress) => { await saveAutonomousProductionState(root, "book", progress); },
+        providerRecovery: execution,
+      });
+
+      expect(result).toMatchObject({
+        status: "PAUSED_PIPELINE_ERROR",
+        nextChapter: 1,
+        lastErrorClassification: "DETERMINISTIC_PIPELINE_ERROR",
+      });
+      expect(transportCalls).toBe(1);
+      expect(result.providerAttemptHistory).toHaveLength(1);
+      expect(result.providerAttemptHistory?.[0]).toMatchObject({
+        transactionId: stage.transactionId,
+        transportStarted: true,
+        transportReturned: true,
+      });
+      await expect(readdir(join(root, "books", "book", "story", "commits"))).rejects.toMatchObject({ code: "ENOENT" });
+
+      await expect(execution.runProviderCall(1, async () => {
+        transportCalls += 1;
+        return { content: "must not replay", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "test", model: "model", inputFingerprint: "b".repeat(64) })).rejects.toThrow("OPERATOR_DECISION_REQUIRED");
+      expect(transportCalls).toBe(1);
+      const durable = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
+      expect(durable.status).toBe("PAUSED_PIPELINE_ERROR");
+      expect(durable.providerAttemptHistory).toMatchObject([{
+        transportStarted: true,
+        transportReturned: true,
+      }]);
+    } finally {
+      providerResponseFsReads.failNextProductionStateRename = false;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let an unrelated local error override the current job provider history", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-history-authority-"));
+    try {
+      const oneChapterMap: BookProductionMap = {
+        ...map,
+        totalChapters: 1,
+        volumes: [{ volumeId: "volume-001", volumeNumber: 1, title: "One", startChapter: 1, endChapter: 1, chapterCount: 1 }],
+      };
+      const jobId = deriveAutonomousJobIdentity({ map: oneChapterMap, mode: "current-volume", nextChapter: 1 });
+      const currentLogicalStepId = `provider-step-${"1".repeat(64)}`;
+      const staleLogicalStepId = `provider-step-${"2".repeat(64)}`;
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      await mkdir(runtimeDir, { recursive: true });
+      const currentHistory = [{
+        transportAttemptId: `${currentLogicalStepId}:transport-attempt:1`, logicalStepId: currentLogicalStepId,
+        chapterNumber: 1, role: "writer", provider: "test", requestedModel: "model", transactionId: "current-txn",
+        attempt: 1, classification: "TRANSPORT_STARTED", transportStarted: true, transportReturned: true,
+        recordedAt: "2026-08-30T00:00:00.000Z",
+      }];
+      const staleHistory = [{
+        transportAttemptId: `${staleLogicalStepId}:transport-attempt:1`, logicalStepId: staleLogicalStepId,
+        chapterNumber: 99, role: "writer", provider: "other", requestedModel: "other-model", transactionId: "other-txn",
+        attempt: 1, classification: "TRANSPORT_STARTED", transportStarted: true, transportReturned: true,
+        recordedAt: "2026-08-30T00:00:00.000Z",
+      }];
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId, status: "RUNNING", mode: "current-volume", volumeId: "volume-001",
+        startChapter: 1, targetChapter: 1, nextChapter: 1, completedThisRun: 0,
+        providerAttemptHistory: currentHistory,
+      }));
+      const execution = createAutonomousProviderExecution({
+        projectRoot: root, bookId: "book", jobId,
+        getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId: "current-txn" }),
+      });
+      const unrelatedError = Object.assign(new Error("unrelated local pipeline failure"), {
+        providerAttemptHistory: staleHistory,
+      });
+      const result = await runBoundedAutonomousScope({
+        map: oneChapterMap,
+        mode: "current-volume",
+        getNextChapter: async () => 1,
+        runChapter: async () => { throw unrelatedError; },
+        shouldStop: () => false,
+        persistProgress: async () => {},
+        providerRecovery: execution,
+      });
+
+      expect(result).toMatchObject({ status: "PAUSED_PIPELINE_ERROR", lastErrorClassification: "DETERMINISTIC_PIPELINE_ERROR" });
+      expect(result.providerAttemptHistory).toEqual(currentHistory);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("durably closes a returned retry failure, starts attempt 2, then replays only COMPLETE", async () => {
     const root = await mkdtemp(join(tmpdir(), "inkos-provider-returned-retry-"));
     try {
@@ -418,6 +622,210 @@ describe("bounded autonomous production controller", () => {
       ]);
       expect(new Set(runtime.providerAttemptHistory.map((entry: { transportAttemptId: string }) => entry.transportAttemptId)).size).toBe(2);
       expect(runtime.responseArtifactStatus).toBe("COMPLETE");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("enforces the fixed 18 logical-call budget per chapter transaction without charging COMPLETE replay", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-logical-budget-"));
+    try {
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      await mkdir(runtimeDir, { recursive: true });
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId: "job", status: "RUNNING", mode: "current-volume", nextChapter: 5,
+      }));
+      const stage = { stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId: "chapter-txn-budget" };
+      const execution = createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId: "job", getActiveStage: () => stage });
+      let transports = 0;
+      const requests = Array.from({ length: 18 }, (_, index) => ({
+        provider: "test", model: "model", inputFingerprint: index.toString(16).padStart(64, "0"),
+      }));
+      for (const request of requests) {
+        await execution.runProviderCall(5, async () => {
+          transports += 1;
+          return { content: request.inputFingerprint, usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+        }, request);
+      }
+      const replay = await execution.runProviderCall(5, async () => {
+        transports += 1;
+        throw new Error("COMPLETE replay must not use transport");
+      }, requests[0]!);
+      expect(replay.content).toBe(requests[0]!.inputFingerprint);
+
+      await expect(execution.runProviderCall(5, async () => {
+        transports += 1;
+        return { content: "over budget", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "test", model: "model", inputFingerprint: "f".repeat(64) }))
+        .rejects.toThrow("CHAPTER_LOGICAL_MODEL_CALL_LIMIT_REACHED");
+      expect(transports).toBe(18);
+      const runtime = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
+      expect(new Set(runtime.providerAttemptHistory.map((entry: { logicalStepId: string }) => entry.logicalStepId)).size).toBe(18);
+      expect(runtime.providerAttemptHistory.every((entry: { transactionId?: string }) => entry.transactionId === stage.transactionId)).toBe(true);
+
+      // COMPLETE artifacts are the durable transaction authority. A restart from
+      // pre-ceiling history that lacks transactionId must not reset admission.
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        ...runtime,
+        providerAttemptHistory: runtime.providerAttemptHistory.map(({ transactionId: _ignored, ...entry }: { transactionId?: string }) => entry),
+      }));
+      const restarted = createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId: "job", getActiveStage: () => stage });
+      await expect(restarted.runProviderCall(5, async () => {
+        transports += 1;
+        return { content: "restart must remain capped", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "test", model: "model", inputFingerprint: "e".repeat(64) }))
+        .rejects.toThrow("CHAPTER_LOGICAL_MODEL_CALL_LIMIT_REACHED");
+      expect(transports).toBe(18);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("enforces the fixed 24 transport budget per transaction and resets it for a fresh attempt", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-transport-budget-"));
+    try {
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      await mkdir(runtimeDir, { recursive: true });
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId: "job", status: "RUNNING", mode: "current-volume", nextChapter: 5,
+      }));
+      let transactionId = "chapter-txn-attempt-1";
+      const execution = createAutonomousProviderExecution({
+        projectRoot: root, bookId: "book", jobId: "job",
+        getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId }),
+      });
+      let transports = 0;
+      for (let logical = 0; logical < 8; logical += 1) {
+        const request = { provider: "test", model: "model", inputFingerprint: logical.toString(16).padStart(64, "a") };
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          await expect(execution.runProviderCall(5, async () => {
+            transports += 1;
+            throw Object.assign(new Error("HTTP 503 bounded retry"), { status: 503 });
+          }, request)).rejects.toThrow("503");
+        }
+      }
+      await expect(execution.runProviderCall(5, async () => {
+        transports += 1;
+        return { content: "must not run", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "test", model: "model", inputFingerprint: "f".repeat(64) }))
+        .rejects.toThrow("CHAPTER_PROVIDER_TRANSPORT_LIMIT_REACHED");
+      expect(transports).toBe(24);
+
+      transactionId = "chapter-txn-attempt-2";
+      const fresh = await execution.runProviderCall(5, async () => {
+        transports += 1;
+        return { content: "fresh attempt", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "test", model: "model", inputFingerprint: "f".repeat(64) });
+      expect(fresh.content).toBe("fresh attempt");
+      expect(transports).toBe(25);
+      const runtime = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
+      expect(runtime.providerAttemptHistory.filter((entry: { transactionId?: string }) => entry.transactionId === "chapter-txn-attempt-1")).toHaveLength(24);
+      expect(runtime.providerAttemptHistory.filter((entry: { transactionId?: string }) => entry.transactionId === "chapter-txn-attempt-2")).toHaveLength(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("bootstraps COMPLETE admission evidence once per transaction executor instead of rescanning the book for every transport", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-admission-bootstrap-"));
+    try {
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      await mkdir(runtimeDir, { recursive: true });
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId: "job", status: "RUNNING", mode: "current-volume", nextChapter: 5,
+      }));
+      const transactionId = "chapter-txn-bootstrap";
+      const execution = createAutonomousProviderExecution({
+        projectRoot: root,
+        bookId: "book",
+        jobId: "job",
+        getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId }),
+      });
+      providerResponseFsReads.directoryScans = 0;
+
+      for (const fingerprint of ["1".repeat(64), "2".repeat(64)]) {
+        await execution.runProviderCall(5, async () => ({
+          content: fingerprint,
+          usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+        }), { provider: "test", model: "model", inputFingerprint: fingerprint });
+      }
+
+      expect(providerResponseFsReads.directoryScans).toBe(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not bootstrap the same transaction twice when one executor observes another transaction between calls", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-admission-multi-transaction-"));
+    try {
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      await mkdir(runtimeDir, { recursive: true });
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId: "job", status: "RUNNING", mode: "current-volume", nextChapter: 5,
+      }));
+      let transactionId = "chapter-txn-a";
+      const execution = createAutonomousProviderExecution({
+        projectRoot: root,
+        bookId: "book",
+        jobId: "job",
+        getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId }),
+      });
+      providerResponseFsReads.directoryScans = 0;
+
+      for (const [nextTransactionId, fingerprint] of [
+        ["chapter-txn-a", "3".repeat(64)],
+        ["chapter-txn-b", "4".repeat(64)],
+        ["chapter-txn-a", "5".repeat(64)],
+      ] as const) {
+        transactionId = nextTransactionId;
+        await execution.runProviderCall(5, async () => ({
+          content: fingerprint,
+          usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+        }), { provider: "test", model: "model", inputFingerprint: fingerprint });
+      }
+
+      expect(providerResponseFsReads.directoryScans).toBe(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("charges pre-upgrade unbound returned failures to the active chapter transaction transport cap", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-upgrade-budget-"));
+    try {
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      await mkdir(runtimeDir, { recursive: true });
+      const transactionId = "chapter-txn-upgrade";
+      const history = Array.from({ length: 24 }, (_, index) => ({
+        transportAttemptId: `legacy-step-${Math.floor(index / 3)}:transport-attempt:${index % 3 + 1}`,
+        logicalStepId: `legacy-step-${Math.floor(index / 3)}`,
+        chapterNumber: 5,
+        role: "writer",
+        provider: "test",
+        requestedModel: "model",
+        ...(index < 21 ? { transactionId } : {}),
+        attempt: index % 3 + 1,
+        classification: "RETRYABLE_PROVIDER_HTTP",
+        transportStarted: true,
+        transportReturned: true,
+        recordedAt: "2026-08-30T00:00:00.000Z",
+      }));
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId: "job", status: "RUNNING", mode: "current-volume", nextChapter: 5,
+        chapterNumber: 5, providerAttemptHistory: history,
+      }));
+      const execution = createAutonomousProviderExecution({
+        projectRoot: root, bookId: "book", jobId: "job",
+        getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId }),
+      });
+      let transports = 0;
+      await expect(execution.runProviderCall(5, async () => {
+        transports += 1;
+        return { content: "must not run", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "test", model: "model", inputFingerprint: "d".repeat(64) }))
+        .rejects.toThrow("CHAPTER_PROVIDER_TRANSPORT_LIMIT_REACHED");
+      expect(transports).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -994,7 +1402,7 @@ describe("bounded autonomous production controller", () => {
       providerRecovery: { execute: async (_chapter, task) => task(), loadPersistedProgress: async () => null, now: () => 0, sleep },
     });
     expect(result).toMatchObject({
-      status: "PAUSED_DETERMINISTIC_PROVIDER_ERROR",
+      status: "PAUSED_PIPELINE_ERROR",
       checkpoint: "DETERMINISTIC_PIPELINE_ERROR",
       lastErrorClassification: "DETERMINISTIC_PIPELINE_ERROR",
     });
@@ -1071,6 +1479,65 @@ describe("bounded autonomous production controller", () => {
       const runtime = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
       expect(runtime.providerAttemptHistory).toHaveLength(2);
       expect(new Set(runtime.providerAttemptHistory.map((entry: { logicalStepId: string }) => entry.logicalStepId)).size).toBe(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves two semantically invalid state COMPLETE artifacts and repeated Resume creates no third call", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-autonomous-state-semantic-exhaustion-"));
+    try {
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      await mkdir(runtimeDir, { recursive: true });
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId: "job", status: "RUNNING", mode: "current-volume", nextChapter: 5,
+      }));
+      let role = "final-state-extractor";
+      const transactionId = "chapter-txn-semantic-state";
+      const execution = createAutonomousProviderExecution({
+        projectRoot: root, bookId: "book", jobId: "job",
+        getActiveStage: () => ({ stage: "SETTLING_STATE", role, provider: "test", model: "model", transactionId }),
+      });
+      const fingerprint = "9".repeat(64);
+      let transports = 0;
+      const first = await execution.runProviderCall(5, async () => {
+        transports += 1;
+        return { content: " ", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "test", model: "model", inputFingerprint: fingerprint });
+      const firstPath = execution.responseArtifactPath(fingerprint, "test", "model", 5);
+      const firstBytes = await readFile(firstPath);
+
+      role = "final-state-extractor-semantic-retry";
+      const second = await execution.runProviderCall(5, async () => {
+        transports += 1;
+        return { content: "\n", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "test", model: "model", inputFingerprint: fingerprint });
+      const secondPath = execution.responseArtifactPath(fingerprint, "test", "model", 5);
+      const secondBytes = await readFile(secondPath);
+
+      role = "final-state-extractor";
+      const replayedFirst = await execution.runProviderCall(5, async () => {
+        transports += 1;
+        throw new Error("Resume must not transport first semantic identity");
+      }, { provider: "test", model: "model", inputFingerprint: fingerprint });
+      role = "final-state-extractor-semantic-retry";
+      const replayedSecond = await execution.runProviderCall(5, async () => {
+        transports += 1;
+        throw new Error("Resume must not create semantic call three");
+      }, { provider: "test", model: "model", inputFingerprint: fingerprint });
+
+      expect(first.content).toBe(" ");
+      expect(second.content).toBe("\n");
+      expect(replayedFirst).toEqual(first);
+      expect(replayedSecond).toEqual(second);
+      expect(firstPath).not.toBe(secondPath);
+      expect(await readFile(firstPath)).toEqual(firstBytes);
+      expect(await readFile(secondPath)).toEqual(secondBytes);
+      expect(transports).toBe(2);
+      const runtime = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
+      expect(runtime.providerAttemptHistory).toHaveLength(2);
+      expect(new Set(runtime.providerAttemptHistory.map((entry: { logicalStepId: string }) => entry.logicalStepId)).size).toBe(2);
+      await expect(readdir(join(root, "books", "book", "story", "commits"))).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await rm(root, { recursive: true, force: true });
     }

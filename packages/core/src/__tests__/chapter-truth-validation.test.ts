@@ -64,18 +64,44 @@ const BOOK: BookConfig = {
 };
 
 describe("validateChapterTruthPersistence", () => {
+  it("preserves verified actual cost for one extractor and one validator call", async () => {
+    const result = await validateChapterTruthPersistence({
+      writer: { settleChapterState: vi.fn() },
+      validator: { validate: vi.fn().mockResolvedValue(createValidationResult({
+        tokenUsage: { promptTokens: 3, completionTokens: 4, totalTokens: 7, actualCostUsd: 0.02 },
+      })) },
+      book: BOOK, bookDir: "/tmp/book", chapterNumber: 2, title: "Known costs", content: "Body.",
+      persistenceOutput: createWriterOutput({
+        tokenUsage: { promptTokens: 1, completionTokens: 2, totalTokens: 3, actualCostUsd: 0.01 },
+      }),
+      auditResult: createAuditResult(),
+      previousTruth: { oldState: "old", oldHooks: "old hooks", oldLedger: "old ledger" },
+      language: "en", logWarn: vi.fn(),
+    });
+    expect(result.stateUsage).toEqual({
+      extractor: { promptTokens: 1, completionTokens: 2, totalTokens: 3, actualCostUsd: 0.01 },
+      validator: { promptTokens: 3, completionTokens: 4, totalTokens: 7, actualCostUsd: 0.02 },
+    });
+  });
+
   it("retries settlement when the validator requests repair without a hard contradiction", async () => {
+    const onSettlementExtractorRetry = vi.fn();
+    const onSettlementValidatorRetry = vi.fn();
     const validator = {
       validate: vi.fn()
         .mockResolvedValueOnce(createValidationResult({
           passed: false,
           repairRequired: true,
           warnings: [{ category: "missing_state_update", description: "位置尚未更新。" }],
+          tokenUsage: { promptTokens: 1, completionTokens: 2, totalTokens: 3, actualCostUsd: 0.01 },
         }))
-        .mockResolvedValueOnce(createValidationResult()),
+        .mockResolvedValueOnce(createValidationResult({ tokenUsage: { promptTokens: 4, completionTokens: 5, totalTokens: 9 } })),
     };
     const writer = {
-      settleChapterState: vi.fn().mockResolvedValue(createWriterOutput({ updatedState: "码头" })),
+      settleChapterState: vi.fn().mockResolvedValue(createWriterOutput({
+        updatedState: "码头",
+        tokenUsage: { promptTokens: 6, completionTokens: 7, totalTokens: 13, actualCostUsd: 0.02 },
+      })),
     };
 
     const result = await validateChapterTruthPersistence({
@@ -86,16 +112,25 @@ describe("validateChapterTruthPersistence", () => {
       chapterNumber: 2,
       title: "抵达码头",
       content: "林舟抵达码头。",
-      persistenceOutput: createWriterOutput({ updatedState: "车站" }),
+      persistenceOutput: createWriterOutput({
+        updatedState: "车站",
+        tokenUsage: { promptTokens: 2, completionTokens: 3, totalTokens: 5, actualCostUsd: 0.01 },
+      }),
       auditResult: createAuditResult(),
       previousTruth: { oldState: "车站", oldHooks: "hooks", oldLedger: "ledger" },
       language: "zh",
       logWarn: vi.fn(),
+      semanticRecovery: { onSettlementExtractorRetry, onSettlementValidatorRetry },
     });
 
     expect(writer.settleChapterState).toHaveBeenCalledTimes(1);
     expect(result.chapterStatus).toBeNull();
     expect(result.persistenceOutput.updatedState).toBe("码头");
+    expect(onSettlementExtractorRetry).toHaveBeenCalledTimes(1);
+    expect(onSettlementValidatorRetry).toHaveBeenCalledTimes(1);
+    expect(result.stateUsage.extractor).toMatchObject({ promptTokens: 8, completionTokens: 10, totalTokens: 18, actualCostUsd: 0.03 });
+    expect(result.stateUsage.validator).toMatchObject({ promptTokens: 5, completionTokens: 7, totalTokens: 12 });
+    expect(result.stateUsage.validator.actualCostUsd).toBeUndefined();
   });
 
   it("uses recovered settlement output when retry succeeds", async () => {

@@ -186,7 +186,7 @@ export function ProjectSettings({ nav, theme, t }: { nav: Nav; theme: Theme; t: 
   const { data: promptPacksData, refetch: refetchPromptPacks } = useApi<PromptPacksResponse>("/prompt-packs");
   const [defaultService, setDefaultService] = useState("");
   const [defaultModel, setDefaultModel] = useState("");
-  const [productionRoles, setProductionRoles] = useState<ProductionRoleSelection>({ writer: "", logicAuditor: "", commercialReader: "", reviser: "", observerReflector: "" });
+  const [productionRoles, setProductionRoles] = useState<ProductionRoleSelection>({ production: "", review: "", reader: "" });
   const [researchSearch, setResearchSearch] = useState<ResearchSearchDraft>({ ...DEFAULT_RESEARCH_SEARCH });
   const [overrideRows, setOverrideRows] = useState<OverrideRow[]>([]);
   const [notifyChannels, setNotifyChannels] = useState<NotifyChannelDraft[]>([]);
@@ -222,11 +222,9 @@ export function ProjectSettings({ nav, theme, t }: { nav: Nav; theme: Theme; t: 
   useEffect(() => {
     if (!productionRolesData) return;
     setProductionRoles({
-      writer: productionRolesData.selection.writer ?? "",
-      logicAuditor: productionRolesData.selection.logicAuditor ?? "",
-      commercialReader: productionRolesData.selection.commercialReader ?? "",
-      reviser: productionRolesData.selection.reviser ?? "",
-      observerReflector: productionRolesData.selection.observerReflector ?? "",
+      production: productionRolesData.selection.production ?? "",
+      review: productionRolesData.selection.review ?? "",
+      reader: productionRolesData.selection.reader ?? "",
     });
   }, [productionRolesData]);
 
@@ -322,19 +320,16 @@ export function ProjectSettings({ nav, theme, t }: { nav: Nav; theme: Theme; t: 
       )}
 
       <div data-testid="production-role-models" data-verification-values="VERIFIED_IN_CURRENT_CATALOG SAVED_MODEL_NOT_IN_CURRENT_CATALOG UNVERIFIED_MANUAL_MODEL_ID CATALOG_UNAVAILABLE">
-      <SettingsCard title="Autonomous Production Models" description="Search the current OpenRouter catalog or enter an exact provider/model slug for each fixed production responsibility." icon={<Bot size={18} />}>
+      <SettingsCard title={isZh ? "自动生产模型" : "Autonomous Production Models"} description={isZh ? "为三个正式生产角色选择模型。" : "Select models for the three formal production roles."} icon={<Bot size={18} />}>
         <div className="grid gap-3 lg:grid-cols-2">
           {([
-            ["writer", "Writer", "Initial chapter prose generation."],
-            ["logicAuditor", "Logic Auditor", "Independently checks canon and logic."],
-            ["commercialReader", "Commercial Reader", "Evaluates reader and market effect."],
-            ["reviser", "Reviser", "Applies bounded review findings."],
-            ["observerReflector", "Observer / Reflector", "Settles chapter facts and state."],
+            ["production", isZh ? "生产" : "Production", isZh ? "规划、写作、修订与最终状态工作。" : "Planning, writing, revision, and final state work."],
+            ["review", isZh ? "审核" : "Review", isZh ? "独立检查逻辑、设定与连续性。" : "Independent logic, canon, and continuity review."],
+            ["reader", isZh ? "读者" : "Reader", isZh ? "评估读者体验与商业效果。" : "Reader and commercial-effect evaluation."],
           ] as const).map(([key,label,description]) => <ProductionModelField key={key} role={key} label={label} description={description} value={productionRoles[key]} savedValue={productionRolesData?.selection[key] ?? ""} data={productionRolesData ?? undefined} onChange={(model)=>setProductionRoles((current)=>({...current,[key]:model}))} />)}
         </div>
-        <p className="text-xs text-muted-foreground">Connected service: {productionRolesData?.service ?? "none"}. Catalog: {productionRolesData?.catalogStatus ?? "loading"}. Saving records explicit model IDs only and does not call a model.</p>
-        <p className="text-xs text-amber-700 dark:text-amber-300">OpenRouter role routing remains explicit. Studio never chooses openrouter/auto automatically and never adds automatic fallback.</p>
-        <button disabled={saving === "production-roles" || !productionRolesData?.connected} onClick={()=>void runSave("production-roles",async()=>{await putApi("/project/production-role-models",{selection:productionRoles});await refetchProductionRoles();},"Autonomous production models saved and reloaded from disk.")} className="rounded-lg bg-primary px-4 py-2 text-sm font-bold text-primary-foreground disabled:opacity-40">Save production models</button>
+        <p className="text-xs text-muted-foreground">{isZh ? `已连接服务：${productionRolesData?.service ?? "无"}。目录：${productionRolesData?.catalogStatus ?? "加载中"}。保存不会调用模型。` : `Connected service: ${productionRolesData?.service ?? "none"}. Catalog: ${productionRolesData?.catalogStatus ?? "loading"}. Saving does not call a model.`}</p>
+        <button disabled={saving === "production-roles" || !productionRolesData?.connected} onClick={()=>void runSave("production-roles",async()=>{await putApi("/project/production-role-models",{selection:productionRoles});await refetchProductionRoles();},isZh ? "生产模型已保存。" : "Production models saved.")} className="rounded-lg bg-primary px-4 py-2 text-sm font-bold text-primary-foreground disabled:opacity-40">{isZh ? "保存" : "Save"}</button>
       </SettingsCard>
       </div>
 
