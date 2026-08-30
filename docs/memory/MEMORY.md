@@ -81,6 +81,15 @@
 - 忽略的旧 `dist` 不得覆盖更新的 source。Source checkout 的 freshness refresh 必须复用完整正式 Studio build，而不能只运行 client build 后永久清空共享 `dist` 中的 compiled server artifacts。
 - UI presentation 收敛不改变 Resume endpoint/handler/disabled semantics，也不改变 Rewrite/abandon confirmation 或 production semantics。
 
+### Full-book default and BookDetail live refresh
+
+- Ordinary Autonomous Production Resume/Start 默认使用 `full-book`；Volume 不再是要求普通用户重新点击的 execution boundary，正式书籍最后一章完成后进入 `BOOK_COMPLETE`。
+- Identity-bound recovery 必须保留 persisted `runtime.mode`。既有 `current-volume` Provider、pipeline、ambiguous-outcome 或 formal preserved recovery identity 不得被普通 UI 默认值改写为 `full-book`。
+- BookDetail 章节列表以 matching-book `autonomous:chapter-complete` 作为 autonomous live-refresh contract；普通 autonomous start、phase、progress、complete、paused 和 error 不触发 chapter-list refetch。
+- BookDetail 复用既有 SSE cursor，逐条消费批次新增消息；因此 batch 中间事件和初始空 stream 后的第一条 chapter completion 不会丢失。没有新增 polling、watcher、queue 或第二套 SSE subsystem。
+- 该产品修正由 PR `rayzh68/inkos#16` 以 merge commit 合入；final reviewed head `04755e11ce96570a3dd720bff84f6af34ccf0538` 通过 `GPT_FULL_BOOK_AND_REFRESH_SOURCE_REVIEW`，Core source 保持 0 修改。
+- NON-BLOCKING FOLLOW-UP：historical recovery terminal-promotion 尚未统一发送 `autonomous:chapter-complete`；后续如需规范化，必须单独定界，不得把本次正常 autonomous Chapter Commit 路径的修复扩大解释为历史路径已解决。
+
 ## 5. 不应反复重新设计的架构决定
 
 - Chapter Transaction 是章节生产和提交的正式边界。
