@@ -34,6 +34,139 @@ const blockedView: AutonomousView = {
 };
 
 describe("compact autonomous production card", () => {
+  it.each([
+    ["RUNNING", "Running", "运行中"],
+    ["REPAIRING", "Running", "运行中"],
+    ["WAITING_PROVIDER_RETRY", "Waiting", "等待中"],
+    ["PAUSED_BY_USER", "Paused", "已暂停"],
+    ["PAUSED_PROVIDER_UNAVAILABLE", "Paused", "已暂停"],
+    ["PAUSED_DETERMINISTIC_PROVIDER_ERROR", "Paused", "已暂停"],
+    ["PAUSED_PIPELINE_ERROR", "Paused", "已暂停"],
+    ["PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", "Needs Attention", "需要处理"],
+    ["VOLUME_COMPLETE", "Volume Complete", "本卷完成"],
+    ["BOOK_COMPLETE", "Complete", "已完成"],
+    ["READY", "Ready", "就绪"],
+    ["READY_TO_REWRITE_SAME_CHAPTER", "Ready", "就绪"],
+    ["RECOVERY_READY_OFFLINE_FINALIZATION", "Ready", "就绪"],
+  ] as const)("maps %s to locale-exclusive user status", (runtimeStatus, expectedEn, expectedZh) => {
+    const render = (language: "en" | "zh") => renderToStaticMarkup(createElement(AutonomousProductionCard, {
+      view: { ...blockedView, runtimeStatus, runtimeBlockers: [], startEnabled: true },
+      pending: false,
+      error: null,
+      onStart: () => undefined,
+      onStop: () => undefined,
+      onRepair: () => undefined,
+      onConfigureModels: () => undefined,
+      language,
+    })).split("<details")[0];
+
+    expect(render("en")).toContain(`>${expectedEn}<`);
+    expect(render("zh")).toContain(`>${expectedZh}<`);
+  });
+
+  it("shows only the three product roles with compact model families on the main card", () => {
+    const view: AutonomousView = {
+      ...blockedView,
+      runtimeStatus: "PAUSED_DETERMINISTIC_PROVIDER_ERROR",
+      runtimeBlockers: [],
+      startEnabled: true,
+      roles: {
+        production: "openai/gpt-5.4",
+        review: "deepseek/deepseek-v3",
+        reader: "google/gemini-2.5-pro",
+      },
+    };
+    const html = renderToStaticMarkup(createElement(AutonomousProductionCard, {
+      view,
+      pending: false,
+      error: null,
+      onStart: () => undefined,
+      onStop: () => undefined,
+      onRepair: () => undefined,
+      onConfigureModels: () => undefined,
+      language: "en",
+    }));
+    const main = html.split("<details")[0];
+
+    expect(main).toContain("Production");
+    expect(main).toContain("Review");
+    expect(main).toContain("Reader");
+    expect(main).toContain(">GPT<");
+    expect(main).toContain(">DeepSeek<");
+    expect(main).toContain(">Gemini<");
+    expect(main).not.toContain("openai/gpt-5.4");
+    expect(main).not.toContain("deepseek/deepseek-v3");
+    expect(main).not.toContain("google/gemini-2.5-pro");
+    expect(html).toContain("production=openai/gpt-5.4");
+    expect(html).toContain("review=deepseek/deepseek-v3");
+    expect(html).toContain("reader=google/gemini-2.5-pro");
+  });
+
+  it("uses a short collapsed Details entry while retaining raw audit evidence inside", () => {
+    const view: AutonomousView = {
+      ...blockedView,
+      runtimeStatus: "PAUSED_DETERMINISTIC_PROVIDER_ERROR",
+      runtimeBlockers: [],
+      runtime: {
+        status: "PAUSED_DETERMINISTIC_PROVIDER_ERROR",
+        phase: "SETTLING_STATE",
+        activeRole: "observer-reflector",
+        activeProvider: "openrouter",
+        activeModel: "deepseek/deepseek-v4-flash-0731",
+        attempt: 1,
+        logicalStepId: "chapter-005:settlement",
+        transportAttemptId: "transport-attempt-one",
+        responseArtifactStatus: "PERSISTED",
+      },
+      economics: {
+        ...blockedView.economics,
+        currentAttempt: {
+          logicalCalls: 1,
+          providerTransports: 1,
+          promptTokens: 10,
+          completionTokens: 5,
+          totalTokens: 15,
+          tokenDiscrepancy: 0,
+          estimatedCostUsd: 0.01,
+          actualCostUsd: null,
+          unknownLegacyTotal: 0,
+        },
+      },
+    };
+    const html = renderToStaticMarkup(createElement(AutonomousProductionCard, {
+      view,
+      pending: false,
+      error: null,
+      onStart: () => undefined,
+      onStop: () => undefined,
+      onRepair: () => undefined,
+      onConfigureModels: () => undefined,
+      language: "en",
+    }));
+    const main = html.split("<details")[0];
+
+    expect(html).toContain("<details");
+    expect(html).not.toContain("<details open");
+    expect(html).toContain(">Details</summary>");
+    expect(html).not.toContain(">Advanced Details</summary>");
+    expect(main).not.toContain("PAUSED_DETERMINISTIC_PROVIDER_ERROR");
+    expect(main).not.toContain("SETTLING_STATE");
+    expect(main).not.toContain("observer-reflector");
+    expect(main).not.toContain("openrouter");
+    expect(main).not.toContain("transport-attempt-one");
+    expect(main).not.toContain("chapter-005:settlement");
+    expect(main).not.toContain("Logical Calls");
+    expect(main).not.toContain("Provider Transports");
+    expect(main).not.toContain("Tokens");
+    expect(html).toContain("PAUSED_DETERMINISTIC_PROVIDER_ERROR");
+    expect(html).toContain("SETTLING_STATE");
+    expect(html).toContain("observer-reflector");
+    expect(html).toContain("openrouter");
+    expect(html).toContain("chapter-005:settlement");
+    expect(html).toContain("Current logical calls");
+    expect(html).toContain("Provider transports");
+  });
+
   it.each(["HELD_AFTER_TWO_REVISIONS", "REVIEW_DECISION_CONTRADICTORY"])("renders terminal review status %s as Error", (runtimeStatus) => {
     const html = renderToStaticMarkup(createElement(AutonomousProductionCard, {
       view: { ...blockedView, runtimeStatus }, pending: false, error: null,
@@ -262,7 +395,7 @@ describe("compact autonomous production card", () => {
     expect(readyHtml).not.toContain(">Rewrite<");
   });
 
-  it("renders logical calls and Provider transports as separate current-attempt metrics", () => {
+  it("keeps logical calls and Provider transports separate inside Details", () => {
     const view: AutonomousView = {
       ...blockedView,
       economics: {
@@ -285,8 +418,11 @@ describe("compact autonomous production card", () => {
       onRepair: () => undefined, onConfigureModels: () => undefined,
     }));
 
-    expect(html).toContain("Logical Calls");
-    expect(html).toContain("Provider Transports");
+    const main = html.split("<details")[0];
+    expect(main).not.toContain("Logical Calls");
+    expect(main).not.toContain("Provider Transports");
+    expect(html).toContain("Current logical calls");
+    expect(html).toContain("Provider transports");
     expect(html).not.toContain("Current Attempt Calls");
   });
 });
