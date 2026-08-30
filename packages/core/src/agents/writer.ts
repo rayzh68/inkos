@@ -5,7 +5,7 @@ import type { BookRules } from "../models/book-rules.js";
 import { buildWriterSystemPrompt, type FanficContext } from "./writer-prompts.js";
 import { buildSettlerSystemPrompt, buildSettlerUserPrompt } from "./settler-prompts.js";
 import { buildObserverSystemPrompt, buildObserverUserPrompt } from "./observer-prompts.js";
-import { parseSettlerDeltaOutput } from "./settler-delta-parser.js";
+import { hasSettlerDeltaEnvelope, parseSettlerDeltaOutput } from "./settler-delta-parser.js";
 import { parseSettlementOutput } from "./settler-parser.js";
 import { readGenreProfile, readBookRules } from "./rules-reader.js";
 import {
@@ -617,7 +617,7 @@ export class WriterAgent extends BaseAgent {
       runtimeStateDelta?: RuntimeStateDelta;
       runtimeStateSnapshot?: RuntimeStateSnapshot;
     };
-    try {
+    if (hasSettlerDeltaEnvelope(response.content)) {
       const deltaOutput = parseSettlerDeltaOutput(response.content);
       mergedSettlement = {
         postSettlement: deltaOutput.postSettlement,
@@ -630,7 +630,7 @@ export class WriterAgent extends BaseAgent {
         updatedEmotionalArcs: "",
         updatedCharacterMatrix: "",
       };
-    } catch {
+    } else {
       const settlement = parseSettlementOutput(response.content, params.genreProfile);
       mergedSettlement = governedControlBlock
         ? {

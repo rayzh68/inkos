@@ -14,6 +14,30 @@ function sanitizeJSON(str: string): string {
     .replace(/,\s*([}\]])/g, "$1");
 }
 
+export function hasSettlerDeltaEnvelope(content: string): boolean {
+  return content.includes("=== RUNTIME_STATE_DELTA ===");
+}
+
+function normalizePersistedHookStatusAlias(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const delta = value as Record<string, unknown>;
+  const hookOps = delta.hookOps;
+  if (!hookOps || typeof hookOps !== "object" || Array.isArray(hookOps)) return value;
+  const upsert = (hookOps as Record<string, unknown>).upsert;
+  if (!Array.isArray(upsert)) return value;
+
+  return {
+    ...delta,
+    hookOps: {
+      ...hookOps,
+      upsert: upsert.map((hook) => hook && typeof hook === "object" && !Array.isArray(hook)
+        && (hook as Record<string, unknown>).status === "pressured"
+        ? { ...hook, status: "progressing" }
+        : hook),
+    },
+  };
+}
+
 export function parseSettlerDeltaOutput(content: string): SettlerDeltaOutput {
   const extract = (tag: string): string => {
     const regex = new RegExp(
@@ -39,7 +63,7 @@ export function parseSettlerDeltaOutput(content: string): SettlerDeltaOutput {
   try {
     return {
       postSettlement: extract("POST_SETTLEMENT"),
-      runtimeStateDelta: RuntimeStateDeltaSchema.parse(parsed),
+      runtimeStateDelta: RuntimeStateDeltaSchema.parse(normalizePersistedHookStatusAlias(parsed)),
     };
   } catch (error) {
     throw new Error(`runtime state delta failed schema validation: ${String(error)}`);

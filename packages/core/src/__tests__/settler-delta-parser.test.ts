@@ -51,6 +51,58 @@ describe("parseSettlerDeltaOutput", () => {
     expect(result.runtimeStateDelta.chapterSummary?.title).toBe("河埠对账");
   });
 
+  it("normalizes the exact persisted pressured hook status to progressing before validation", () => {
+    const result = parseSettlerDeltaOutput([
+      "=== RUNTIME_STATE_DELTA ===",
+      "```json",
+      JSON.stringify({
+        chapter: 6,
+        hookOps: {
+          upsert: [{
+            hookId: "mentor-debt",
+            startChapter: 1,
+            type: "relationship",
+            status: "pressured",
+            lastAdvancedChapter: 6,
+            expectedPayoff: "Reveal the debt.",
+            notes: "The chapter applies pressure to the debt.",
+          }],
+          resolve: [],
+          defer: [],
+        },
+        notes: [],
+      }),
+      "```",
+    ].join("\n"));
+
+    expect(result.runtimeStateDelta.hookOps.upsert[0]?.status).toBe("progressing");
+  });
+
+  it.each(["open", "progressing", "deferred", "resolved"] as const)("preserves canonical hook status %s", (status) => {
+    const result = parseSettlerDeltaOutput([
+      "=== RUNTIME_STATE_DELTA ===",
+      JSON.stringify({
+        chapter: 6,
+        hookOps: {
+          upsert: [{
+            hookId: "mentor-debt",
+            startChapter: 1,
+            type: "relationship",
+            status,
+            lastAdvancedChapter: 6,
+            expectedPayoff: "Reveal the debt.",
+            notes: "The hook keeps its canonical status.",
+          }],
+          resolve: [],
+          defer: [],
+        },
+        notes: [],
+      }),
+    ].join("\n"));
+
+    expect(result.runtimeStateDelta.hookOps.upsert[0]?.status).toBe(status);
+  });
+
   it("rejects invalid runtime-state delta payloads", () => {
     expect(() =>
       parseSettlerDeltaOutput([
