@@ -74,6 +74,13 @@
 - 隔离 worktree 并行写入只适用于真正独立、有 ownership 与 integration contract 的任务；worktree lifecycle 必须包含任务完成后的 cleanup。
 - Active worktree 在任务期间不是 TEMP/orphan；完成使命且 commits 已进入 authority 后应使用 `git worktree remove` 与 `git worktree prune`，并以 ownership + disposable status 证明清理安全。
 
+### Post-PR14 user-facing UI convergence
+
+- Post-PR14 user-facing UI convergence 已通过外部 GPT UI source review，并以 PR `rayzh68/inkos#15` merge；最终 reviewed head 为 `3d75c98e69c431ab94f0e5f242b0ea14c5eee5df`，merge commit 为 `f1a63ed8145c507d00f6bb872a5cc6a6149fcd8a`。
+- 普通 Autonomous Production 页面只展示 Production、Review、Reader 三个产品角色，并使用短状态和短操作；raw status、phase、内部角色、Provider/model 和 transport evidence 保留在默认折叠的 Details 中。
+- 忽略的旧 `dist` 不得覆盖更新的 source。Source checkout 的 freshness refresh 必须复用完整正式 Studio build，而不能只运行 client build 后永久清空共享 `dist` 中的 compiled server artifacts。
+- UI presentation 收敛不改变 Resume endpoint/handler/disabled semantics，也不改变 Rewrite/abandon confirmation 或 production semantics。
+
 ## 5. 不应反复重新设计的架构决定
 
 - Chapter Transaction 是章节生产和提交的正式边界。
