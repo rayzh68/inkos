@@ -1,8 +1,7 @@
 import { startStudioServer } from "./server.js";
 import { resolve, join, dirname } from "node:path";
-import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { shouldBuildStudioFrontend } from "./studio-frontend-assets.js";
+import { refreshStudioFrontend, shouldBuildStudioFrontend } from "./studio-frontend-assets.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -18,7 +17,7 @@ const distDir = join(studioRoot, "dist");
 if (shouldBuildStudioFrontend(studioRoot)) {
   console.log("Building frontend...");
   try {
-    execSync("npx vite build", { cwd: studioRoot, stdio: "inherit" });
+    refreshStudioFrontend(studioRoot);
   } catch {
     console.error("Failed to build frontend. Run 'cd packages/studio && pnpm build' manually.");
     process.exit(1);

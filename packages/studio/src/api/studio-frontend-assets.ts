@@ -1,4 +1,5 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
+import { execSync } from "node:child_process";
 import { join } from "node:path";
 
 function newestFileMtimeMs(path: string): number {
@@ -31,4 +32,8 @@ export function shouldBuildStudioFrontend(studioRoot: string): boolean {
   } catch {
     return true;
   }
+}
+
+export function refreshStudioFrontend(studioRoot: string): void {
+  execSync("npm run build", { cwd: studioRoot, stdio: "inherit" });
 }

@@ -1,8 +1,9 @@
-import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { shouldBuildStudioFrontend } from "./studio-frontend-assets.js";
+import { refreshStudioFrontend, shouldBuildStudioFrontend } from "./studio-frontend-assets.js";
 
 const roots: string[] = [];
 
@@ -30,6 +31,43 @@ async function studioFixture(input: { readonly sourceMtime: number; readonly dis
 }
 
 describe("Studio frontend startup freshness", () => {
+  it("restores the compiled server entry after stale client cleanup", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-studio-build-"));
+    roots.push(root);
+    const studioPackage = JSON.parse(await readFile(
+      fileURLToPath(new URL("../../package.json", import.meta.url)),
+      "utf8",
+    )) as { readonly scripts: { readonly build: string } };
+    await mkdir(join(root, "dist", "api"), { recursive: true });
+    await mkdir(join(root, "scripts"), { recursive: true });
+    await writeFile(join(root, "dist", "api", "index.js"), "old server\n", "utf8");
+    await writeFile(join(root, "package.json"), JSON.stringify({
+      scripts: {
+        build: studioPackage.scripts.build,
+        "build:client": "node scripts/build-client.mjs",
+        "build:server": "node scripts/build-server.mjs",
+      },
+    }), "utf8");
+    await writeFile(join(root, "scripts", "build-client.mjs"), [
+      'import { mkdir, rm, writeFile } from "node:fs/promises";',
+      'await rm("dist", { recursive: true, force: true });',
+      'await mkdir("dist", { recursive: true });',
+      'await writeFile("dist/index.html", "fresh client\\n");',
+    ].join("\n"), "utf8");
+    await writeFile(join(root, "scripts", "build-server.mjs"), [
+      'import { mkdir, writeFile } from "node:fs/promises";',
+      'await mkdir("dist/api", { recursive: true });',
+      'await writeFile("dist/api/index.js", "fresh server\\n");',
+    ].join("\n"), "utf8");
+
+    refreshStudioFrontend(root);
+
+    await expect(access(join(root, "dist", "index.html"))).resolves.toBeUndefined();
+    await expect(access(join(root, "dist", "api", "index.js"))).resolves.toBeUndefined();
+    await expect(readFile(join(root, "dist", "api", "index.js"), "utf8"))
+      .resolves.toBe("fresh server\n");
+  });
+
   it("rebuilds a stale dist once when Studio runs from source", async () => {
     const fixture = await studioFixture({ sourceMtime: 200, distMtime: 100 });
     expect(shouldBuildStudioFrontend(fixture.root)).toBe(true);
