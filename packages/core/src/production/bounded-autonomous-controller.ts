@@ -474,6 +474,17 @@ interface PersistedProviderResponseArtifact {
 
 const MAX_CHAPTER_TRANSACTION_LOGICAL_CALLS = 18;
 const MAX_CHAPTER_TRANSACTION_PROVIDER_TRANSPORTS = 24;
+const RETURNED_TRANSPORT_CHECKPOINT_FAILURE = "AUTONOMOUS_RETURNED_TRANSPORT_CHECKPOINT_FAILURE";
+
+interface ReturnedTransportCheckpointFailureEnvelope {
+  readonly code: typeof RETURNED_TRANSPORT_CHECKPOINT_FAILURE;
+  readonly checkpoint: {
+    readonly jobId: string;
+    readonly chapterNumber: number;
+    readonly logicalStepId: string;
+    readonly providerAttemptHistory: AutonomousRunProgress["providerAttemptHistory"];
+  };
+}
 
 async function loadTransactionCompleteLogicalStepIds(
   projectRoot: string,
@@ -2185,22 +2196,36 @@ export function createAutonomousProviderExecution(params: {
       transportReturned: true,
       recordedAt: new Date(params.now?.() ?? Date.now()).toISOString(),
     };
-    await saveAutonomousProductionState(params.projectRoot, params.bookId, {
-      ...progress,
-      logicalStepId: identity.logicalStepId,
-      chapterNumber: activeChapter,
-      role: identity.role,
-      stage: identity.stage,
-      provider: identity.provider,
-      requestedModel: identity.model,
-      attempt: started.attempt,
-      maxAttempts: 3,
-      transportRetryCount: Math.max(0, started.attempt - 1),
-      transportAttemptId: started.transportAttemptId,
-      providerAttemptHistory: history,
-      checkpoint: "TRANSPORT_RETURNED",
-      responseArtifactStatus: "NONE",
-    });
+    try {
+      await saveAutonomousProductionState(params.projectRoot, params.bookId, {
+        ...progress,
+        logicalStepId: identity.logicalStepId,
+        chapterNumber: activeChapter,
+        role: identity.role,
+        stage: identity.stage,
+        provider: identity.provider,
+        requestedModel: identity.model,
+        attempt: started.attempt,
+        maxAttempts: 3,
+        transportRetryCount: Math.max(0, started.attempt - 1),
+        transportAttemptId: started.transportAttemptId,
+        providerAttemptHistory: history,
+        checkpoint: "TRANSPORT_RETURNED",
+        responseArtifactStatus: "NONE",
+      });
+    } catch (error) {
+      const checkpointError = error instanceof Error ? error : new Error(String(error), { cause: error });
+      Object.assign(checkpointError, {
+        code: RETURNED_TRANSPORT_CHECKPOINT_FAILURE,
+        checkpoint: {
+          jobId: params.jobId,
+          chapterNumber: activeChapter,
+          logicalStepId: identity.logicalStepId,
+          providerAttemptHistory: history,
+        },
+      } satisfies ReturnedTransportCheckpointFailureEnvelope);
+      throw checkpointError;
+    }
   };
   const normalizeLegacyEmptyResponseAttempt = async (
     identity: LLMCallExecutionIdentity,
@@ -2516,6 +2541,18 @@ export async function runBoundedAutonomousScope(params: {
         if (!params.providerRecovery) throw error;
         if (!(error instanceof LLMCallExecutionError)) {
           const latest = await params.providerRecovery.loadPersistedProgress();
+          const checkpoint = error && typeof error === "object"
+            && (error as { readonly code?: unknown }).code === RETURNED_TRANSPORT_CHECKPOINT_FAILURE
+            ? (error as Partial<ReturnedTransportCheckpointFailureEnvelope>).checkpoint
+            : undefined;
+          const intendedHistory = checkpoint?.jobId === jobId
+            && checkpoint.chapterNumber === chapterNumber
+            && checkpoint.logicalStepId
+            && checkpoint.providerAttemptHistory?.some((entry) => entry.logicalStepId === checkpoint.logicalStepId
+              && entry.transportStarted && entry.transportReturned)
+            ? checkpoint.providerAttemptHistory
+            : undefined;
+          const durableHistory = intendedHistory ?? (latest?.jobId === jobId ? latest.providerAttemptHistory : undefined);
           const paused = project(
             "PAUSED_PIPELINE_ERROR",
             durableNextChapter,
@@ -2524,9 +2561,7 @@ export async function runBoundedAutonomousScope(params: {
               chapterNumber,
               checkpoint: "DETERMINISTIC_PIPELINE_ERROR",
               lastErrorClassification: "DETERMINISTIC_PIPELINE_ERROR",
-              ...(latest?.jobId === jobId && latest.providerAttemptHistory
-                ? { providerAttemptHistory: latest.providerAttemptHistory }
-                : {}),
+              ...(durableHistory ? { providerAttemptHistory: durableHistory } : {}),
             },
           );
           await params.persistProgress(paused);

@@ -9,7 +9,7 @@ import type { BookProductionMap } from "../production/book-production-map.js";
 import type { ChapterMeta } from "../models/chapter.js";
 import { abandonChapterTransactionAttempt, beginChapterTransaction, createChapterGenesis } from "../production/chapter-transaction.js";
 
-const providerResponseFsReads = vi.hoisted(() => ({ directoryScans: 0 }));
+const providerResponseFsReads = vi.hoisted(() => ({ directoryScans: 0, failNextProductionStateRename: false }));
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
@@ -20,6 +20,14 @@ vi.mock("node:fs/promises", async (importOriginal) => {
         providerResponseFsReads.directoryScans += 1;
       }
       return Reflect.apply(actual.readdir, actual, args);
+    },
+    rename: async (...args: Parameters<typeof actual.rename>) => {
+      if (providerResponseFsReads.failNextProductionStateRename
+        && String(args[1]).replace(/\\/gu, "/").endsWith("/production-state.json")) {
+        providerResponseFsReads.failNextProductionStateRename = false;
+        throw new Error("synthetic returned checkpoint persistence failure");
+      }
+      return Reflect.apply(actual.rename, actual, args);
     },
   };
 });
@@ -446,6 +454,128 @@ describe("bounded autonomous production controller", () => {
       });
       expect(persisted.at(-1)).toMatchObject({ status: "PAUSED_PIPELINE_ERROR" });
       await expect(readdir(join(root, "books", "book", "story", "commits"))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves intended returned evidence when the returned checkpoint save fails once", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-returned-checkpoint-failure-"));
+    try {
+      const oneChapterMap: BookProductionMap = {
+        ...map,
+        totalChapters: 1,
+        volumes: [{ volumeId: "volume-001", volumeNumber: 1, title: "One", startChapter: 1, endChapter: 1, chapterCount: 1 }],
+      };
+      const jobId = deriveAutonomousJobIdentity({ map: oneChapterMap, mode: "current-volume", nextChapter: 1 });
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      await mkdir(runtimeDir, { recursive: true });
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId, status: "RUNNING", mode: "current-volume", volumeId: "volume-001",
+        startChapter: 1, targetChapter: 1, nextChapter: 1, completedThisRun: 0,
+      }));
+      const stage = { stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId: "chapter-txn-returned-checkpoint" };
+      const execution = createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId, getActiveStage: () => stage });
+      let nextChapter = 1;
+      let transportCalls = 0;
+      const result = await runBoundedAutonomousScope({
+        map: oneChapterMap,
+        mode: "current-volume",
+        getNextChapter: async () => nextChapter,
+        runChapter: async () => {
+          await execution.runProviderCall(1, async () => {
+            transportCalls += 1;
+            providerResponseFsReads.failNextProductionStateRename = true;
+            return { content: "transport returned", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+          }, { provider: "test", model: "model", inputFingerprint: "b".repeat(64) });
+          nextChapter += 1;
+          return { status: "ready-for-review" };
+        },
+        shouldStop: () => false,
+        persistProgress: async (progress) => { await saveAutonomousProductionState(root, "book", progress); },
+        providerRecovery: execution,
+      });
+
+      expect(result).toMatchObject({
+        status: "PAUSED_PIPELINE_ERROR",
+        nextChapter: 1,
+        lastErrorClassification: "DETERMINISTIC_PIPELINE_ERROR",
+      });
+      expect(transportCalls).toBe(1);
+      expect(result.providerAttemptHistory).toHaveLength(1);
+      expect(result.providerAttemptHistory?.[0]).toMatchObject({
+        transactionId: stage.transactionId,
+        transportStarted: true,
+        transportReturned: true,
+      });
+      await expect(readdir(join(root, "books", "book", "story", "commits"))).rejects.toMatchObject({ code: "ENOENT" });
+
+      await expect(execution.runProviderCall(1, async () => {
+        transportCalls += 1;
+        return { content: "must not replay", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "test", model: "model", inputFingerprint: "b".repeat(64) })).rejects.toThrow("OPERATOR_DECISION_REQUIRED");
+      expect(transportCalls).toBe(1);
+      const durable = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
+      expect(durable.status).toBe("PAUSED_PIPELINE_ERROR");
+      expect(durable.providerAttemptHistory).toMatchObject([{
+        transportStarted: true,
+        transportReturned: true,
+      }]);
+    } finally {
+      providerResponseFsReads.failNextProductionStateRename = false;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let an unrelated local error override the current job provider history", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-history-authority-"));
+    try {
+      const oneChapterMap: BookProductionMap = {
+        ...map,
+        totalChapters: 1,
+        volumes: [{ volumeId: "volume-001", volumeNumber: 1, title: "One", startChapter: 1, endChapter: 1, chapterCount: 1 }],
+      };
+      const jobId = deriveAutonomousJobIdentity({ map: oneChapterMap, mode: "current-volume", nextChapter: 1 });
+      const currentLogicalStepId = `provider-step-${"1".repeat(64)}`;
+      const staleLogicalStepId = `provider-step-${"2".repeat(64)}`;
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      await mkdir(runtimeDir, { recursive: true });
+      const currentHistory = [{
+        transportAttemptId: `${currentLogicalStepId}:transport-attempt:1`, logicalStepId: currentLogicalStepId,
+        chapterNumber: 1, role: "writer", provider: "test", requestedModel: "model", transactionId: "current-txn",
+        attempt: 1, classification: "TRANSPORT_STARTED", transportStarted: true, transportReturned: true,
+        recordedAt: "2026-08-30T00:00:00.000Z",
+      }];
+      const staleHistory = [{
+        transportAttemptId: `${staleLogicalStepId}:transport-attempt:1`, logicalStepId: staleLogicalStepId,
+        chapterNumber: 99, role: "writer", provider: "other", requestedModel: "other-model", transactionId: "other-txn",
+        attempt: 1, classification: "TRANSPORT_STARTED", transportStarted: true, transportReturned: true,
+        recordedAt: "2026-08-30T00:00:00.000Z",
+      }];
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId, status: "RUNNING", mode: "current-volume", volumeId: "volume-001",
+        startChapter: 1, targetChapter: 1, nextChapter: 1, completedThisRun: 0,
+        providerAttemptHistory: currentHistory,
+      }));
+      const execution = createAutonomousProviderExecution({
+        projectRoot: root, bookId: "book", jobId,
+        getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId: "current-txn" }),
+      });
+      const unrelatedError = Object.assign(new Error("unrelated local pipeline failure"), {
+        providerAttemptHistory: staleHistory,
+      });
+      const result = await runBoundedAutonomousScope({
+        map: oneChapterMap,
+        mode: "current-volume",
+        getNextChapter: async () => 1,
+        runChapter: async () => { throw unrelatedError; },
+        shouldStop: () => false,
+        persistProgress: async () => {},
+        providerRecovery: execution,
+      });
+
+      expect(result).toMatchObject({ status: "PAUSED_PIPELINE_ERROR", lastErrorClassification: "DETERMINISTIC_PIPELINE_ERROR" });
+      expect(result.providerAttemptHistory).toEqual(currentHistory);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
