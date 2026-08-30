@@ -800,6 +800,14 @@ describe("autonomous production Studio projection", () => {
     expect(jobs.isActive("book")).toBe(false);
   });
 
+  it("admits a model stage before Stop and blocks every following stage admission", () => {
+    const jobs = new AutonomousJobRegistry();
+    expect(jobs.reserve("book")).toBe(true);
+    expect(() => jobs.assertStageAdmission("book")).not.toThrow();
+    expect(jobs.requestStop("book")).toBe(true);
+    expect(() => jobs.assertStageAdmission("book")).toThrow("AUTONOMOUS_STAGE_ADMISSION_STOPPED");
+  });
+
   it("classifies persisted repair failures without replacing the real message", () => {
     expect(classifyStateRepairError("Cannot repair chapter 4 safely: baseline snapshot 3 is unavailable")).toBe("STATE_REPAIR_BASELINE_UNAVAILABLE");
     expect(classifyStateRepairError("State repair still failed for chapter 4.")).toBe("STATE_REPAIR_VALIDATION_FAILED");

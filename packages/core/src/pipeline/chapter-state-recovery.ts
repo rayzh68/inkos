@@ -1,5 +1,6 @@
 import type { AuditIssue } from "../agents/continuity.js";
 import type {
+  StateValidationAuthorityContext,
   ValidationResult,
   ValidationWarning,
 } from "../agents/state-validator.js";
@@ -29,7 +30,9 @@ export interface SettlementRetryParams {
   };
   readonly oldState: string;
   readonly oldHooks: string;
+  readonly oldLedger: string;
   readonly originalValidation: ValidationResult;
+  readonly authorityContext?: StateValidationAuthorityContext;
   readonly language: LengthLanguage;
   readonly logWarn?: (message: { zh: string; en: string }) => void;
   readonly logger?: Pick<Logger, "warn">;
@@ -40,6 +43,11 @@ export interface SettlementRetryParams {
 export type SettlementRetryResult =
   | {
     readonly kind: "recovered";
+    readonly output: WriteChapterOutput;
+    readonly validation: ValidationResult;
+  }
+  | {
+    readonly kind: "content-repair-required";
     readonly output: WriteChapterOutput;
     readonly validation: ValidationResult;
   }
@@ -86,6 +94,9 @@ export async function retrySettlementAfterValidationFailure(
       params.oldHooks,
       retryOutput.updatedHooks,
       params.language,
+      params.authorityContext,
+      undefined,
+      { oldLedger: params.oldLedger, newLedger: retryOutput.updatedLedger },
     );
   } catch (error) {
     throw new Error(`State validation retry failed for chapter ${params.chapterNumber}: ${String(error)}`);
@@ -101,9 +112,17 @@ export async function retrySettlementAfterValidationFailure(
     }
   }
 
-  if (retryValidation.passed && !retryValidation.repairRequired) {
+  if (retryValidation.disposition === "PASS") {
     return {
       kind: "recovered",
+      output: retryOutput,
+      validation: retryValidation,
+    };
+  }
+
+  if (retryValidation.disposition === "CONTENT_REPAIR_REQUIRED") {
+    return {
+      kind: "content-repair-required",
       output: retryOutput,
       validation: retryValidation,
     };

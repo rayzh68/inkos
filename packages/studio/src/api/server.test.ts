@@ -6755,6 +6755,69 @@ describe("createStudioServer daemon lifecycle", () => {
     expect(chapters.find((chapter) => chapter.number === 4)?.status).toBe("approved");
   });
 
+  it("allows provider-less APPROVED finalization after Stop and pauses at the committed next cursor", async () => {
+    const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
+    raw.llm = { ...raw.llm, service: "openrouter", defaultModel: "openai/gpt", model: "openai/gpt", services: [{ service: "openrouter" }] };
+    raw.productionRoles = { production: "openai/gpt", review: "deepseek/chat", reader: "google/gemini" };
+    await writeFile(join(root, "inkos.json"), JSON.stringify(raw, null, 2), "utf-8");
+    await mkdir(join(root, "books", "demo-book", "story", "outline"), { recursive: true });
+    await writeFile(join(root, "books", "demo-book", "story", "outline", "book-production-map.json"), JSON.stringify({
+      schema_version: "1.0", book_id: "demo-book", authority_book_id: "authority", title: "Demo", total_chapters: 7,
+      volumes: [{ volume_id: "volume-001", volume_number: 1, title: "One", start_chapter: 1, end_chapter: 7, chapter_count: 7 }],
+    }), "utf-8");
+    loadSecretsMock.mockResolvedValue({ services: { openrouter: { apiKey: "test-only-secret" } } });
+    probeModelsFromUpstreamMock.mockResolvedValue(["openai/gpt", "deepseek/chat", "google/gemini"].map((id) => ({
+      id, name: id, contextWindow: 128_000, maxOutputTokens: 16_000,
+      inputPrice: "0.000001", outputPrice: "0.000004", inputModalities: ["text"], outputModalities: ["text"],
+    })));
+    loadBookConfigMock.mockResolvedValue({ id: "demo-book", title: "Demo", genre: "urban", targetChapters: 7 });
+    let nextChapter = 5;
+    getNextChapterNumberMock.mockImplementation(async () => nextChapter);
+    let chapters = [1, 2, 3, 4].map((number) => ({
+      number, title: `Chapter ${number}`, status: "approved", wordCount: 1, auditIssues: [], lengthWarnings: [],
+    }));
+    loadChapterIndexMock.mockImplementation(async () => chapters);
+    saveChapterIndexMock.mockImplementation(async (_bookId, updated) => { chapters = [...updated]; });
+    let requestStop!: () => Promise<void>;
+    writeNextChapterMock.mockImplementationOnce(async () => {
+      const onAutonomousStage = (pipelineConfigs.at(-1) as {
+        onAutonomousStage: (event: {
+          stage: string; role: string; provider: string | null; model: string | null; transactionId?: string;
+        }) => Promise<void>;
+      }).onAutonomousStage;
+      await onAutonomousStage({
+        stage: "WRITING", role: "writer", provider: "openrouter", model: "openai/gpt", transactionId: "txn-5",
+      });
+      chapters = [...chapters, {
+        number: 5, title: "Chapter 5", status: "ready-for-review", wordCount: 1, auditIssues: [], lengthWarnings: [],
+      }];
+      nextChapter = 6;
+      await requestStop();
+      await onAutonomousStage({
+        stage: "APPROVED", role: "state-manager", provider: null, model: null, transactionId: "txn-5",
+      });
+      return { chapterNumber: 5, status: "ready-for-review" };
+    });
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+    requestStop = async () => {
+      const response = await app.request("http://localhost/api/v1/books/demo-book/autonomous-production/stop", { method: "POST" });
+      expect(response.status).toBe(200);
+    };
+    const start = await app.request("http://localhost/api/v1/books/demo-book/autonomous-production/start", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "current-volume" }),
+    });
+    expect(start.status).toBe(202);
+
+    const runtimePath = join(root, "books", "demo-book", "story", "runtime", "bounded-autonomous", "production-state.json");
+    await vi.waitFor(async () => {
+      const runtime = JSON.parse(await readFile(runtimePath, "utf-8"));
+      expect(runtime).toMatchObject({ status: "PAUSED_BY_USER", nextChapter: 6 });
+    });
+    expect(writeNextChapterMock).toHaveBeenCalledTimes(1);
+  });
+
   it("preserves rebaseline ownership and blocks a third attempt after double state validation failure", async () => {
     const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
     raw.llm = { ...raw.llm, service: "openrouter", defaultModel: "openai/gpt", model: "openai/gpt", services: [{ service: "openrouter" }] };

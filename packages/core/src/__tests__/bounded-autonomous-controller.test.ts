@@ -1073,6 +1073,105 @@ describe("bounded autonomous production controller", () => {
     expect(result.nextChapter).toBe(2);
   });
 
+  it("continues full-book production after a repairable arbitrary future chapter commits", async () => {
+    let next = 4;
+    const calls: number[] = [];
+    const result = await runBoundedAutonomousScope({
+      map,
+      mode: "full-book",
+      getNextChapter: async () => next,
+      runChapter: async () => {
+        calls.push(next);
+        next += 1;
+        return { status: "ready-for-review", autonomousReview: { revisionCount: calls.length === 1 ? 1 : 0 } };
+      },
+      shouldStop: () => false,
+      persistProgress: async () => undefined,
+    });
+
+    expect(calls).toEqual([4, 5, 6]);
+    expect(result).toMatchObject({ status: "BOOK_COMPLETE", nextChapter: 7 });
+  });
+
+  it("projects PAUSED_BY_USER when Stop blocks the next admitted model stage inside a chapter", async () => {
+    let stop = false;
+    let stagesStarted = 0;
+    const states: string[] = [];
+    const result = await runBoundedAutonomousScope({
+      map,
+      mode: "full-book",
+      getNextChapter: async () => 1,
+      runChapter: async () => {
+        stagesStarted += 1;
+        stop = true;
+        throw new Error("AUTONOMOUS_STAGE_ADMISSION_STOPPED");
+      },
+      shouldStop: () => stop,
+      persistProgress: async (progress) => { states.push(progress.status); },
+    });
+
+    expect(result).toMatchObject({ status: "PAUSED_BY_USER", nextChapter: 1 });
+    expect(stagesStarted).toBe(1);
+    expect(states.at(-1)).toBe("PAUSED_BY_USER");
+  });
+
+  it("preserves an admitted ambiguous Provider outcome when Stop is requested before the error is caught", async () => {
+    let stop = false;
+    const result = await runBoundedAutonomousScope({
+      map,
+      mode: "full-book",
+      getNextChapter: async () => 1,
+      runChapter: async () => {
+        stop = true;
+        throw providerFailure({ classification: "AMBIGUOUS_PROVIDER_OUTCOME" });
+      },
+      shouldStop: () => stop,
+      persistProgress: async () => undefined,
+      providerRecovery: {
+        execute: async (_chapter, task) => task(),
+        loadPersistedProgress: async () => null,
+        now: () => 0,
+        sleep: async () => undefined,
+      },
+    });
+
+    expect(result).toMatchObject({
+      status: "PAUSED_AMBIGUOUS_PROVIDER_OUTCOME",
+      checkpoint: "AMBIGUOUS_PROVIDER_OUTCOME",
+      nextChapter: 1,
+    });
+  });
+
+  it.each([
+    "DETERMINISTIC_PIPELINE_FAILURE",
+    "CHAPTER_LOGICAL_MODEL_CALL_LIMIT_REACHED",
+  ])("preserves an admitted pipeline failure when Stop is requested before %s is caught", async (message) => {
+    let stop = false;
+    const result = await runBoundedAutonomousScope({
+      map,
+      mode: "full-book",
+      getNextChapter: async () => 1,
+      runChapter: async () => {
+        stop = true;
+        throw new Error(message);
+      },
+      shouldStop: () => stop,
+      persistProgress: async () => undefined,
+      providerRecovery: {
+        execute: async (_chapter, task) => task(),
+        loadPersistedProgress: async () => null,
+        now: () => 0,
+        sleep: async () => undefined,
+      },
+    });
+
+    expect(result).toMatchObject({
+      status: "PAUSED_PIPELINE_ERROR",
+      checkpoint: "DETERMINISTIC_PIPELINE_ERROR",
+      nextChapter: 1,
+    });
+  });
+
   it("crosses a volume boundary in full-book mode and stops at the mapped final chapter", async () => {
     let next = 1;
     const calls: number[] = [];
@@ -1175,6 +1274,35 @@ describe("bounded autonomous production controller", () => {
     expect(states.find((state) => state.status === "WAITING_PROVIDER_RETRY")?.nextRetryAt).toBe("2026-08-23T00:05:00.000Z");
     expect(calls).toBe(4);
     expect(result.status).toBe("VOLUME_COMPLETE");
+  });
+
+  it("honors Stop during Provider retry wait without admitting the retry stage", async () => {
+    let now = Date.parse("2026-08-23T00:00:00.000Z");
+    let stop = false;
+    let calls = 0;
+    const states: string[] = [];
+    const result = await runBoundedAutonomousScope({
+      map,
+      mode: "current-volume",
+      getNextChapter: async () => 1,
+      runChapter: async () => {
+        calls += 1;
+        throw providerFailure({ classification: "RETRYABLE_PROVIDER_HTTP", status: 429, revisionRound: 1 });
+      },
+      shouldStop: () => stop,
+      persistProgress: async (progress) => { states.push(progress.status); },
+      providerRecovery: {
+        execute: async (_chapter, task) => task(),
+        loadPersistedProgress: async () => null,
+        now: () => now,
+        sleep: async (ms) => { now += ms; stop = true; },
+      },
+    });
+
+    expect(result).toMatchObject({ status: "PAUSED_BY_USER", nextChapter: 1 });
+    expect(calls).toBe(1);
+    expect(states).toContain("WAITING_PROVIDER_RETRY");
+    expect(states.at(-1)).toBe("PAUSED_BY_USER");
   });
 
   it("applies the existing bounded retry policy to a returned empty-response failure", async () => {

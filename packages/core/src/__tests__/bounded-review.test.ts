@@ -137,6 +137,98 @@ describe("bounded autonomous chapter review", () => {
     expect(stages).toEqual(["LOGIC_REVIEW", "READER_REVIEW"]);
   });
 
+  it("consumes the next unused revision slot for a post-state content finding and binds two fresh reviews", async () => {
+    const initial = await runBoundedReviewCycle({
+      initialContent: "candidate before state validation",
+      lengthSpec: TEST_LENGTH_SPEC,
+      reviewLogic: vi.fn().mockResolvedValue(review("logic-canon-auditor", 92)),
+      reviewCommercial: vi.fn().mockResolvedValue(review("commercial-reader", 86)),
+      revise: vi.fn(),
+    });
+    const revise = vi.fn().mockResolvedValue({ content: "candidate after content repair" });
+    const reviewLogic = vi.fn().mockResolvedValue(review("logic-canon-auditor", 92));
+    const reviewCommercial = vi.fn().mockResolvedValue(review("commercial-reader", 86));
+
+    const result = await runBoundedReviewCycle({
+      initialContent: initial.finalContent,
+      lengthSpec: TEST_LENGTH_SPEC,
+      reviewLogic,
+      reviewCommercial,
+      revise,
+      priorResult: initial,
+      requiredContentRepairFinding: {
+        findingId: "state-validator-content-1",
+        severity: "CRITICAL",
+        evidence: "current prose evidence: candidate fact",
+        impact: "committed authority evidence: committed fact",
+        requiredOutcome: "restore convergence with committed authority",
+      },
+    } as Parameters<typeof runBoundedReviewCycle>[0] & {
+      priorResult: BoundedReviewResult;
+      requiredContentRepairFinding: {
+        findingId: string; severity: "CRITICAL"; evidence: string; impact: string; requiredOutcome: string;
+      };
+    });
+
+    expect(revise).toHaveBeenCalledTimes(1);
+    expect(revise).toHaveBeenCalledWith(initial.finalContent, [expect.objectContaining({
+      findingId: "state-validator-content-1",
+    })], 1);
+    expect(result.revisionCount).toBe(1);
+    expect(result.candidates.map((candidate) => candidate.label)).toEqual(["INITIAL", "REVISION_1"]);
+    expect(result.bestCandidate.reviews).toHaveLength(2);
+    expect(result.bestCandidate.reviews.every((item) => item.reviewedCandidateSha === result.bestCandidate.sha256)).toBe(true);
+    expect(reviewLogic).toHaveBeenCalledWith("candidate after content repair", result.bestCandidate.sha256);
+    expect(reviewCommercial).toHaveBeenCalledWith("candidate after content repair", result.bestCandidate.sha256);
+  });
+
+  it("fails closed without a third prose revision when post-state content repair finds revision two exhausted", async () => {
+    const content = "revision two candidate";
+    const candidate = {
+      label: "REVISION_2" as const,
+      content,
+      sha256: "b".repeat(64),
+      reviews: [review("logic-canon-auditor", 92), review("commercial-reader", 86)],
+      combinedScore: 178,
+      lengthCount: 3,
+      lengthInHardRange: true,
+    };
+    const priorResult: BoundedReviewResult = {
+      status: "APPROVED", grade: "B", finalContent: content, revisionCount: 2,
+      candidates: [candidate], bestCandidate: candidate, usageByRole: {},
+    };
+    const revise = vi.fn();
+    const reviewLogic = vi.fn().mockResolvedValue(review("logic-canon-auditor", 92));
+    const reviewCommercial = vi.fn().mockResolvedValue(review("commercial-reader", 86));
+
+    const result = await runBoundedReviewCycle({
+      initialContent: content,
+      lengthSpec: TEST_LENGTH_SPEC,
+      reviewLogic,
+      reviewCommercial,
+      revise,
+      priorResult,
+      requiredContentRepairFinding: {
+        findingId: "state-validator-content-1", severity: "CRITICAL",
+        evidence: "candidate fact", impact: "committed fact", requiredOutcome: "repair",
+      },
+    } as Parameters<typeof runBoundedReviewCycle>[0] & {
+      priorResult: BoundedReviewResult;
+      requiredContentRepairFinding: {
+        findingId: string; severity: "CRITICAL"; evidence: string; impact: string; requiredOutcome: string;
+      };
+    });
+
+    expect(result).toMatchObject({
+      status: "HELD_AFTER_TWO_REVISIONS",
+      revisionCount: 2,
+      holdReason: "REVISION_LIMIT_REACHED",
+    });
+    expect(revise).not.toHaveBeenCalled();
+    expect(reviewLogic).not.toHaveBeenCalled();
+    expect(reviewCommercial).not.toHaveBeenCalled();
+  });
+
   it("retries one commercial semantic contract failure on the same candidate without revising prose", async () => {
     const commercial = vi.fn()
       .mockResolvedValueOnce(invalidReview("commercial-reader"))

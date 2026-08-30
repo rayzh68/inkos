@@ -2525,12 +2525,18 @@ export async function runBoundedAutonomousScope(params: {
 
   const executeRecoverably = async <T>(chapterNumber: number, action: (safeReplayStage?: string) => Promise<T>): Promise<T | AutonomousRunProgress> => {
     const durableNextChapter = params.pendingChapterNumber === chapterNumber ? initialNext : chapterNumber;
+    const pauseForStop = async (): Promise<AutonomousRunProgress> => {
+      const paused = project("PAUSED_BY_USER", durableNextChapter, undefined, { chapterNumber });
+      await params.persistProgress(paused);
+      return paused;
+    };
     let previous = retryState;
     if (previous?.nextRetryAt && params.providerRecovery) {
       const remaining = Math.max(0, Date.parse(previous.nextRetryAt) - params.providerRecovery.now());
       if (remaining > 0) await params.providerRecovery.sleep(remaining);
     }
     while (true) {
+      if (params.shouldStop()) return pauseForStop();
       try {
         const result = params.providerRecovery
           ? await params.providerRecovery.execute(chapterNumber, () => action(previous?.stage))
@@ -2538,6 +2544,9 @@ export async function runBoundedAutonomousScope(params: {
         retryState = null;
         return result;
       } catch (error) {
+        if (error instanceof Error && error.message === "AUTONOMOUS_STAGE_ADMISSION_STOPPED") {
+          return pauseForStop();
+        }
         if (!params.providerRecovery) throw error;
         if (!(error instanceof LLMCallExecutionError)) {
           const latest = await params.providerRecovery.loadPersistedProgress();

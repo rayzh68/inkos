@@ -379,6 +379,7 @@ describe("PipelineRunner", () => {
     vi.spyOn(StateValidatorAgent.prototype, "validate").mockResolvedValue({
       warnings: [],
       passed: true,
+      disposition: "PASS",
     });
     vi.spyOn(WriterAgent.prototype, "settleChapterState").mockImplementation(
       async (input) => createSettledRevisionOutput(input),
@@ -500,17 +501,17 @@ describe("PipelineRunner", () => {
         tokenUsage: { promptTokens: 2, completionTokens: 3, totalTokens: 5, actualCostUsd: 0.01 },
       }));
       vi.mocked(StateValidatorAgent.prototype.validate).mockResolvedValue({
-        warnings: [], passed: true,
+        warnings: [], passed: true, disposition: "PASS",
         tokenUsage: { promptTokens: 7, completionTokens: 11, totalTokens: 18 },
       });
       vi.mocked(StateValidatorAgent.prototype.validate)
         .mockResolvedValueOnce({
           warnings: [{ category: "missing_state_update", description: "repair fixture" }],
-          passed: false, repairRequired: true,
+          passed: false, repairRequired: true, disposition: "STATE_REPAIR_REQUIRED",
           tokenUsage: { promptTokens: 7, completionTokens: 11, totalTokens: 18, actualCostUsd: 0.03 },
         })
         .mockResolvedValueOnce({
-          warnings: [], passed: true,
+          warnings: [], passed: true, disposition: "PASS",
           tokenUsage: { promptTokens: 1, completionTokens: 1, totalTokens: 2, actualCostUsd: 0.04 },
         });
       vi.mocked(WriterAgent.prototype.settleChapterState).mockResolvedValue(createWriterOutput({
@@ -556,6 +557,196 @@ describe("PipelineRunner", () => {
         bookDir, "story", "runtime", "chapter-transactions", "chapter-0001", "staging", "evidence", "review-result.json",
       ), "utf-8")).resolves.toContain('"status": "APPROVED"');
       expect(await state.getNextChapterNumber(bookId)).toBe(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
+
+  it("converges a post-state prose-authority contradiction inside the same transaction before one Commit", async () => {
+    let artifactBookDir = "";
+    const stageCounts = new Map<string, number>();
+    const { root, runner, state, bookId } = await createRunnerFixture({
+      boundedAutonomousReview: true,
+      onAutonomousStage: async (event) => {
+        if (!event.transactionId || !event.provider || !event.model) return;
+        const stageKey = `${event.stage}:${event.role}`;
+        const occurrence = (stageCounts.get(stageKey) ?? 0) + 1;
+        stageCounts.set(stageKey, occurrence);
+        const logicalOperationId = `provider-step-${createHash("sha256").update(`${stageKey}:${occurrence}`).digest("hex")}`;
+        const content = `${stageKey}:${occurrence}:fixture-response`;
+        const artifact = {
+          schema_version: "1.0", job_id: "convergence-test-job", logical_step_id: logicalOperationId, usage_identity: logicalOperationId,
+          transaction_id: event.transactionId, chapter_number: 1, role: event.role, stage: event.stage,
+          provider: event.provider, requested_model: event.model,
+          input_fingerprint: createHash("sha256").update(`${event.transactionId}:${stageKey}:${occurrence}:input`).digest("hex"),
+          response_artifact_status: "COMPLETE", content_sha256: createHash("sha256").update(content).digest("hex"),
+          response: { content }, completed_at: "2026-08-30T00:00:00.000Z",
+        };
+        const dir = join(artifactBookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, `${logicalOperationId}.json`), `${JSON.stringify(artifact, null, 2)}\n`, "utf-8");
+      },
+    });
+    const bookDir = state.bookDir(bookId);
+    artifactBookDir = bookDir;
+    const storyDir = join(bookDir, "story");
+    const initialBody = englishWords(2200, "initial");
+    const repairedBody = englishWords(2200, "repaired");
+    const dimensions = {
+      blueprint_transition: 92, causal_logic: 92, canon_continuity: 92, character_motivation: 92,
+      state_inheritance: 92, hooks_disclosure: 92, narrative_clarity: 92,
+    };
+    try {
+      await state.saveBookConfig(bookId, { ...(await state.loadBookConfig(bookId)), language: "en", chapterWordCount: 2200 });
+      await Promise.all([
+        writeFile(join(storyDir, "current_state.md"), createStateCard({ chapter: 0, location: "Gate", protagonistState: "prior authority", goal: "Begin", conflict: "Clock" })),
+        writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n"),
+        writeFile(join(storyDir, "chapter_summaries.md"), "| 0 | committed prior authority |\n"),
+      ]);
+      await state.snapshotState(bookId, 0);
+      await createChapterGenesis({ bookDir, bookId, lastTrustedChapter: 0, trustedSnapshotDir: join(storyDir, "snapshots", "0") });
+      vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(createWriterOutput({
+        chapterNumber: 1, title: "Convergence", content: initialBody, wordCount: 2200,
+      }));
+      const logic = vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockResolvedValue(createAuditResult({
+        passed: true, overallScore: 92, dimensionScores: dimensions, issues: [],
+      }));
+      const commercial = vi.spyOn(CommercialReaderAgent.prototype, "reviewChapter").mockImplementation(async (input) => ({
+        reviewerRole: "commercial-reader", provider: "openai", model: "test-model", totalScore: 90,
+        dimensionScores: { opening_hook: 90, pacing_tension: 90, emotional_investment: 90, plot_clarity: 90, dialogue_appeal: 90, western_cultural_naturalness: 90, commercial_appeal: 90, ending_hook: 90 },
+        decision: "APPROVED", findings: [], reviewedCandidateSha: input.candidateSha,
+        reviewedAt: "2026-08-30T00:00:00.000Z", tokenUsage: ZERO_USAGE,
+      }));
+      const reviser = vi.spyOn(ReviserAgent.prototype, "reviseChapter").mockResolvedValue(createReviseOutput({
+        revisedContent: repairedBody, wordCount: 2200,
+      }));
+      const analyze = vi.spyOn(ChapterAnalyzerAgent.prototype, "analyzeChapter").mockImplementation(async (input) => createAnalyzedOutput({
+        chapterNumber: 1, title: "Convergence", content: input.chapterContent, wordCount: 2200,
+        updatedState: createStateCard({ chapter: 1, location: "Gate", protagonistState: input.chapterContent === repairedBody ? "repaired authority" : "stale authority", goal: "Proceed", conflict: "Clock" }),
+      }));
+      vi.spyOn(StateValidatorAgent.prototype, "validate")
+        .mockResolvedValueOnce({
+          passed: false,
+          warnings: [{ category: "ongoing_authority_contradiction", description: "candidate conflicts" }],
+          disposition: "CONTENT_REPAIR_REQUIRED",
+          proseAuthorityEvidence: {
+            status: "PROVEN",
+            currentProse: ["candidate fact"],
+            committedAuthority: ["committed prior authority"],
+          },
+        })
+        .mockResolvedValueOnce({ passed: true, warnings: [], disposition: "PASS" });
+
+      const result = await runner.writeNextChapter(bookId, 2200);
+      const commit = await verifyChapterCommit({ bookDir, chapterNumber: 1 });
+
+      expect(result.status).toBe("ready-for-review");
+      expect(commit.revisionCount).toBe(1);
+      expect(commit.finalBodySha256).toBe(createHash("sha256").update(repairedBody).digest("hex"));
+      expect(reviser).toHaveBeenCalledTimes(1);
+      expect(logic).toHaveBeenCalledTimes(2);
+      expect(commercial).toHaveBeenCalledTimes(2);
+      expect(analyze).toHaveBeenCalledTimes(2);
+      const aggregate = JSON.parse(await readFile(join(
+        bookDir, "story", "runtime", "chapter-transactions", "chapter-0001", "staging", "evidence", "review-result.json",
+      ), "utf-8"));
+      expect(aggregate.result).toMatchObject({ revisionCount: 1, bestCandidateSha256: commit.finalBodySha256 });
+      expect(aggregate.result.candidates.map((candidate: { label: string }) => candidate.label)).toEqual(["INITIAL", "REVISION_1"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
+
+  it("returns complete Reviser and fresh-review usage when post-state content repair terminates blocked", async () => {
+    let artifactBookDir = "";
+    const stageCounts = new Map<string, number>();
+    const { root, runner, state, bookId } = await createRunnerFixture({
+      boundedAutonomousReview: true,
+      onAutonomousStage: async (event) => {
+        if (!event.transactionId || !event.provider || !event.model) return;
+        const stageKey = `${event.stage}:${event.role}`;
+        const occurrence = (stageCounts.get(stageKey) ?? 0) + 1;
+        stageCounts.set(stageKey, occurrence);
+        const logicalOperationId = `provider-step-${createHash("sha256").update(`${stageKey}:${occurrence}`).digest("hex")}`;
+        const content = `${stageKey}:${occurrence}:fixture-response`;
+        const artifact = {
+          schema_version: "1.0", job_id: "usage-failure-test-job", logical_step_id: logicalOperationId, usage_identity: logicalOperationId,
+          transaction_id: event.transactionId, chapter_number: 1, role: event.role, stage: event.stage,
+          provider: event.provider, requested_model: event.model,
+          input_fingerprint: createHash("sha256").update(`${event.transactionId}:${stageKey}:${occurrence}:input`).digest("hex"),
+          response_artifact_status: "COMPLETE", content_sha256: createHash("sha256").update(content).digest("hex"),
+          response: { content }, completed_at: "2026-08-30T00:00:00.000Z",
+        };
+        const dir = join(artifactBookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, `${logicalOperationId}.json`), `${JSON.stringify(artifact, null, 2)}\n`, "utf-8");
+      },
+    });
+    const bookDir = state.bookDir(bookId);
+    artifactBookDir = bookDir;
+    const storyDir = join(bookDir, "story");
+    const initialBody = englishWords(2200, "initial");
+    const repairedBody = englishWords(2200, "repaired");
+    const dimensions = {
+      blueprint_transition: 92, causal_logic: 92, canon_continuity: 92, character_motivation: 92,
+      state_inheritance: 92, hooks_disclosure: 92, narrative_clarity: 92,
+    };
+    try {
+      await state.saveBookConfig(bookId, { ...(await state.loadBookConfig(bookId)), language: "en", chapterWordCount: 2200 });
+      await Promise.all([
+        writeFile(join(storyDir, "current_state.md"), createStateCard({ chapter: 0, location: "Gate", protagonistState: "committed fact", goal: "Begin", conflict: "Clock" })),
+        writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n"),
+        writeFile(join(storyDir, "chapter_summaries.md"), "| 0 | committed fact |\n"),
+      ]);
+      await state.snapshotState(bookId, 0);
+      await createChapterGenesis({ bookDir, bookId, lastTrustedChapter: 0, trustedSnapshotDir: join(storyDir, "snapshots", "0") });
+      vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(createWriterOutput({
+        chapterNumber: 1, title: "Blocked Convergence", content: initialBody, wordCount: 2200,
+      }));
+      let logicReviewCount = 0;
+      vi.spyOn(ContinuityAuditor.prototype, "auditChapter")
+        .mockImplementation(async () => ++logicReviewCount === 1 ? createAuditResult({
+          passed: true, overallScore: 92, dimensionScores: dimensions, issues: [],
+          tokenUsage: { promptTokens: 2, completionTokens: 3, totalTokens: 5 },
+        }) : createAuditResult({
+          passed: false, overallScore: 60, dimensionScores: { ...dimensions, canon_continuity: 40 },
+          issues: [{ severity: "critical", category: "canon_continuity", description: "still conflicts", suggestion: "hold" }],
+          tokenUsage: { promptTokens: 7, completionTokens: 11, totalTokens: 18 },
+        }));
+      let commercialReviewCount = 0;
+      vi.spyOn(CommercialReaderAgent.prototype, "reviewChapter")
+        .mockImplementation(async () => ++commercialReviewCount === 1 ? ({
+          reviewerRole: "commercial-reader", provider: "openai", model: "test-model", totalScore: 90,
+          dimensionScores: { opening_hook: 90, pacing_tension: 90, emotional_investment: 90, plot_clarity: 90, dialogue_appeal: 90, western_cultural_naturalness: 90, commercial_appeal: 90, ending_hook: 90 },
+          decision: "APPROVED", findings: [], reviewedCandidateSha: createHash("sha256").update(initialBody).digest("hex"),
+          reviewedAt: "2026-08-30T00:00:00.000Z", tokenUsage: { promptTokens: 3, completionTokens: 5, totalTokens: 8 },
+        }) : ({
+          reviewerRole: "commercial-reader", provider: "openai", model: "test-model", totalScore: 90,
+          dimensionScores: { opening_hook: 90, pacing_tension: 90, emotional_investment: 90, plot_clarity: 90, dialogue_appeal: 90, western_cultural_naturalness: 90, commercial_appeal: 90, ending_hook: 90 },
+          decision: "APPROVED", findings: [], reviewedCandidateSha: createHash("sha256").update(repairedBody).digest("hex"),
+          reviewedAt: "2026-08-30T00:00:00.000Z", tokenUsage: { promptTokens: 13, completionTokens: 17, totalTokens: 30 },
+        }));
+      vi.spyOn(ReviserAgent.prototype, "reviseChapter").mockResolvedValue(createReviseOutput({
+        revisedContent: repairedBody, wordCount: 2200,
+        tokenUsage: { promptTokens: 19, completionTokens: 23, totalTokens: 42 },
+      }));
+      vi.spyOn(ChapterAnalyzerAgent.prototype, "analyzeChapter").mockResolvedValue(createAnalyzedOutput({
+        chapterNumber: 1, title: "Blocked Convergence", content: initialBody, wordCount: 2200,
+      }));
+      vi.spyOn(StateValidatorAgent.prototype, "validate").mockResolvedValue({
+        passed: false, repairRequired: false, disposition: "CONTENT_REPAIR_REQUIRED",
+        warnings: [{ category: "ongoing_authority_contradiction", description: "candidate conflicts" }],
+        proseAuthorityEvidence: { status: "PROVEN", currentProse: ["initial"], committedAuthority: ["committed fact"] },
+      });
+
+      const result = await runner.writeNextChapter(bookId, 2200);
+
+      expect(result.status).toBe("held-after-two-revisions");
+      expect(result.roleUsage).toMatchObject({
+        reviser: { promptTokens: 38, completionTokens: 46, totalTokens: 84 },
+        "logic-canon-auditor": { promptTokens: 16, completionTokens: 25, totalTokens: 41 },
+        "commercial-reader": { promptTokens: 29, completionTokens: 39, totalTokens: 68 },
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -3263,6 +3454,8 @@ describe("PipelineRunner", () => {
     vi.spyOn(StateValidatorAgent.prototype, "validate")
       .mockResolvedValueOnce({
         passed: false,
+        repairRequired: true,
+        disposition: "STATE_REPAIR_REQUIRED",
         warnings: [{
           category: "unsupported_change",
           description: "状态写成铜牌未带在身上，但正文明确写了怀里的铜牌。",
@@ -3270,6 +3463,7 @@ describe("PipelineRunner", () => {
       })
       .mockResolvedValueOnce({
         passed: true,
+        disposition: "PASS",
         warnings: [],
       });
 
@@ -3339,6 +3533,8 @@ describe("PipelineRunner", () => {
     vi.spyOn(StateValidatorAgent.prototype, "validate")
       .mockResolvedValueOnce({
         passed: false,
+        repairRequired: true,
+        disposition: "STATE_REPAIR_REQUIRED",
         warnings: [{
           category: "unsupported_change",
           description: "settler 把铜牌写没了，但正文仍然明确带在身上。",
@@ -3346,6 +3542,8 @@ describe("PipelineRunner", () => {
       })
       .mockResolvedValueOnce({
         passed: false,
+        repairRequired: false,
+        disposition: "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED",
         warnings: [{
           category: "unsupported_change",
           description: "重试后仍然把铜牌写没了。",
@@ -3449,6 +3647,7 @@ describe("PipelineRunner", () => {
     );
     vi.spyOn(StateValidatorAgent.prototype, "validate").mockResolvedValue({
       passed: true,
+      disposition: "PASS",
       warnings: [],
     });
 
@@ -3475,6 +3674,56 @@ describe("PipelineRunner", () => {
     expect(savedIndex[0]?.reviewNote).toBeUndefined();
 
     await rm(root, { recursive: true, force: true });
+  });
+
+  it.each([
+    "CONTENT_REPAIR_REQUIRED",
+    "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED",
+  ] as const)("fails closed state repair on initial %s without a settlement retry or persistence", async (disposition) => {
+    const { root, runner, state, bookId } = await createRunnerFixture({});
+    const now = "2026-03-19T00:00:00.000Z";
+    const bookDir = state.bookDir(bookId);
+    const storyDir = join(bookDir, "story");
+    const baselineDir = join(storyDir, "snapshots", "0");
+    const chapterPath = join(bookDir, "chapters", "0001_Broken_Persistence.md");
+    await mkdir(baselineDir, { recursive: true });
+    await Promise.all([
+      writeFile(join(storyDir, "current_state.md"), "stable state", "utf-8"),
+      writeFile(join(storyDir, "pending_hooks.md"), "stable hooks", "utf-8"),
+      writeFile(join(storyDir, "particle_ledger.md"), "stable ledger", "utf-8"),
+      writeFile(join(baselineDir, "current_state.md"), "baseline state", "utf-8"),
+      writeFile(join(baselineDir, "pending_hooks.md"), "baseline hooks", "utf-8"),
+      writeFile(join(baselineDir, "particle_ledger.md"), "baseline ledger", "utf-8"),
+      writeFile(chapterPath, "# 第1章 Broken Persistence\n\nHealthy chapter body.", "utf-8"),
+      state.saveChapterIndex(bookId, [{
+        number: 1, title: "Broken Persistence", status: "state-degraded" as ChapterMeta["status"],
+        wordCount: 21, createdAt: now, updatedAt: now,
+        auditIssues: ["[warning] broken truth"], lengthWarnings: [],
+        reviewNote: JSON.stringify({ kind: "state-degraded", baseStatus: "ready-for-review", injectedIssues: ["[warning] broken truth"] }),
+      }]),
+    ]);
+    const originalChapter = await readFile(chapterPath, "utf-8");
+    const settle = vi.spyOn(WriterAgent.prototype, "settleChapterState").mockResolvedValue(createWriterOutput({
+      chapterNumber: 1, title: "Broken Persistence", content: "Healthy chapter body.", wordCount: 21,
+      updatedState: "candidate state", updatedHooks: "candidate hooks", updatedLedger: "candidate ledger",
+    }));
+    vi.spyOn(StateValidatorAgent.prototype, "validate").mockResolvedValue({
+      passed: false, repairRequired: false, disposition,
+      warnings: [{ category: "canonical-disposition", description: "Do not retry state settlement." }],
+      ...(disposition === "CONTENT_REPAIR_REQUIRED" ? {
+        proseAuthorityEvidence: { status: "PROVEN" as const, currentProse: ["Healthy chapter body."], committedAuthority: ["baseline state"] },
+      } : {}),
+    });
+
+    try {
+      await expect(runner.repairChapterState(bookId, 1)).rejects.toThrow("STATE_VALIDATION_DISPOSITION");
+      expect(settle).toHaveBeenCalledTimes(1);
+      await expect(readFile(chapterPath, "utf-8")).resolves.toBe(originalChapter);
+      await expect(readFile(join(storyDir, "current_state.md"), "utf-8")).resolves.toBe("stable state");
+      expect((await state.loadChapterIndex(bookId))[0]?.status).toBe("state-degraded");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("syncs the latest edited chapter body back into truth files without requiring state-degraded status", async () => {
@@ -3539,6 +3788,7 @@ describe("PipelineRunner", () => {
     );
     vi.spyOn(StateValidatorAgent.prototype, "validate").mockResolvedValue({
       passed: true,
+      disposition: "PASS",
       warnings: [],
     });
 
@@ -3564,6 +3814,54 @@ describe("PipelineRunner", () => {
     expect(savedIndex[0]?.status).toBe("ready-for-review");
 
     await rm(root, { recursive: true, force: true });
+  });
+
+  it.each([
+    "CONTENT_REPAIR_REQUIRED",
+    "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED",
+  ] as const)("fails closed edited-chapter truth resync on initial %s without a settlement retry or persistence", async (disposition) => {
+    const { root, runner, state, bookId } = await createRunnerFixture({ externalContext: "Keep the edited body authoritative." });
+    const now = "2026-03-19T00:00:00.000Z";
+    const bookDir = state.bookDir(bookId);
+    const storyDir = join(bookDir, "story");
+    const baselineDir = join(storyDir, "snapshots", "0");
+    const chapterPath = join(bookDir, "chapters", "0001_Edited.md");
+    await mkdir(baselineDir, { recursive: true });
+    await Promise.all([
+      writeFile(join(storyDir, "current_state.md"), "stable state", "utf-8"),
+      writeFile(join(storyDir, "pending_hooks.md"), "stable hooks", "utf-8"),
+      writeFile(join(storyDir, "particle_ledger.md"), "stable ledger", "utf-8"),
+      writeFile(join(baselineDir, "current_state.md"), "baseline state", "utf-8"),
+      writeFile(join(baselineDir, "pending_hooks.md"), "baseline hooks", "utf-8"),
+      writeFile(join(baselineDir, "particle_ledger.md"), "baseline ledger", "utf-8"),
+      writeFile(chapterPath, "# 第1章 Edited\n\nEdited chapter body.", "utf-8"),
+      state.saveChapterIndex(bookId, [{
+        number: 1, title: "Edited", status: "approved" as ChapterMeta["status"], wordCount: 20,
+        createdAt: now, updatedAt: now, auditIssues: [], lengthWarnings: [],
+      }]),
+    ]);
+    const originalChapter = await readFile(chapterPath, "utf-8");
+    const settle = vi.spyOn(WriterAgent.prototype, "settleChapterState").mockResolvedValue(createWriterOutput({
+      chapterNumber: 1, title: "Edited", content: "Edited chapter body.", wordCount: 20,
+      updatedState: "candidate state", updatedHooks: "candidate hooks", updatedLedger: "candidate ledger",
+    }));
+    vi.spyOn(StateValidatorAgent.prototype, "validate").mockResolvedValue({
+      passed: false, repairRequired: false, disposition,
+      warnings: [{ category: "canonical-disposition", description: "Do not retry state settlement." }],
+      ...(disposition === "CONTENT_REPAIR_REQUIRED" ? {
+        proseAuthorityEvidence: { status: "PROVEN" as const, currentProse: ["Edited chapter body."], committedAuthority: ["baseline state"] },
+      } : {}),
+    });
+
+    try {
+      await expect(runner.resyncChapterArtifacts(bookId, 1)).rejects.toThrow("STATE_VALIDATION_DISPOSITION");
+      expect(settle).toHaveBeenCalledTimes(1);
+      await expect(readFile(chapterPath, "utf-8")).resolves.toBe(originalChapter);
+      await expect(readFile(join(storyDir, "current_state.md"), "utf-8")).resolves.toBe("stable state");
+      expect((await state.loadChapterIndex(bookId))[0]?.status).toBe("approved");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("still persists the chapter when the state validator appends markdown after a valid JSON verdict", async () => {
@@ -5803,6 +6101,7 @@ describe("PipelineRunner", () => {
     let targetRoot: string | undefined;
     let invalidRoot: string | undefined;
     let retryRoot: string | undefined;
+    const dispositionRoots: string[] = [];
     try {
       const target = await createFixture([]);
       targetRoot = target.root;
@@ -6075,6 +6374,7 @@ describe("PipelineRunner", () => {
       vi.mocked(StateValidatorAgent.prototype.validate).mockResolvedValue({
         passed: false,
         repairRequired: true,
+        disposition: "STATE_REPAIR_REQUIRED",
         warnings: [{ category: "contradiction", description: "Synthetic double-failure." }],
       });
       await expect(invalid.runner.rebaselinePendingChapterState(rebaselinePlan))
@@ -6083,7 +6383,7 @@ describe("PipelineRunner", () => {
       expect(await readFile(join(invalid.bookDir, "chapters", "0004_Pending.md"), "utf-8")).toBe(`# 第4章 Pending\n\n${oldBody}`);
       expect(await readFile(join(invalid.bookDir, "story", "current_state.md"), "utf-8")).toBe(oldState);
       await expect(stat(join(invalid.evidenceDir, "bounded-state-rebaseline-settlement.json"))).rejects.toMatchObject({ code: "ENOENT" });
-      vi.mocked(StateValidatorAgent.prototype.validate).mockResolvedValue({ warnings: [], passed: true });
+      vi.mocked(StateValidatorAgent.prototype.validate).mockResolvedValue({ warnings: [], passed: true, disposition: "PASS" });
       const normalSettlementCallsBefore = vi.mocked(WriterAgent.prototype.settleChapterState).mock.calls.length;
       const normalValidationCallsBefore = vi.mocked(StateValidatorAgent.prototype.validate).mock.calls.length;
       const rebaselineResult = await invalid.runner.rebaselinePendingChapterState(rebaselinePlan);
@@ -6136,8 +6436,8 @@ describe("PipelineRunner", () => {
       const settlementCallsBefore = vi.mocked(WriterAgent.prototype.settleChapterState).mock.calls.length;
       const validationCallsBefore = vi.mocked(StateValidatorAgent.prototype.validate).mock.calls.length;
       vi.mocked(StateValidatorAgent.prototype.validate)
-        .mockResolvedValueOnce({ passed: false, repairRequired: true, warnings: [{ category: "repair", description: "Retry once." }] })
-        .mockResolvedValueOnce({ passed: true, warnings: [] });
+        .mockResolvedValueOnce({ passed: false, repairRequired: true, disposition: "STATE_REPAIR_REQUIRED", warnings: [{ category: "repair", description: "Retry once." }] })
+        .mockResolvedValueOnce({ passed: true, disposition: "PASS", warnings: [] });
       await expect(retryFixture.runner.rebaselinePendingChapterState(retryPlan)).resolves.toMatchObject({
         status: "accepted-with-findings", providerCallCount: 6,
       });
@@ -6148,11 +6448,52 @@ describe("PipelineRunner", () => {
       expect(transport).toHaveBeenCalledTimes(0);
       expect(chapterWriter).toHaveBeenCalledTimes(0);
       expect(realFinalReview).toHaveBeenCalledTimes(0);
+
+      for (const disposition of [
+        "CONTENT_REPAIR_REQUIRED",
+        "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED",
+      ] as const) {
+        const dispositionFixture = await createFixture(outcomes);
+        dispositionRoots.push(dispositionFixture.root);
+        const dispositionResponseDir = join(dispositionFixture.bookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
+        await mkdir(dispositionResponseDir, { recursive: true });
+        await writeArtifact(dispositionResponseDir, rescueId, rescueFingerprint, `=== REVISED_CONTENT ===\n${candidateBody}`);
+        await writeArtifact(dispositionResponseDir, finalId, finalFingerprint, finalContent);
+        await writeFile(join(dispositionFixture.bookDir, "story", "runtime", "bounded-autonomous", "production-state.json"), JSON.stringify({
+          jobId, status: "REVIEW_EXHAUSTED", mode: "current-volume", volumeId: "volume-001",
+          startChapter: 4, targetChapter: 10, nextChapter: 5, chapterNumber: 5, completedThisRun: 0, responseArtifactStatus: "COMPLETE",
+        }));
+        await correctLegacyPendingChapterArtifactBindings({
+          projectRoot: dispositionFixture.root, bookId: dispositionFixture.bookId, jobId, pendingChapterNumber: 4,
+        });
+        const dispositionPlan = await resolveFormalPendingChapterRecoveryPlan({
+          projectRoot: dispositionFixture.root, bookId: dispositionFixture.bookId, jobId, pendingChapterNumber: 4,
+        });
+        if (dispositionPlan?.kind !== "FORMAL_BOUNDED_STATE_REBASELINE") throw new Error("EXPECTED_DISPOSITION_REBASELINE_PLAN");
+        await snapshotRevisionBaseline(dispositionFixture.state, dispositionFixture.bookId, dispositionPlan.baselineChapterNumber);
+        const dispositionSettlementCallsBefore = vi.mocked(WriterAgent.prototype.settleChapterState).mock.calls.length;
+        vi.mocked(StateValidatorAgent.prototype.validate).mockResolvedValue({
+          passed: false, repairRequired: false, disposition,
+          warnings: [{ category: "canonical-disposition", description: "Do not retry state settlement." }],
+          ...(disposition === "CONTENT_REPAIR_REQUIRED" ? {
+            proseAuthorityEvidence: { status: "PROVEN" as const, currentProse: ["PENDING_STATE_B"], committedAuthority: ["OLD_STATE_A"] },
+          } : {}),
+        });
+
+        await expect(dispositionFixture.runner.rebaselinePendingChapterState(dispositionPlan))
+          .rejects.toThrow("STATE_VALIDATION_DISPOSITION");
+        expect(vi.mocked(WriterAgent.prototype.settleChapterState).mock.calls.length - dispositionSettlementCallsBefore).toBe(1);
+        expect((await dispositionFixture.state.loadChapterIndex(dispositionFixture.bookId))[3]).toMatchObject({ status: "audit-failed" });
+        expect(await readFile(join(dispositionFixture.bookDir, "chapters", "0004_Pending.md"), "utf-8"))
+          .toBe(`# 第4章 Pending\n\n${oldBody}`);
+        expect(await readFile(join(dispositionFixture.bookDir, "story", "current_state.md"), "utf-8")).toBe(oldState);
+      }
     } finally {
       globalThis.fetch = originalFetch;
       if (targetRoot) await rm(targetRoot, { recursive: true, force: true });
       if (invalidRoot) await rm(invalidRoot, { recursive: true, force: true });
       if (retryRoot) await rm(retryRoot, { recursive: true, force: true });
+      for (const root of dispositionRoots) await rm(root, { recursive: true, force: true });
     }
   }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
 
@@ -6302,6 +6643,7 @@ describe("PipelineRunner", () => {
     vi.spyOn(StateValidatorAgent.prototype, "validate").mockResolvedValue({
       passed: false,
       repairRequired: true,
+      disposition: "STATE_REPAIR_REQUIRED",
       warnings: [{
         category: "state-conflict",
         description: "The derived hook board contradicts the revised body.",
@@ -6320,6 +6662,79 @@ describe("PipelineRunner", () => {
       await expect(readFile(join(storyDir, "current_state.md"), "utf-8")).resolves.toBe(originalState);
       await expect(readFile(join(storyDir, "pending_hooks.md"), "utf-8")).resolves.toBe(originalHooks);
       expect(originalChapter).not.toContain(revisedBody);
+      await expect(listChapterVersions(state.bookDir(bookId), 1)).resolves.toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
+
+  it("fails closed manual revision when the state-only retry escalates to content repair", async () => {
+    const { root, runner, state, bookId, chaptersDir } = await createRevisionGateFixture("always");
+    const storyDir = join(state.bookDir(bookId), "story");
+    const originalChapter = await readFile(join(chaptersDir, "0001_Test_Chapter.md"), "utf-8");
+    const originalState = await readFile(join(storyDir, "current_state.md"), "utf-8");
+    const audit = vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockResolvedValueOnce(
+      createAuditResult({ passed: false, issues: [CRITICAL_ISSUE], summary: "needs revision" }),
+    );
+    const settle = vi.spyOn(WriterAgent.prototype, "settleChapterState");
+    vi.spyOn(StateValidatorAgent.prototype, "validate")
+      .mockResolvedValueOnce({
+        passed: false, repairRequired: true, disposition: "STATE_REPAIR_REQUIRED",
+        warnings: [{ category: "state-only", description: "Retry state settlement once." }],
+      })
+      .mockResolvedValueOnce({
+        passed: false, repairRequired: false, disposition: "CONTENT_REPAIR_REQUIRED",
+        warnings: [{ category: "content", description: "The revised prose itself requires repair." }],
+        proseAuthorityEvidence: {
+          status: "PROVEN", currentProse: ["柜台后那盏灯"], committedAuthority: ["Lin Yue still hides the oath token."],
+        },
+      });
+
+    try {
+      await expect(runner.reviseDraft(bookId, 1, "rework", "Rewrite and sync state."))
+        .rejects.toThrow("REVISION_STATE_VALIDATION_DISPOSITION_CONTENT_REPAIR_REQUIRED_NOT_ALLOWED");
+      expect(settle).toHaveBeenCalledTimes(2);
+      expect(audit).toHaveBeenCalledTimes(1);
+      await expect(readFile(join(chaptersDir, "0001_Test_Chapter.md"), "utf-8")).resolves.toBe(originalChapter);
+      await expect(readFile(join(storyDir, "current_state.md"), "utf-8")).resolves.toBe(originalState);
+      await expect(listChapterVersions(state.bookDir(bookId), 1)).resolves.toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
+
+  it.each([
+    "CONTENT_REPAIR_REQUIRED",
+    "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED",
+  ] as const)("fails closed manual revision on initial %s without a settlement retry", async (disposition) => {
+    const { root, runner, state, bookId, chaptersDir } = await createRevisionGateFixture("always");
+    const storyDir = join(state.bookDir(bookId), "story");
+    const originalChapter = await readFile(join(chaptersDir, "0001_Test_Chapter.md"), "utf-8");
+    const originalState = await readFile(join(storyDir, "current_state.md"), "utf-8");
+    vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockResolvedValueOnce(
+      createAuditResult({ passed: false, issues: [CRITICAL_ISSUE], summary: "needs revision" }),
+    );
+    const settle = vi.spyOn(WriterAgent.prototype, "settleChapterState");
+    vi.spyOn(StateValidatorAgent.prototype, "validate").mockResolvedValue({
+      passed: false,
+      repairRequired: false,
+      disposition,
+      warnings: [{ category: "canonical-disposition", description: "Do not retry state settlement." }],
+      ...(disposition === "CONTENT_REPAIR_REQUIRED" ? {
+        proseAuthorityEvidence: {
+          status: "PROVEN" as const,
+          currentProse: ["柜台后那盏灯"],
+          committedAuthority: ["Lin Yue still hides the oath token."],
+        },
+      } : {}),
+    });
+
+    try {
+      await expect(runner.reviseDraft(bookId, 1, "rework", "Rewrite and sync state."))
+        .rejects.toThrow("STATE_VALIDATION_DISPOSITION");
+      expect(settle).toHaveBeenCalledTimes(1);
+      await expect(readFile(join(chaptersDir, "0001_Test_Chapter.md"), "utf-8")).resolves.toBe(originalChapter);
+      await expect(readFile(join(storyDir, "current_state.md"), "utf-8")).resolves.toBe(originalState);
       await expect(listChapterVersions(state.bookDir(bookId), 1)).resolves.toEqual([]);
     } finally {
       await rm(root, { recursive: true, force: true });

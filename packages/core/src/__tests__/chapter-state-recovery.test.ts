@@ -41,9 +41,13 @@ function createValidationWarning(
 function createValidationResult(
   overrides: Partial<ValidationResult> = {},
 ): ValidationResult {
+  const passed = overrides.passed ?? false;
   return {
-    passed: overrides.passed ?? false,
+    passed,
     warnings: overrides.warnings ?? [createValidationWarning()],
+    disposition: overrides.disposition ?? (passed ? "PASS" : "STATE_REPAIR_REQUIRED"),
+    repairRequired: overrides.repairRequired ?? !passed,
+    ...overrides,
   };
 }
 
@@ -117,6 +121,7 @@ describe("chapter-state-recovery", () => {
       content: "铜牌贴在胸口。",
       oldState: "old state",
       oldHooks: "old hooks",
+      oldLedger: "old ledger",
       originalValidation: createValidationResult(),
       language: "zh",
       logWarn,
@@ -133,6 +138,78 @@ describe("chapter-state-recovery", () => {
       zh: expect.stringContaining("仅重试结算层"),
     }));
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("revalidates settlement retry with the identical committed-authority context", async () => {
+    const authorityContext = {
+      storyFrame: "stable frame",
+      bookRules: "stable rules",
+      chapterSummaries: "committed summary authority",
+    };
+    const validate = vi.fn(async () => createValidationResult({ passed: true, warnings: [] }));
+
+    await retrySettlementAfterValidationFailure({
+      writer: { settleChapterState: vi.fn(async () => createWriteChapterOutput()) } as never,
+      validator: { validate } as never,
+      book: createBook(),
+      bookDir: "/tmp/test-book",
+      chapterNumber: 3,
+      title: "第三章",
+      content: "铜牌贴在胸口。",
+      oldState: "old state",
+      oldHooks: "old hooks",
+      oldLedger: "old ledger",
+      originalValidation: createValidationResult(),
+      authorityContext,
+      language: "zh",
+    });
+
+    expect(validate).toHaveBeenCalledWith(
+      "铜牌贴在胸口。",
+      3,
+      "old state",
+      "new state",
+      "old hooks",
+      "new hooks",
+      "zh",
+      authorityContext,
+      undefined,
+      { oldLedger: "old ledger", newLedger: "new ledger" },
+    );
+  });
+
+  it("escalates a proven content contradiction discovered by settlement revalidation", async () => {
+    const retryValidation = createValidationResult({
+      passed: false,
+      disposition: "CONTENT_REPAIR_REQUIRED",
+      warnings: [{ category: "ongoing_authority_contradiction", description: "candidate conflicts with committed authority" }],
+      proseAuthorityEvidence: {
+        status: "PROVEN",
+        currentProse: ["copper token rests on his chest"],
+        committedAuthority: ["copper token remains in the box"],
+      },
+    });
+
+    const result = await retrySettlementAfterValidationFailure({
+      writer: { settleChapterState: vi.fn(async () => createWriteChapterOutput()) } as never,
+      validator: { validate: vi.fn(async () => retryValidation) } as never,
+      book: createBook(),
+      bookDir: "/tmp/test-book",
+      chapterNumber: 3,
+      title: "Chapter Three",
+      content: "The copper token rests on his chest.",
+      oldState: "The copper token remains in the box.",
+      oldHooks: "old hooks",
+      oldLedger: "old ledger",
+      originalValidation: createValidationResult({ disposition: "STATE_REPAIR_REQUIRED" }),
+      language: "en",
+    });
+
+    expect(result).toMatchObject({
+      kind: "content-repair-required",
+      validation: retryValidation,
+      output: { updatedLedger: "new ledger" },
+    });
   });
 
   it("returns localized degraded issues when settlement retry still fails", async () => {
@@ -156,6 +233,7 @@ describe("chapter-state-recovery", () => {
       content: "铜牌贴在胸口。",
       oldState: "old state",
       oldHooks: "old hooks",
+      oldLedger: "old ledger",
       originalValidation: createValidationResult({
         warnings: [validatorWarning],
       }),

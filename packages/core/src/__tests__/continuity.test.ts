@@ -455,4 +455,42 @@ describe("ContinuityAuditor", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it("requires generic ongoing-authority validation and explicit narrative support for changes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-auditor-ongoing-authority-"));
+    const bookDir = join(root, "book");
+    const storyDir = join(bookDir, "story");
+    await mkdir(storyDir, { recursive: true });
+    await Promise.all([
+      writeFile(join(storyDir, "current_state.md"), "# Current State\n- ongoing condition: prior value\n", "utf-8"),
+      writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n", "utf-8"),
+      writeFile(join(storyDir, "chapter_summaries.md"), "# Chapter Summaries\n| 4 | prior value remains authoritative |\n", "utf-8"),
+      writeFile(join(storyDir, "subplot_board.md"), "# Subplots\n", "utf-8"),
+      writeFile(join(storyDir, "emotional_arcs.md"), "# Emotional Arcs\n", "utf-8"),
+      writeFile(join(storyDir, "character_matrix.md"), "# Matrix\n", "utf-8"),
+      writeFile(join(storyDir, "style_guide.md"), "# Style\n", "utf-8"),
+    ]);
+    const auditor = new ContinuityAuditor({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model",
+      projectRoot: root,
+    });
+    const chatSpy = vi.spyOn(ContinuityAuditor.prototype as never, "chat" as never).mockResolvedValue({
+      content: JSON.stringify({ passed: true, issues: [], summary: "ok" }), usage: ZERO_USAGE,
+    });
+
+    try {
+      await auditor.auditChapter(bookDir, "The candidate continues with a changed value.", 5, "xuanhuan");
+      const messages = chatSpy.mock.calls[0]?.[0] as ReadonlyArray<{ content: string }>;
+      expect(messages[0]?.content).toMatch(/ongoing authority/i);
+      expect(messages[0]?.content).toContain("explicitly narrates");
+      expect(messages[1]?.content).toContain("ongoing condition: prior value");
+      expect(messages[1]?.content).toContain("prior value remains authoritative");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

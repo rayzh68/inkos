@@ -160,6 +160,12 @@ export class AutonomousJobRegistry {
     return this.jobs.get(bookId)?.stopRequested ?? false;
   }
 
+  assertStageAdmission(bookId: string): void {
+    const job = this.jobs.get(bookId);
+    if (!job) throw new Error("AUTONOMOUS_JOB_NOT_ACTIVE");
+    if (job.stopRequested) throw new Error("AUTONOMOUS_STAGE_ADMISSION_STOPPED");
+  }
+
   release(bookId: string): void {
     this.jobs.delete(bookId);
   }

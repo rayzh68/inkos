@@ -22,9 +22,12 @@ function createAuditResult(overrides?: Partial<AuditResult>): AuditResult {
 }
 
 function createValidationResult(overrides?: Partial<ValidationResult>): ValidationResult {
+  const passed = overrides?.passed ?? true;
   return {
-    passed: true,
+    passed,
     warnings: [],
+    disposition: overrides?.disposition ?? (passed ? "PASS" : "STATE_REPAIR_REQUIRED"),
+    repairRequired: overrides?.repairRequired ?? !passed,
     ...overrides,
   };
 }
@@ -65,11 +68,12 @@ const BOOK: BookConfig = {
 
 describe("validateChapterTruthPersistence", () => {
   it("preserves verified actual cost for one extractor and one validator call", async () => {
+    const validate = vi.fn().mockResolvedValue(createValidationResult({
+      tokenUsage: { promptTokens: 3, completionTokens: 4, totalTokens: 7, actualCostUsd: 0.02 },
+    }));
     const result = await validateChapterTruthPersistence({
       writer: { settleChapterState: vi.fn() },
-      validator: { validate: vi.fn().mockResolvedValue(createValidationResult({
-        tokenUsage: { promptTokens: 3, completionTokens: 4, totalTokens: 7, actualCostUsd: 0.02 },
-      })) },
+      validator: { validate },
       book: BOOK, bookDir: "/tmp/book", chapterNumber: 2, title: "Known costs", content: "Body.",
       persistenceOutput: createWriterOutput({
         tokenUsage: { promptTokens: 1, completionTokens: 2, totalTokens: 3, actualCostUsd: 0.01 },
@@ -82,6 +86,10 @@ describe("validateChapterTruthPersistence", () => {
       extractor: { promptTokens: 1, completionTokens: 2, totalTokens: 3, actualCostUsd: 0.01 },
       validator: { promptTokens: 3, completionTokens: 4, totalTokens: 7, actualCostUsd: 0.02 },
     });
+    expect(validate).toHaveBeenCalledWith(
+      "Body.", 2, "old", "writer state", "old hooks", "writer hooks", "en", undefined, undefined,
+      { oldLedger: "old ledger", newLedger: "writer ledger" },
+    );
   });
 
   it("retries settlement when the validator requests repair without a hard contradiction", async () => {
@@ -131,6 +139,88 @@ describe("validateChapterTruthPersistence", () => {
     expect(result.stateUsage.extractor).toMatchObject({ promptTokens: 8, completionTokens: 10, totalTokens: 18, actualCostUsd: 0.03 });
     expect(result.stateUsage.validator).toMatchObject({ promptTokens: 5, completionTokens: 7, totalTokens: 12 });
     expect(result.stateUsage.validator.actualCostUsd).toBeUndefined();
+  });
+
+  it("routes a proven prose-authority contradiction to content repair without touching stale settlement", async () => {
+    const writer = { settleChapterState: vi.fn() };
+    const validation = createValidationResult({
+      passed: false,
+      repairRequired: false,
+      disposition: "CONTENT_REPAIR_REQUIRED",
+      warnings: [{ category: "ongoing_authority_contradiction", description: "candidate conflicts with committed authority" }],
+      proseAuthorityEvidence: {
+        status: "PROVEN",
+        currentProse: ["candidate fact"],
+        committedAuthority: ["committed fact"],
+      },
+    });
+
+    const result = await validateChapterTruthPersistence({
+      writer,
+      validator: { validate: vi.fn().mockResolvedValue(validation) },
+      book: BOOK, bookDir: "/tmp/book", chapterNumber: 8, title: "Conflict", content: "candidate fact",
+      persistenceOutput: createWriterOutput({ updatedState: "stale settlement" }),
+      auditResult: createAuditResult(),
+      previousTruth: { oldState: "committed fact", oldHooks: "old hooks", oldLedger: "old ledger" },
+      authorityContext: { chapterSummaries: "committed fact" },
+      language: "en", logWarn: vi.fn(),
+    });
+
+    expect(result.repairDisposition).toBe("CONTENT_REPAIR_REQUIRED");
+    expect(result.validation).toBe(validation);
+    expect(writer.settleChapterState).not.toHaveBeenCalled();
+  });
+
+  it("propagates content repair when the settlement retry revalidation discovers a prose contradiction", async () => {
+    const retryValidation = createValidationResult({
+      passed: false,
+      disposition: "CONTENT_REPAIR_REQUIRED",
+      warnings: [{ category: "ongoing_authority_contradiction", description: "candidate conflicts with committed authority" }],
+      proseAuthorityEvidence: {
+        status: "PROVEN",
+        currentProse: ["candidate fact"],
+        committedAuthority: ["committed fact"],
+      },
+      tokenUsage: { promptTokens: 4, completionTokens: 5, totalTokens: 9 },
+    });
+    const validator = {
+      validate: vi.fn()
+        .mockResolvedValueOnce(createValidationResult({
+          passed: false,
+          disposition: "STATE_REPAIR_REQUIRED",
+          repairRequired: true,
+          warnings: [{ category: "missing_state_update", description: "settlement omission" }],
+          tokenUsage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 },
+        }))
+        .mockResolvedValueOnce(retryValidation),
+    };
+    const retryOutput = createWriterOutput({
+      updatedState: "retried state",
+      updatedLedger: "retried ledger",
+      tokenUsage: { promptTokens: 6, completionTokens: 7, totalTokens: 13 },
+    });
+
+    const result = await validateChapterTruthPersistence({
+      writer: { settleChapterState: vi.fn().mockResolvedValue(retryOutput) },
+      validator,
+      book: BOOK, bookDir: "/tmp/book", chapterNumber: 8, title: "Conflict", content: "candidate fact",
+      persistenceOutput: createWriterOutput({ updatedState: "stale state" }),
+      auditResult: createAuditResult(),
+      previousTruth: { oldState: "committed fact", oldHooks: "old hooks", oldLedger: "old ledger" },
+      authorityContext: { chapterSummaries: "committed fact" },
+      language: "en", logWarn: vi.fn(),
+    });
+
+    expect(result).toMatchObject({
+      repairDisposition: "CONTENT_REPAIR_REQUIRED",
+      chapterStatus: null,
+      validation: retryValidation,
+      persistenceOutput: retryOutput,
+      stateUsage: {
+        extractor: { promptTokens: 6, completionTokens: 7, totalTokens: 13 },
+        validator: { promptTokens: 5, completionTokens: 7, totalTokens: 12 },
+      },
+    });
   });
 
   it("uses recovered settlement output when retry succeeds", async () => {
