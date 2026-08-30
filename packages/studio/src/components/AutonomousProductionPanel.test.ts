@@ -1,4 +1,4 @@
-import { createElement } from "react";
+import { Children, createElement, isValidElement, type ReactElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import {
@@ -33,7 +33,134 @@ const blockedView: AutonomousView = {
   startEnabled: false,
 };
 
+function nodeText(node: ReactNode): string {
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(nodeText).join("");
+  if (!isValidElement(node)) return "";
+  return nodeText((node.props as { readonly children?: ReactNode }).children);
+}
+
+function findButton(node: ReactNode, label: string): ReactElement<{ readonly onClick?: () => void }> {
+  if (!isValidElement(node)) throw new Error(`Button ${label} not found`);
+  if (node.type === "button" && nodeText(node) === label) {
+    return node as ReactElement<{ readonly onClick?: () => void }>;
+  }
+  const children = Children.toArray((node.props as { readonly children?: ReactNode }).children);
+  for (const child of children) {
+    try {
+      return findButton(child, label);
+    } catch {
+      // Keep searching this real component tree.
+    }
+  }
+  throw new Error(`Button ${label} not found`);
+}
+
+function clickCardButton(
+  view: AutonomousView,
+  label: string,
+  callbacks: { readonly onStart?: (mode: "current-volume" | "full-book") => void; readonly onStop?: () => void; readonly onAbandon?: () => void },
+): void {
+  const card = AutonomousProductionCard({
+    view,
+    pending: false,
+    error: null,
+    onStart: callbacks.onStart ?? (() => undefined),
+    onStop: callbacks.onStop ?? (() => undefined),
+    onRepair: () => undefined,
+    ...(callbacks.onAbandon ? { onAbandon: callbacks.onAbandon } : {}),
+    onConfigureModels: () => undefined,
+  });
+  findButton(card, label).props.onClick?.();
+}
+
 describe("compact autonomous production card", () => {
+  it.each([
+    ["fresh ordinary start", "READY", null],
+    ["READY ordinary resume", "READY", { status: "READY", mode: "current-volume" }],
+    ["user-paused ordinary resume", "PAUSED_BY_USER", { status: "PAUSED_BY_USER", mode: "current-volume" }],
+    ["new run after old volume completion", "VOLUME_COMPLETE", { status: "VOLUME_COMPLETE", mode: "current-volume" }],
+  ] as const)("starts full-book for %s", (_case, runtimeStatus, runtime) => {
+    const starts: Array<"current-volume" | "full-book"> = [];
+    clickCardButton({
+      ...blockedView,
+      runtimeStatus,
+      runtime: runtime as AutonomousView["runtime"],
+      runtimeBlockers: [],
+      startEnabled: true,
+    }, "Resume", { onStart: (mode) => starts.push(mode) });
+
+    expect(starts).toEqual(["full-book"]);
+  });
+
+  it.each([
+    ["PAUSED_PROVIDER_UNAVAILABLE", "current-volume"],
+    ["PAUSED_AMBIGUOUS_PROVIDER_OUTCOME", "full-book"],
+    ["PAUSED_DETERMINISTIC_PROVIDER_ERROR", "current-volume"],
+    ["PAUSED_PIPELINE_ERROR", "full-book"],
+  ] as const)("preserves %s identity with persisted %s mode", (runtimeStatus, mode) => {
+    const starts: Array<"current-volume" | "full-book"> = [];
+    clickCardButton({
+      ...blockedView,
+      runtimeStatus,
+      runtime: { status: runtimeStatus, mode },
+      runtimeBlockers: [],
+      startEnabled: true,
+    }, "Resume", { onStart: (selected) => starts.push(selected) });
+
+    expect(starts).toEqual([mode]);
+  });
+
+  it.each(["current-volume", "full-book"] as const)("preserves %s for formal preserved recovery", (persistedMode) => {
+    const starts: Array<"current-volume" | "full-book"> = [];
+    clickCardButton({
+      ...blockedView,
+      runtimeStatus: "RECOVERY_READY_PRESERVED_BOUNDED_REVIEW",
+      runtime: { status: "REVIEW_EXHAUSTED", mode: persistedMode },
+      runtimeBlockers: [],
+      startEnabled: true,
+      finalReviewRecovery: {
+        recoveryMode: "FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME",
+        chapter: 5,
+        rescueCandidate: "PRESERVED",
+        rescueGeneration: "REUSED",
+        rescueArtifactIdentity: "VERIFIED_CHAPTER_005",
+        finalReview: "RESUME_REQUIRED",
+        finalReviewDecision: null,
+        writerRegeneration: false,
+        normalRevisionRegeneration: false,
+        rescueRevisionRegeneration: false,
+        nextAction: "RESUME_PRESERVED_REVIEW",
+        additionalWriterCalls: 0,
+        additionalReviserCalls: 0,
+        additionalReviewerCalls: 1,
+        additionalRevisionAllowed: false,
+      },
+    }, "Resume", { onStart: (mode) => starts.push(mode) });
+
+    expect(starts).toEqual([persistedMode]);
+  });
+
+  it("keeps Stop and Rewrite bound to their existing handlers", () => {
+    let stops = 0;
+    let rewrites = 0;
+    clickCardButton({
+      ...blockedView,
+      runtimeStatus: "RUNNING",
+      runtimeBlockers: [],
+      startEnabled: false,
+    }, "Stop", { onStop: () => { stops += 1; } });
+    clickCardButton({
+      ...blockedView,
+      runtimeStatus: "PAUSED_BY_USER",
+      runtimeBlockers: [],
+      startEnabled: true,
+      chapterTransaction: { state: "STAGING", activeTransactionId: "txn-one", canAbandonAttempt: true },
+    }, "Rewrite", { onAbandon: () => { rewrites += 1; } });
+
+    expect({ stops, rewrites }).toEqual({ stops: 1, rewrites: 1 });
+  });
+
   it.each([
     ["RUNNING", "Running", "运行中"],
     ["REPAIRING", "Running", "运行中"],

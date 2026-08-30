@@ -1,10 +1,10 @@
 import { fetchJson, useApi, postApi } from "../hooks/use-api";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { Theme } from "../hooks/use-theme";
 import type { TFunction } from "../hooks/use-i18n";
-import type { SSEMessage } from "../hooks/use-sse";
+import { useNewSSEMessages, type SSEMessage } from "../hooks/use-sse";
 import { useColors } from "../hooks/use-colors";
-import { deriveBookActivity, shouldRefetchBookView } from "../hooks/use-book-activity";
+import { deriveBookActivity, primeBookViewSSEMessages, shouldRefetchBookView } from "../hooks/use-book-activity";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { AutonomousProductionPanel } from "../components/AutonomousProductionPanel";
 import {
@@ -137,10 +137,7 @@ export function BookDetail({
   const drafting = draftRequestPending || activity.drafting;
   const latestPersistedChapter = data ? data.nextChapter - 1 : 0;
 
-  useEffect(() => {
-    const recent = sse.messages.at(-1);
-    if (!recent) return;
-
+  const handleBookEvent = useCallback((recent: SSEMessage) => {
     const data = recent.data as { bookId?: string } | null;
     if (data?.bookId !== bookId) return;
 
@@ -159,7 +156,8 @@ export function BookDetail({
       setDraftRequestPending(false);
       refetch();
     }
-  }, [bookId, refetch, sse.messages]);
+  }, [bookId, refetch]);
+  useNewSSEMessages(primeBookViewSSEMessages(sse.messages), handleBookEvent);
 
   const handleWriteNext = async () => {
     setWriteRequestPending(true);

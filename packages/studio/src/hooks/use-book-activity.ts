@@ -3,6 +3,7 @@ import type { SSEMessage } from "./use-sse";
 const START_EVENTS = new Set(["write:start", "draft:start"]);
 const TERMINAL_EVENTS = new Set(["write:complete", "write:error", "draft:complete", "draft:error"]);
 const BOOK_REFRESH_EVENTS = new Set([
+  "autonomous:chapter-complete",
   "write:complete",
   "write:error",
   "draft:complete",
@@ -37,6 +38,10 @@ const DAEMON_STATUS_REFRESH_EVENTS = new Set([
   "daemon:error",
 ]);
 
+const BOOK_VIEW_CURSOR_SEED: ReadonlyArray<SSEMessage> = [
+  { event: "book-view:cursor-seed", data: null, timestamp: 0, seq: 0 },
+];
+
 export interface BookActivity {
   readonly writing: boolean;
   readonly drafting: boolean;
@@ -49,6 +54,10 @@ export interface SidebarBookSummary {
   readonly genre: string;
   readonly status: string;
   readonly chaptersWritten: number;
+}
+
+export function primeBookViewSSEMessages(messages: ReadonlyArray<SSEMessage>): ReadonlyArray<SSEMessage> {
+  return messages.length === 0 ? BOOK_VIEW_CURSOR_SEED : messages;
 }
 
 function getBookId(message: SSEMessage): string | null {
