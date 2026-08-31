@@ -18,6 +18,54 @@ describe("retrieveMemorySelection", () => {
     }
   });
 
+  it("returns the same canonical memory set and order when authoritative hook rows arrive in a different order", async () => {
+    root = await mkdtemp(join(tmpdir(), "inkos-memory-canonical-order-"));
+    const retrieve = async (name: string, hookIds: ReadonlyArray<string>) => {
+      const bookDir = join(root, name);
+      const storyDir = join(bookDir, "story");
+      await mkdir(storyDir, { recursive: true });
+      await Promise.all([
+        writeFile(join(storyDir, "current_state.md"), [
+          "# Current State",
+          "| Field | Value |",
+          "| --- | --- |",
+          "| Current Chapter | 5 |",
+          "| Current Goal | Keep both witness debts active. |",
+          "| Current Conflict | Both witnesses are exposed. |",
+        ].join("\n"), "utf-8"),
+        writeFile(join(storyDir, "chapter_summaries.md"), [
+          "| chapter | title | characters | events | stateChanges | hookActivity | mood | chapterType |",
+          "| --- | --- | --- | --- | --- | --- | --- | --- |",
+          "| 4 | Witnesses | Lin | Both witness debts remain active | None | alpha and zeta advanced | tense | mainline |",
+        ].join("\n"), "utf-8"),
+        writeFile(join(storyDir, "pending_hooks.md"), [
+          "| hook_id | start_chapter | type | status | last_advanced | expected_payoff | notes |",
+          "| --- | --- | --- | --- | --- | --- | --- |",
+          ...hookIds.map((hookId) => `| ${hookId} | 1 | witness | open | 5 | Resolve witness debt | ${hookId} remains active |`),
+        ].join("\n"), "utf-8"),
+      ]);
+      return retrieveMemorySelection({
+        bookDir,
+        chapterNumber: 6,
+        goal: "Keep both witness debts active.",
+      });
+    };
+
+    const forward = await retrieve("forward", ["Zeta", "alpha"]);
+    const reversed = await retrieve("reversed", ["alpha", "Zeta"]);
+
+    expect(forward.hooks.map((hook) => hook.hookId)).toEqual(["Zeta", "alpha"]);
+    expect(reversed.hooks.map((hook) => hook.hookId)).toEqual(["Zeta", "alpha"]);
+    expect(reversed.activeHooks.map((hook) => hook.hookId)).toEqual(["Zeta", "alpha"]);
+    expect(reversed.summaries.map((summary) => summary.chapter)).toEqual(
+      forward.summaries.map((summary) => summary.chapter),
+    );
+    expect(reversed.facts.map((fact) => [fact.predicate, fact.object])).toEqual(
+      forward.facts.map((fact) => [fact.predicate, fact.object]),
+    );
+    expect(reversed.retrievalTrace).not.toHaveProperty("semanticSelectedIds");
+  });
+
   it("indexes current state facts into sqlite-backed memory selection", async () => {
     root = await mkdtemp(join(tmpdir(), "inkos-memory-retrieval-test-"));
     const bookDir = join(root, "book");

@@ -2902,16 +2902,6 @@ export class PipelineRunner {
       })).digest("hex")}`;
       chapterTransaction = await beginChapterTransaction({ bookDir, bookId, chapterNumber, productionAuthority });
     }
-    if (this.config.boundedAutonomousReview && !preservedReviewPlan) {
-      const identity = this.resolveOverride("writer");
-      await this.config.onAutonomousStage?.({
-        stage: "PREPARING",
-        role: "writer",
-        provider: identity.client.service ?? identity.client.provider,
-        model: identity.model,
-        ...(chapterTransaction ? { transactionId: chapterTransaction.transactionId } : {}),
-      });
-    }
     const paddedChapter = String(chapterNumber).padStart(4, "0");
     if (preservedReviewPlan && chapterNumber !== preservedReviewPlan.pendingChapterNumber) {
       throw new Error("PRESERVED_CANDIDATE_CURSOR_CHANGED");
@@ -5692,14 +5682,18 @@ ${matrix}`,
         await emitComposerOperation("context-compression");
         return composer.compileCompressibleContext(request);
       },
-      outlineSectionSelector: async (request) => {
-        await emitComposerOperation(request.fileName.includes("story_frame") ? "story-frame-selector" : "volume-map-selector");
-        return composer.selectOutlineSections(request);
-      },
-      memorySemanticSelector: async (request) => {
-        await emitComposerOperation("memory-selector");
-        return composer.selectMemoryCandidates(request);
-      },
+      ...(options?.transactionId
+        ? { strictStructuralOutlineSelection: true }
+        : {
+            outlineSectionSelector: async (request) => {
+              await emitComposerOperation(request.fileName.includes("story_frame") ? "story-frame-selector" : "volume-map-selector");
+              return composer.selectOutlineSections(request);
+            },
+            memorySemanticSelector: async (request) => {
+              await emitComposerOperation("memory-selector");
+              return composer.selectMemoryCandidates(request);
+            },
+          }),
       referenceContextProvider: (request) => selectBookReferenceContext(
         this.config.projectRoot,
         book.id,

@@ -29,6 +29,7 @@ import type {
   BookReferenceSelectionTask,
   ReferenceSectionSelectionRequest,
 } from "../references/reference-context.js";
+import { parseBookProductionMap, type ProductionVolume } from "../production/book-production-map.js";
 
 export interface ComposeChapterInput {
   readonly book: BookConfig;
@@ -40,6 +41,7 @@ export interface ComposeChapterInput {
   readonly outlineSectionSelector?: OutlineSectionSelector;
   readonly referenceContextProvider?: BookReferenceContextProvider;
   readonly memorySemanticSelector?: MemorySemanticSelector;
+  readonly strictStructuralOutlineSelection?: boolean;
   readonly onContextCompression?: ContextCompressionCallback;
 }
 
@@ -98,7 +100,10 @@ export async function composeGovernedChapter(input: ComposeChapterInput): Promis
     input.plan,
     input.book.language ?? "zh",
     input.outlineSectionSelector,
-    input.memorySemanticSelector,
+    input.strictStructuralOutlineSelection ? undefined : input.memorySemanticSelector,
+    input.book.id,
+    input.book.title,
+    input.strictStructuralOutlineSelection === true,
   );
   const referenceContext = await loadReferenceContext(input);
   const selectedContext = [...baseContext.entries, ...referenceContext.entries];
@@ -575,6 +580,9 @@ async function collectSelectedContext(
   language: "zh" | "en",
   outlineSectionSelector?: OutlineSectionSelector,
   memorySemanticSelector?: MemorySemanticSelector,
+  bookId?: string,
+  bookTitle?: string,
+  strictStructuralOutlineSelection = false,
 ): Promise<{
   readonly entries: ContextPackage["selectedContext"];
   readonly retrievalTrace: MemoryRetrievalTrace;
@@ -628,6 +636,9 @@ async function collectSelectedContext(
       "story-frame",
       language,
       outlineSectionSelector,
+      bookId,
+      bookTitle,
+      strictStructuralOutlineSelection,
     ),
       ...await maybeOutlineSectionSources(
         storyDir,
@@ -637,6 +648,9 @@ async function collectSelectedContext(
       "volume-map",
       language,
       outlineSectionSelector,
+      bookId,
+      bookTitle,
+      strictStructuralOutlineSelection,
     ),
     ];
     const canonEntries = await Promise.all([
@@ -913,16 +927,23 @@ async function maybeOutlineSectionSources(
   kind: "story-frame" | "volume-map",
   language: "zh" | "en",
   outlineSectionSelector?: OutlineSectionSelector,
+  bookId?: string,
+  bookTitle?: string,
+  strictStructuralOutlineSelection?: boolean,
 ): Promise<ContextPackage["selectedContext"]> {
     const path = join(storyDir, fileName);
     const content = await readFileOrDefault(path);
 
     if (!content || content === "(文件尚未创建)") {
+      if (strictStructuralOutlineSelection) {
+        throw new Error(`FORMAL_${kind === "story-frame" ? "STORY_FRAME" : "VOLUME_MAP"}_STRUCTURE_INVALID: missing story/${fileName}`);
+      }
       const legacyFallback = outlineFallback(fileName);
       if (!legacyFallback) return [];
       const legacyContent = await readFileOrDefault(join(storyDir, legacyFallback));
       if (!legacyContent || legacyContent === "(文件尚未创建)") return [];
       return await selectOutlineSectionEntries({
+        storyDir,
         fileName: legacyFallback,
         content: legacyContent,
         reason,
@@ -930,10 +951,14 @@ async function maybeOutlineSectionSources(
         kind,
         language,
         outlineSectionSelector,
+        bookId,
+        bookTitle,
+        strictStructuralOutlineSelection,
       });
     }
 
     return await selectOutlineSectionEntries({
+      storyDir,
       fileName,
       content,
       reason,
@@ -941,10 +966,14 @@ async function maybeOutlineSectionSources(
       kind,
       language,
       outlineSectionSelector,
+      bookId,
+      bookTitle,
+      strictStructuralOutlineSelection,
     });
 }
 
 async function selectOutlineSectionEntries(params: {
+  readonly storyDir: string;
   readonly fileName: string;
   readonly content: string;
   readonly reason: string;
@@ -952,14 +981,47 @@ async function selectOutlineSectionEntries(params: {
   readonly kind: "story-frame" | "volume-map";
   readonly language: "zh" | "en";
   readonly outlineSectionSelector?: OutlineSectionSelector;
+  readonly bookId?: string;
+  readonly bookTitle?: string;
+  readonly strictStructuralOutlineSelection?: boolean;
 }): Promise<ContextPackage["selectedContext"]> {
     const sections = splitMarkdownSections(params.content);
     if (sections.length === 0) {
+      if (params.strictStructuralOutlineSelection) {
+        throw new Error(`FORMAL_${params.kind === "story-frame" ? "STORY_FRAME" : "VOLUME_MAP"}_STRUCTURE_INVALID: no Markdown sections`);
+      }
       return [{
         source: `story/${params.fileName}#document`,
         reason: params.reason,
         excerpt: params.content.trim(),
       }];
+    }
+
+    if (params.strictStructuralOutlineSelection) {
+      if (!params.bookId) {
+        throw new Error("FORMAL_OUTLINE_STRUCTURE_INVALID: missing book identity");
+      }
+      const productionMap = parseBookProductionMap(JSON.parse(await readFile(
+        join(params.storyDir, "outline", "book-production-map.json"),
+        "utf-8",
+      )), params.bookId);
+      if (!params.bookTitle || normalizeAuthorityTitle(productionMap.title) !== normalizeAuthorityTitle(params.bookTitle)) {
+        throw new Error("FORMAL_OUTLINE_STRUCTURE_INVALID: book-production-map.json title does not match BookConfig");
+      }
+      const activeVolume = productionMap.volumes.filter((volume) =>
+        params.plan.intent.chapter >= volume.startChapter && params.plan.intent.chapter <= volume.endChapter,
+      );
+      if (activeVolume.length !== 1) {
+        throw new Error(`FORMAL_VOLUME_MAP_STRUCTURE_INVALID: expected one active production volume for Chapter ${params.plan.intent.chapter}, found ${activeVolume.length}`);
+      }
+      const formalSections = params.kind === "story-frame"
+        ? selectFormalStoryFrameSections(sections, activeVolume[0]!, params.plan.intent.chapter)
+        : selectFormalVolumeMapSections(sections, activeVolume[0]!, params.plan.intent.chapter, productionMap.title);
+      return formalSections.map((section) => ({
+        source: `story/${params.fileName}#${slugifyAnchor(section.heading)}`,
+        reason: params.reason,
+        excerpt: section.raw.trim(),
+      }));
     }
 
     const hints = deriveOutlineSelectionHints(params.plan);
@@ -1011,13 +1073,52 @@ async function selectOutlineSectionEntries(params: {
 
 interface MarkdownSection {
   readonly heading: string;
+  readonly level: number;
   readonly raw: string;
 }
 
 function splitMarkdownSections(content: string): MarkdownSection[] {
-    const sections: Array<{ heading: string; lines: string[] }> = [];
-    let current: { heading: string; lines: string[] } | null = null;
+    const sections: Array<{ heading: string; level: number; lines: string[] }> = [];
+    let current: { heading: string; level: number; lines: string[] } | null = null;
+    let fenceMarker: "`" | "~" | null = null;
+    let fenceLength = 0;
+    let inHtmlComment = false;
     for (const line of content.split(/\r?\n/)) {
+      if (inHtmlComment) {
+        if (current) current.lines.push(line);
+        if (line.includes("-->")) inHtmlComment = false;
+        continue;
+      }
+
+      const fenceMatch = /^\s{0,3}(`{3,}|~{3,})(.*)$/u.exec(line);
+      if (fenceMarker) {
+        if (current) current.lines.push(line);
+        if (fenceMatch
+          && fenceMatch[1]![0] === fenceMarker
+          && fenceMatch[1]!.length >= fenceLength
+          && fenceMatch[2]!.trim().length === 0) {
+          fenceMarker = null;
+          fenceLength = 0;
+        }
+        continue;
+      }
+      if (fenceMatch) {
+        fenceMarker = fenceMatch[1]![0] as "`" | "~";
+        fenceLength = fenceMatch[1]!.length;
+        if (current) current.lines.push(line);
+        continue;
+      }
+
+      const commentStart = line.indexOf("<!--");
+      if (commentStart >= 0) {
+        const commentEnd = line.indexOf("-->", commentStart + 4);
+        if (commentEnd < 0) inHtmlComment = true;
+        if (line.slice(0, commentStart).trim().length === 0 || commentEnd < 0) {
+          if (current) current.lines.push(line);
+          continue;
+        }
+      }
+
       const headingMatch = /^(#{1,6})\s+(.+?)\s*$/.exec(line);
       if (headingMatch) {
         if (current && current.lines.some((entry) => entry.trim().length > 0)) {
@@ -1025,6 +1126,7 @@ function splitMarkdownSections(content: string): MarkdownSection[] {
         }
         current = {
           heading: headingMatch[2]!.trim(),
+          level: headingMatch[1]!.length,
           lines: [line],
         };
         continue;
@@ -1039,9 +1141,204 @@ function splitMarkdownSections(content: string): MarkdownSection[] {
     return sections
       .map((section) => ({
         heading: section.heading,
+        level: section.level,
         raw: section.lines.join("\n").trim(),
       }))
       .filter((section) => section.raw.length > 0);
+}
+
+function selectFormalStoryFrameSections(
+  sections: ReadonlyArray<MarkdownSection>,
+  activeVolume: ProductionVolume,
+  chapterNumber: number,
+): ReadonlyArray<MarkdownSection> {
+  const lockedProjection = sections.filter((section) =>
+    section.level === 1 && [
+      "story frame final locked projection",
+      "story frame locked projection",
+      "故事框架 最终锁定投影",
+      "故事框架 锁定投影",
+    ].includes(normalizeStructuralHeading(section.heading)),
+  );
+  if (lockedProjection.length > 1) {
+    throw new Error(`FORMAL_STORY_FRAME_STRUCTURE_INVALID: expected at most one locked projection root, found ${lockedProjection.length}`);
+  }
+
+  const productPromise = requireOneStoryFrameSection(sections, "Product Promise", [
+    "product promise",
+    "产品承诺",
+    "主题与基调",
+  ]);
+  const dramaticQuestion = requireOneStoryFrameSection(sections, "Two-level dramatic question", [
+    "two level dramatic question",
+    "two level dramatic question core conflict",
+    "core conflict",
+    "core conflict and opponents",
+    "双层戏剧问题",
+    "双层戏剧问题 核心冲突",
+    "核心冲突",
+    "核心冲突与对手",
+  ]);
+  const worldAnchor = requireOneStoryFrameSection(sections, "World anchor", [
+    "world anchor",
+    "world tonal rule anchor",
+    "世界锚",
+    "世界观底色",
+    "世界观底色 铁律 质感 本书专属规则",
+  ]);
+
+  const centers = sections
+    .map((section) => ({ section, range: parseStoryFrameVolumeCenter(section.heading) }))
+    .filter((entry): entry is { section: MarkdownSection; range: { volumeNumber: number; title: string; startChapter: number; endChapter: number } } =>
+      entry.range !== null
+      && chapterNumber >= entry.range.startChapter
+      && chapterNumber <= entry.range.endChapter,
+    );
+  if (centers.length !== 1) {
+    throw new Error(`FORMAL_STORY_FRAME_STRUCTURE_INVALID: expected one active-volume center for Chapter ${chapterNumber}, found ${centers.length}`);
+  }
+  const center = centers[0]!;
+  if (center.range.volumeNumber !== activeVolume.volumeNumber
+    || normalizeAuthorityTitle(center.range.title) !== normalizeAuthorityTitle(activeVolume.title)
+    || center.range.startChapter !== activeVolume.startChapter
+    || center.range.endChapter !== activeVolume.endChapter) {
+    throw new Error("FORMAL_STORY_FRAME_STRUCTURE_INVALID: active-volume center does not match book-production-map.json");
+  }
+
+  return [
+    ...lockedProjection,
+    productPromise,
+    dramaticQuestion,
+    worldAnchor,
+    center.section,
+  ];
+}
+
+function requireOneStoryFrameSection(
+  sections: ReadonlyArray<MarkdownSection>,
+  label: string,
+  aliases: ReadonlyArray<string>,
+): MarkdownSection {
+  const allowed = new Set(aliases.map(normalizeStructuralHeading));
+  const matches = sections.filter((section) => allowed.has(normalizeStructuralHeading(section.heading)));
+  if (matches.length !== 1) {
+    throw new Error(`FORMAL_STORY_FRAME_STRUCTURE_INVALID: expected one ${label}, found ${matches.length}`);
+  }
+  return matches[0]!;
+}
+
+function selectFormalVolumeMapSections(
+  sections: ReadonlyArray<MarkdownSection>,
+  activeVolume: ProductionVolume,
+  chapterNumber: number,
+  productionMapTitle: string,
+): ReadonlyArray<MarkdownSection> {
+  const markers = sections
+    .map((section, index) => ({ section, index, volumeNumber: parseProjectedVolumeHeading(section.heading) }))
+    .filter((entry): entry is { section: MarkdownSection; index: number; volumeNumber: number } => entry.volumeNumber !== null);
+  const activeMarkers = markers.filter((entry) => entry.volumeNumber === activeVolume.volumeNumber);
+  if (activeMarkers.length !== 1 || activeMarkers[0]!.section.level !== 1) {
+    throw new Error(`FORMAL_VOLUME_MAP_STRUCTURE_INVALID: expected one PROJECTED VOLUME ${activeVolume.volumeNumber} root, found ${activeMarkers.length}`);
+  }
+  const marker = activeMarkers[0]!;
+  const nextMarkerIndex = markers.find((entry) => entry.index > marker.index)?.index ?? sections.length;
+  const blueprintMatches = sections
+    .map((section, index) => ({ section, index, blueprint: parseVolumeBlueprintHeading(section.heading) }))
+    .filter((entry): entry is { section: MarkdownSection; index: number; blueprint: { volumeNumber: number; bookTitle: string } } =>
+      entry.blueprint?.volumeNumber === activeVolume.volumeNumber,
+    );
+  if (blueprintMatches.length !== 1
+    || blueprintMatches[0]!.section.level !== 1
+    || blueprintMatches[0]!.index !== marker.index + 1
+    || blueprintMatches[0]!.index >= nextMarkerIndex) {
+    throw new Error(`FORMAL_VOLUME_MAP_STRUCTURE_INVALID: expected one consecutive Volume ${activeVolume.volumeNumber} blueprint root`);
+  }
+  const blueprint = blueprintMatches[0]!;
+  if (normalizeAuthorityTitle(blueprint.blueprint.bookTitle) !== normalizeAuthorityTitle(productionMapTitle)) {
+    throw new Error("FORMAL_VOLUME_MAP_STRUCTURE_INVALID: blueprint book title does not match book-production-map.json");
+  }
+
+  const chapterSections = sections
+    .map((section, index) => ({ section, index, chapter: parseChapterHeading(section.heading) }))
+    .filter((entry): entry is { section: MarkdownSection; index: number; chapter: number } => entry.chapter !== null);
+  const selectedChapters: MarkdownSection[] = [];
+  for (const target of [chapterNumber - 1, chapterNumber, chapterNumber + 1]) {
+    if (target < activeVolume.startChapter || target > activeVolume.endChapter) continue;
+    const matches = chapterSections.filter((entry) => entry.chapter === target);
+    const sameVolume = matches.filter((entry) => entry.index > blueprint.index && entry.index < nextMarkerIndex);
+    if (matches.length !== sameVolume.length || sameVolume.length !== 1) {
+      throw new Error(`FORMAL_VOLUME_MAP_STRUCTURE_INVALID: Chapter ${target} is missing, duplicated, or outside active Volume ${activeVolume.volumeNumber}`);
+    }
+    selectedChapters.push(sameVolume[0]!.section);
+  }
+
+  return [marker.section, blueprint.section, ...selectedChapters];
+}
+
+function parseStoryFrameVolumeCenter(heading: string): {
+  readonly volumeNumber: number;
+  readonly title: string;
+  readonly startChapter: number;
+  readonly endChapter: number;
+} | null {
+  const match = /^Volume\s+([ivxlcdm]+|\d+)\s*[\u2014\u2013-]\s*(.+?)\s*\(\s*Chapters?\s+0*(\d+)\s*[\u2014\u2013-]\s*0*(\d+)\s+center\s*\)$/iu.exec(heading.trim());
+  if (!match) return null;
+  const volumeNumber = parseVolumeOrdinal(match[1]!);
+  const title = match[2]!.trim();
+  const startChapter = Number(match[3]);
+  const endChapter = Number(match[4]);
+  if (!volumeNumber || !title || startChapter < 1 || endChapter < startChapter) return null;
+  return { volumeNumber, title, startChapter, endChapter };
+}
+
+function parseProjectedVolumeHeading(heading: string): number | null {
+  const match = /^PROJECTED\s+VOLUME\s+([ivxlcdm]+|\d+)$/iu.exec(heading.trim());
+  return match ? parseVolumeOrdinal(match[1]!) : null;
+}
+
+function parseVolumeBlueprintHeading(heading: string): { readonly volumeNumber: number; readonly bookTitle: string } | null {
+  const match = /^(.+?)\s*[\u2014\u2013-]\s*Volume\s+([ivxlcdm]+|\d+)\s+Chapter\s+Blueprint\s+Set(?:\s+v[\d.]+)?$/iu.exec(heading.trim());
+  const volumeNumber = match ? parseVolumeOrdinal(match[2]!) : null;
+  return match && volumeNumber ? { volumeNumber, bookTitle: match[1]!.trim() } : null;
+}
+
+function parseChapterHeading(heading: string): number | null {
+  const match = /^(?:Chapter\s+0*(\d+)|第\s*0*(\d+)\s*章)(?:\s|[\u2014\u2013:：-]|$)/iu.exec(heading.trim());
+  if (!match) return null;
+  const chapter = Number(match[1] ?? match[2]);
+  return Number.isInteger(chapter) && chapter > 0 ? chapter : null;
+}
+
+function parseVolumeOrdinal(value: string): number | null {
+  if (/^\d+$/u.test(value)) return Number(value);
+  const normalized = value.toUpperCase();
+  if (!/^(?=[MDCLXVI]+$)M{0,3}(?:CM|CD|D?C{0,3})(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3})$/u.test(normalized)) {
+    return null;
+  }
+  const romanValues: Readonly<Record<string, number>> = { I: 1, V: 5, X: 10, L: 50, C: 100, D: 500, M: 1000 };
+  let total = 0;
+  let previous = 0;
+  for (const char of normalized.split("").reverse()) {
+    const current = romanValues[char];
+    if (!current) return null;
+    total += current < previous ? -current : current;
+    previous = current;
+  }
+  return total > 0 ? total : null;
+}
+
+function normalizeAuthorityTitle(value: string): string {
+  return value.normalize("NFKC").replace(/\s+/gu, " ").trim().toLowerCase();
+}
+
+function normalizeStructuralHeading(value: string): string {
+  return value
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[\u2014\u2013_:：()（）+]/gu, " ")
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
 }
 
 function deriveOutlineSelectionHints(plan: PlanChapterOutput): string[] {

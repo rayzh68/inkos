@@ -56,6 +56,21 @@ const ZERO_USAGE = {
   totalTokens: 0,
 } as const;
 
+const VALID_PLANNER_MEMO = [
+  "# Chapter 1 memo",
+  "## Chapter goal", "Open the watched gate without losing the clock.",
+  "## Thread refs", "none",
+  "## Scene and length budget", "Plan three concrete scenes with distinct actions, consequences, and measured word budgets.",
+  "## Current task", "Open the watched gate while preserving the witnessed authority carried by the clock.",
+  "## What the reader is waiting for right now", "The reader is waiting to see whether the gate opens before the clock expires.",
+  "## To pay off / to keep buried", "Pay off the gate action while keeping the deeper authority conflict buried for later.",
+  "## What the slow / transitional beats carry", "Any slower beat must carry pressure, evidence, relationship movement, or the next action.",
+  "## Three-question check on the key choice", "The choice has a clear reason, serves the protagonist's interest, and matches established behavior.",
+  "## Required end-of-chapter change", "End with a concrete change in access, pressure, evidence, relationship, objective, or risk.",
+  "## Hook ledger for this chapter", "Advance the watched-gate promise, resolve only proved facts, and defer the hidden authority.",
+  "## Do not", "Do not contradict established facts.",
+].join("\n\n");
+
 function englishWords(count: number, word = "word"): string {
   return Array.from({ length: count }, () => word).join(" ");
 }
@@ -308,8 +323,34 @@ async function createRunnerFixture(
   };
 
   await state.saveBookConfig(bookId, book);
-  await mkdir(join(state.bookDir(bookId), "story"), { recursive: true });
-  await mkdir(join(state.bookDir(bookId), "chapters"), { recursive: true });
+  const fixtureBookDir = state.bookDir(bookId);
+  const fixtureStoryDir = join(fixtureBookDir, "story");
+  await Promise.all([
+    mkdir(join(fixtureStoryDir, "outline"), { recursive: true }),
+    mkdir(join(fixtureBookDir, "chapters"), { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(join(fixtureStoryDir, "outline", "story_frame.md"), [
+      "# Story Frame — Final Locked Projection", "Locked projection authority.",
+      "## Product promise", "Keep the gate under pressure.",
+      "## Two-level dramatic question", "The visible clock and hidden gate authority collide.",
+      "## World anchor", "The gate is watched and witnessed rules cannot be erased.",
+      "### Volume I — One (Chapters 1–10 center)", "Open the gate without losing the clock.",
+    ].join("\n")),
+    writeFile(join(fixtureStoryDir, "outline", "volume_map.md"), [
+      "# Volume Map and Complete Chapter Blueprint Authority",
+      "# PROJECTED VOLUME 1", "Status: locked.",
+      "# Test Book — Volume I Chapter Blueprint Set v1.1", "Closure: the gate opens.",
+      ...Array.from({ length: 10 }, (_, index) => [
+        `## Chapter ${String(index + 1).padStart(3, "0")} — Fixture ${index + 1}`,
+        `Advance fixture chapter ${index + 1}.`,
+      ]).flat(),
+    ].join("\n")),
+    writeFile(join(fixtureStoryDir, "outline", "book-production-map.json"), JSON.stringify({
+      schema_version: "1.0", book_id: bookId, authority_book_id: "authority", title: "Test Book", total_chapters: 10,
+      volumes: [{ volume_id: "volume-001", volume_number: 1, title: "One", start_chapter: 1, end_chapter: 10, chapter_count: 10 }],
+    })),
+  ]);
 
   const runner = new PipelineRunner({
     client: {
@@ -348,8 +389,33 @@ async function seedTransactionPipeline(
       chapter: 0, location: "Gate", protagonistState: "Ready", goal: "Begin", conflict: "Clock",
     })),
     writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n"),
-    writeFile(join(storyDir, "outline", "story_frame.md"), "# Frame\n\n## Rule\nKeep the gate.\n\n## Ending\nReach the clock."),
-    writeFile(join(storyDir, "outline", "volume_map.md"), "# Volume\n\n## Chapter 1\nOpen the gate.\n\n## Chapter 2\nFollow the clock."),
+    writeFile(join(storyDir, "outline", "story_frame.md"), [
+      "# Story Frame — Final Locked Projection",
+      "Locked projection authority.",
+      "## Product promise",
+      "Keep the gate under pressure.",
+      "## Two-level dramatic question",
+      "The visible clock and hidden gate authority collide.",
+      "## World anchor",
+      "The gate is watched and witnessed rules cannot be erased.",
+      "### Volume I — One (Chapters 1–10 center)",
+      "Open the gate without losing the clock.",
+    ].join("\n")),
+    writeFile(join(storyDir, "outline", "volume_map.md"), [
+      "# Volume Map and Complete Chapter Blueprint Authority",
+      "# PROJECTED VOLUME 1",
+      "Status: locked.",
+      "# Test Book — Volume I Chapter Blueprint Set v1.1",
+      "Closure: the gate opens.",
+      "## Chapter 001 — Open the Gate",
+      "Open the gate.",
+      "## Chapter 002 — Follow the Clock",
+      "Follow the clock.",
+    ].join("\n")),
+    writeFile(join(storyDir, "outline", "book-production-map.json"), JSON.stringify({
+      schema_version: "1.0", book_id: bookId, authority_book_id: "authority", title: "Test Book", total_chapters: 10,
+      volumes: [{ volume_id: "volume-001", volume_number: 1, title: "One", start_chapter: 1, end_chapter: 10, chapter_count: 10 }],
+    })),
   ]);
   await rewriteStructuredStateFromMarkdown({ bookDir, fallbackChapter: 0 });
   await state.snapshotState(bookId, 0);
@@ -516,13 +582,27 @@ describe("PipelineRunner", () => {
       ]);
       await mkdir(join(storyDir, "outline"), { recursive: true });
       await Promise.all([
-        writeFile(join(storyDir, "outline", "story_frame.md"), "# Frame\n\n## Rule\nKeep the gate.\n\n## Ending\nReach the clock."),
-        writeFile(join(storyDir, "outline", "volume_map.md"), "# Volume\n\n## Chapter 1\nOpen the gate.\n\n## Chapter 2\nFollow the clock."),
+        writeFile(join(storyDir, "outline", "story_frame.md"), [
+          "# Story Frame — Final Locked Projection", "Locked projection authority.",
+          "## Product promise", "Keep the gate under pressure.",
+          "## Two-level dramatic question", "The visible clock and hidden gate authority collide.",
+          "## World anchor", "The gate is watched and witnessed rules cannot be erased.",
+          "### Volume I — One (Chapters 1–10 center)", "Open the gate without losing the clock.",
+        ].join("\n")),
+        writeFile(join(storyDir, "outline", "volume_map.md"), [
+          "# Volume Map and Complete Chapter Blueprint Authority",
+          "# PROJECTED VOLUME 1", "Status: locked.",
+          "# Test Book — Volume I Chapter Blueprint Set v1.1", "Closure: the gate opens.",
+          "## Chapter 001 — Open the Gate", "Open the gate.",
+          "## Chapter 002 — Follow the Clock", "Follow the clock.",
+        ].join("\n")),
+        writeFile(join(storyDir, "outline", "book-production-map.json"), JSON.stringify({
+          schema_version: "1.0", book_id: bookId, authority_book_id: "authority", title: "Test Book", total_chapters: 10,
+          volumes: [{ volume_id: "volume-001", volume_number: 1, title: "One", start_chapter: 1, end_chapter: 10, chapter_count: 10 }],
+        })),
       ]);
-      vi.spyOn(ComposerModule.ComposerAgent.prototype, "selectOutlineSections").mockImplementation(async (request) =>
-        request.fileName.includes("story_frame")
-          ? ["story/outline/story_frame.md#rule"]
-          : ["story/outline/volume_map.md#chapter-1"]);
+      const outlineSelector = vi.spyOn(ComposerModule.ComposerAgent.prototype, "selectOutlineSections");
+      const memorySelector = vi.spyOn(ComposerModule.ComposerAgent.prototype, "selectMemoryCandidates");
       await state.snapshotState(bookId, 0);
       await createChapterGenesis({ bookDir, bookId, lastTrustedChapter: 0, trustedSnapshotDir: join(storyDir, "snapshots", "0"), createdAt: "2026-08-28T00:00:00.000Z" });
       const writeChapter = vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(createWriterOutput({
@@ -581,8 +661,13 @@ describe("PipelineRunner", () => {
       });
       expect(committedUsage.totalUsage).toMatchObject({ promptTokens: 14, completionTokens: 21, totalTokens: 35 });
       expect(stages[0]).toMatchObject({ stage: "PREPARING", transactionId: expect.stringMatching(/^chapter-txn-/u) });
-      expect(stages.filter((event) => event.stage === "PREPARING").map((event) => event.role)).toEqual(expect.arrayContaining(["writer", "planner"]));
-      expect(stages.filter((event) => event.stage === "PREPARING").map((event) => event.role)).toEqual(expect.arrayContaining(["story-frame-selector", "volume-map-selector"]));
+      const preparingModelCallRoles = stages
+        .filter((event) => event.stage === "PREPARING" && event.role !== "writer")
+        .map((event) => event.role);
+      expect(preparingModelCallRoles).toEqual(["planner"]);
+      expect(vi.mocked(PlannerAgent.prototype.planChapter)).toHaveBeenCalledTimes(1);
+      expect(outlineSelector).not.toHaveBeenCalled();
+      expect(memorySelector).not.toHaveBeenCalled();
       expect(stages.filter((event) => event.stage === "SETTLING_STATE").map((event) => event.role)).toEqual(expect.arrayContaining([
         "final-state-extractor",
         "state-validator",
@@ -602,6 +687,48 @@ describe("PipelineRunner", () => {
         bookDir, "story", "runtime", "chapter-transactions", "chapter-0001", "staging", "evidence", "review-result.json",
       ), "utf-8")).resolves.toContain('"status": "APPROVED"');
       expect(await state.getNextChapterNumber(bookId)).toBe(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
+
+  it("stops an invalid formal outline after Planner without admitting Writer or semantic selectors", async () => {
+    const stages: Array<{ readonly stage: string; readonly role: string }> = [];
+    const { root, runner, state, bookId } = await createRunnerFixture({
+      boundedAutonomousReview: true,
+      onAutonomousStage: (event) => { stages.push({ stage: event.stage, role: event.role }); },
+    });
+    try {
+      const { storyDir } = await seedTransactionPipeline(state, bookId);
+      const storyFramePath = join(storyDir, "outline", "story_frame.md");
+      await writeFile(
+        storyFramePath,
+        (await readFile(storyFramePath, "utf-8")).replace(
+          "## World anchor\nThe gate is watched and witnessed rules cannot be erased.\n",
+          "",
+        ),
+        "utf-8",
+      );
+
+      vi.mocked(PlannerAgent.prototype.planChapter).mockRestore();
+      const plannerTransport = vi.spyOn(llmProvider, "chatCompletion").mockResolvedValue({
+        content: VALID_PLANNER_MEMO,
+        usage: ZERO_USAGE,
+      } as Awaited<ReturnType<typeof llmProvider.chatCompletion>>);
+      const writer = vi.spyOn(WriterAgent.prototype, "writeChapter");
+      const outlineSelector = vi.spyOn(ComposerModule.ComposerAgent.prototype, "selectOutlineSections");
+      const memorySelector = vi.spyOn(ComposerModule.ComposerAgent.prototype, "selectMemoryCandidates");
+
+      await expect(runner.writeNextChapter(bookId, 2200)).rejects.toThrow("FORMAL_STORY_FRAME_STRUCTURE_INVALID");
+
+      expect(plannerTransport).toHaveBeenCalledTimes(1);
+      expect(stages.filter((event) => event.stage === "PREPARING").map((event) => event.role)).toEqual(["planner"]);
+      expect(writer).not.toHaveBeenCalled();
+      expect(outlineSelector).not.toHaveBeenCalled();
+      expect(memorySelector).not.toHaveBeenCalled();
+      expect(stages.some((event) => event.role === "story-frame-selector"
+        || event.role === "volume-map-selector"
+        || event.role === "memory-selector")).toBe(false);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1811,7 +1938,7 @@ describe("PipelineRunner", () => {
       const result = await runner.writeNextChapter(bookId, body.length);
 
       expect(result.autonomousReview?.status).toBe("APPROVED");
-      expect(stages[0]).toEqual({ stage: "PREPARING", role: "writer" });
+      expect(stages[0]).toEqual({ stage: "WRITING", role: "writer" });
       expect(stages.filter((event) => event.stage === "APPROVED")).toHaveLength(1);
     } finally {
       await rm(root, { recursive: true, force: true });
