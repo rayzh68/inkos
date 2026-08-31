@@ -2,6 +2,14 @@ import { BaseAgent } from "./base.js";
 import { createHash } from "node:crypto";
 import type { CandidateFactAssertion, CandidateFactEvidence, TokenUsage } from "./writer.js";
 import { parseCurrentStateFacts, parsePendingHooksMarkdown } from "../utils/story-markdown.js";
+import {
+  bindCandidateFactEvidence as bindSemanticCandidateFactEvidence,
+  renderSemanticAuthorityEnvelope,
+  type SemanticAuthorityEnvelope,
+  type SemanticAuthorityEnvelopeIdentity,
+  type SemanticAuthorityRecord,
+  type SemanticCandidateFactEvidence,
+} from "./semantic-authority.js";
 
 export interface ValidationWarning {
   readonly category: string;
@@ -38,12 +46,28 @@ export interface ValidationFinding {
     readonly predicate: string;
     readonly value: string;
     readonly quote: string;
+    readonly assertionId?: string;
+    readonly kind?: "CANDIDATE_ASSERTION" | "EXPLICIT_TRANSITION";
+    readonly candidateSha256?: string;
+    readonly recordId?: string;
+    readonly factKey?: string;
+    readonly startUtf16?: number;
+    readonly endUtf16?: number;
+    readonly fromValue?: string;
   };
   readonly committed?: {
     readonly recordId: string;
     readonly value: string;
     readonly quote: string;
+    readonly factKey?: string;
+    readonly fieldPath?: string;
+    readonly source?: "current_state.json" | "hooks.json";
+    readonly sourceRelativePath?: string;
+    readonly sourceSha256?: string;
+    readonly tier?: "COMMITTED_STRUCTURED_CURRENT_STATE" | "COMMITTED_STRUCTURED_HOOKS";
+    readonly priority?: number;
   };
+  readonly authorityEnvelopeIdentity?: SemanticAuthorityEnvelopeIdentity;
 }
 
 export interface ValidationResult {
@@ -106,6 +130,7 @@ export class StateValidatorAgent extends BaseAgent {
     },
     ledgerContext?: StateValidationLedgerContext,
     candidateFactEvidence?: CandidateFactEvidence,
+    authorityEnvelope?: SemanticAuthorityEnvelope,
   ): Promise<ValidationResult> {
     const stateDiff = this.computeDiff(oldState, newState, "State Card");
     const hooksDiff = this.computeDiff(oldHooks, newHooks, "Hooks Pool");
@@ -119,7 +144,9 @@ export class StateValidatorAgent extends BaseAgent {
       ? "Respond in English."
       : "用中文回答。";
 
-    const authorityCatalog = buildCommittedAuthorityCatalog(oldState, oldHooks, chapterNumber);
+    const authorityCatalog = authorityEnvelope
+      ? authorityEnvelope.records.map((record) => semanticRecordAsLegacy(record))
+      : buildCommittedAuthorityCatalog(oldState, oldHooks, chapterNumber);
     const systemPrompt = `You are a continuity validator for a novel writing system. ${langInstruction}
 
 Given the chapter text, committed current truth, and the CHANGES made to truth files (state card + hooks pool + particle ledger), check for contradictions:
@@ -164,7 +191,9 @@ A legitimate authority change explicitly narrated in the current prose is not a 
       "### Current Particle Ledger",
       ledgerContext?.oldLedger || "(empty)",
     ].join("\n");
-    const authorityCatalogBlock = renderCommittedAuthorityCatalog(authorityCatalog);
+    const authorityCatalogBlock = authorityEnvelope
+      ? renderSemanticAuthorityEnvelope(authorityEnvelope)
+      : renderCommittedAuthorityCatalog(authorityCatalog);
     const candidateFactEvidenceBlock = renderCandidateFactEvidence(candidateFactEvidence);
 
     const userPrompt = `Chapter ${chapterNumber} validation:
@@ -200,7 +229,7 @@ ${chapterContent}`;
 
       try {
         return {
-          ...this.parseResult(response.content, { currentProse: chapterContent, authorityCatalog, candidateFactEvidence }),
+          ...this.parseResult(response.content, { currentProse: chapterContent, authorityCatalog, candidateFactEvidence, authorityEnvelope }),
           tokenUsage: response.usage,
         };
       } catch (semanticError) {
@@ -214,7 +243,7 @@ ${chapterContent}`;
           { temperature: 0.1 },
         );
         return {
-          ...this.parseResult(retryResponse.content, { currentProse: chapterContent, authorityCatalog, candidateFactEvidence }),
+          ...this.parseResult(retryResponse.content, { currentProse: chapterContent, authorityCatalog, candidateFactEvidence, authorityEnvelope }),
           tokenUsage: {
             promptTokens: response.usage.promptTokens + retryResponse.usage.promptTokens,
             completionTokens: response.usage.completionTokens + retryResponse.usage.completionTokens,
@@ -276,6 +305,7 @@ ${chapterContent}`;
       readonly currentProse: string;
       readonly authorityCatalog: ReadonlyArray<CommittedAuthorityRecord>;
       readonly candidateFactEvidence?: CandidateFactEvidence;
+      readonly authorityEnvelope?: SemanticAuthorityEnvelope;
     },
   ): ValidationResult {
     const trimmed = content.trim();
@@ -301,11 +331,7 @@ ${chapterContent}`;
       throw new Error("State validator returned invalid response");
     }
     if (lines.length !== 1) throw new Error("State validator returned invalid response");
-    const candidateEvidenceIssues = validateCandidateFactEvidence(
-      evidenceSurfaces.currentProse,
-      evidenceSurfaces.authorityCatalog,
-      evidenceSurfaces.candidateFactEvidence,
-    );
+    const candidateEvidenceIssues = validateEvidenceSurfaces(evidenceSurfaces);
     if (candidateEvidenceIssues.length > 0) {
       const findings = candidateEvidenceIssues.map((description, index) => ({
         kind: "AMBIGUOUS" as const,
@@ -329,6 +355,7 @@ ${chapterContent}`;
       readonly currentProse: string;
       readonly authorityCatalog: ReadonlyArray<CommittedAuthorityRecord>;
       readonly candidateFactEvidence?: CandidateFactEvidence;
+      readonly authorityEnvelope?: SemanticAuthorityEnvelope;
     },
   ): ValidationResult | null {
     const direct = this.tryParseExactJsonResult(text, evidenceSurfaces);
@@ -349,6 +376,7 @@ ${chapterContent}`;
       readonly currentProse: string;
       readonly authorityCatalog: ReadonlyArray<CommittedAuthorityRecord>;
       readonly candidateFactEvidence?: CandidateFactEvidence;
+      readonly authorityEnvelope?: SemanticAuthorityEnvelope;
     },
   ): ValidationResult | null {
     try {
@@ -371,17 +399,14 @@ ${chapterContent}`;
           || (parsed.warnings !== undefined && !Array.isArray(parsed.warnings))) {
           return null;
         }
-        const candidateEvidenceIssues = validateCandidateFactEvidence(
-          evidenceSurfaces.currentProse,
-          evidenceSurfaces.authorityCatalog,
-          evidenceSurfaces.candidateFactEvidence,
-        );
+        const candidateEvidenceIssues = validateEvidenceSurfaces(evidenceSurfaces);
         const verifiedFindings = parsed.findings.map((finding, index) => verifyValidationFinding(
           finding,
           index,
           evidenceSurfaces.authorityCatalog,
           evidenceSurfaces.candidateFactEvidence,
           candidateEvidenceIssues.length === 0,
+          evidenceSurfaces.authorityEnvelope,
         ));
         const compatibilityWarnings = verifiedFindings.map((finding) => ({
           category: finding.kind,
@@ -683,6 +708,70 @@ function nonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
 }
 
+function semanticRecordAsLegacy(record: SemanticAuthorityRecord): CommittedAuthorityRecord {
+  return {
+    recordId: record.recordId,
+    factKey: record.factKey,
+    source: record.source === "current_state.json" ? "current_state" : "pending_hooks",
+    tier: record.source === "current_state.json"
+      ? "COMMITTED_RUNTIME_CURRENT_STATE"
+      : "COMMITTED_RUNTIME_PENDING_HOOKS",
+    priority: record.priority,
+    value: record.value,
+    sourceSurface: record.value,
+  };
+}
+
+function validateEvidenceSurfaces(evidenceSurfaces: {
+  readonly currentProse: string;
+  readonly authorityCatalog: ReadonlyArray<CommittedAuthorityRecord>;
+  readonly candidateFactEvidence?: CandidateFactEvidence;
+  readonly authorityEnvelope?: SemanticAuthorityEnvelope;
+}): ReadonlyArray<string> {
+  if (!evidenceSurfaces.authorityEnvelope) {
+    return validateCandidateFactEvidence(
+      evidenceSurfaces.currentProse,
+      evidenceSurfaces.authorityCatalog,
+      evidenceSurfaces.candidateFactEvidence,
+    );
+  }
+  const envelope = evidenceSurfaces.authorityEnvelope;
+  const evidence = evidenceSurfaces.candidateFactEvidence as SemanticCandidateFactEvidence | undefined;
+  if (envelope.status !== "VERIFIED") return ["Semantic authority envelope is unavailable."];
+  if (!evidence) return [];
+  const issues = [...evidence.issues];
+  const expectedSha = createHash("sha256").update(evidenceSurfaces.currentProse).digest("hex");
+  if (evidence.candidateSha256 !== expectedSha) issues.push("Candidate evidence SHA does not match final content.");
+  if (JSON.stringify(evidence.authorityEnvelopeIdentity) !== JSON.stringify(envelope.identity)) {
+    issues.push("Candidate evidence authority envelope identity mismatch.");
+  }
+  const seen = new Set<string>();
+  const seenRecordIds = new Set<string>();
+  const seenFactKeys = new Set<string>();
+  for (const assertion of evidence.assertions) {
+    const rebound = bindSemanticCandidateFactEvidence(evidenceSurfaces.currentProse, envelope, [{
+      kind: assertion.kind,
+      recordId: assertion.recordId,
+      value: assertion.value,
+      quote: assertion.quote,
+      startUtf16: assertion.startUtf16,
+      endUtf16: assertion.endUtf16,
+      ...(assertion.fromValue !== undefined ? { fromValue: assertion.fromValue } : {}),
+    }]).assertions[0];
+    if (!rebound || JSON.stringify(rebound) !== JSON.stringify(assertion)) {
+      issues.push(`Candidate assertion ${assertion.assertionId} failed host verification.`);
+    }
+    if (seen.has(assertion.assertionId)) issues.push(`Duplicate candidate assertion id ${assertion.assertionId}.`);
+    if (seenRecordIds.has(assertion.recordId) || seenFactKeys.has(assertion.factKey)) {
+      issues.push(`Candidate evidence contains duplicate or conflicting assertions for ${assertion.recordId}.`);
+    }
+    seen.add(assertion.assertionId);
+    seenRecordIds.add(assertion.recordId);
+    seenFactKeys.add(assertion.factKey);
+  }
+  return [...new Set(issues)];
+}
+
 function ambiguousFinding(raw: unknown, index: number): ValidationFinding {
   const candidate = raw && typeof raw === "object" ? raw as Record<string, unknown> : undefined;
   const findingId = nonEmptyString(candidate?.findingId) ?? `unprovable-finding-${index + 1}`;
@@ -696,6 +785,7 @@ function verifyValidationFinding(
   catalog: ReadonlyArray<CommittedAuthorityRecord>,
   candidateFactEvidence: CandidateFactEvidence | undefined,
   candidateEvidenceValid: boolean,
+  authorityEnvelope?: SemanticAuthorityEnvelope,
 ): ValidationFinding {
   if (!raw || typeof raw !== "object") return ambiguousFinding(raw, index);
   const value = raw as Record<string, unknown>;
@@ -722,6 +812,8 @@ function verifyValidationFinding(
   if (assertion.kind === "EXPLICIT_TRANSITION") {
     return { kind: "STATE_PROJECTION_DEFECT", findingId, description };
   }
+  const semanticRecord = authorityEnvelope?.records.find((item) => item.recordId === committedRecordId);
+  if (authorityEnvelope && !semanticRecord) return ambiguousFinding(raw, index);
   const factParts = record.factKey.split("::");
   const subject = factParts[0]?.replace(/^(state|hook):/u, "") ?? record.factKey;
   const predicate = factParts.slice(1).join("::") || record.factKey;
@@ -736,12 +828,15 @@ function verifyValidationFinding(
       predicate,
       value: assertion.value,
       quote: assertion.quote,
+      ...(authorityEnvelope ? assertion : {}),
     },
     committed: {
       recordId: record.recordId,
       value: record.value,
       quote: record.value,
+      ...(semanticRecord ?? {}),
     },
+    ...(authorityEnvelope ? { authorityEnvelopeIdentity: authorityEnvelope.identity } : {}),
   };
 }
 

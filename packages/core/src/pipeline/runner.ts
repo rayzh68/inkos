@@ -17,6 +17,13 @@ import { ComposerAgent, composeGovernedChapter, contextBudgetFromClient, type Co
 import { WriterAgent, type WriteChapterInput, type WriteChapterOutput } from "../agents/writer.js";
 import { ChapterAnalyzerAgent } from "../agents/chapter-analyzer.js";
 import { ContinuityAuditor } from "../agents/continuity.js";
+import {
+  buildSemanticAdjudicationBatch,
+  buildSemanticAuthorityEnvelope,
+  type CandidateFactAssertion as SemanticCandidateFactAssertion,
+  type SemanticAuthorityEnvelope,
+  type SemanticAuthorityRecord,
+} from "../agents/semantic-authority.js";
 import { CommercialReaderAgent } from "../agents/commercial-reader.js";
 import { ReviserAgent, DEFAULT_REVISE_MODE, type ReviseMode } from "../agents/reviser.js";
 import { StateValidatorAgent, type ValidationResult, type ValidationWarning } from "../agents/state-validator.js";
@@ -3031,6 +3038,12 @@ export class PipelineRunner {
       }
       if (!chapterTransaction || chapterTransaction.chapterNumber !== chapterNumber) throw new Error("CHAPTER_TRANSACTION_MUST_EXIST_BEFORE_PREPARING");
     }
+    const semanticAuthorityEnvelope = chapterTransaction
+      ? await this.buildTransactionSemanticAuthorityEnvelope(bookDir, chapterTransaction)
+      : undefined;
+    const settlementRetryBudget = chapterTransaction
+      ? { remaining: 1 as 0 | 1 }
+      : undefined;
     const stageLanguage = await this.resolveBookLanguage(book);
     this.logStage(stageLanguage, { zh: "准备章节输入", en: "preparing chapter inputs" });
     const writeInput = await this.prepareWriteInput(
@@ -3123,6 +3136,7 @@ export class PipelineRunner {
     let roleUsage: Record<string, RoleTokenUsage> | undefined;
     let boundedReviewCallbacks: Pick<Parameters<typeof runBoundedReviewCycle>[0], "reviewLogic" | "reviewCommercial" | "revise" | "onStage"> | undefined;
     let recordTransactionReviewResult: ((result: BoundedReviewResult) => Promise<string | undefined>) | undefined;
+    let semanticAuditor: ContinuityAuditor | undefined;
 
     if ((this.config.chapterReviewMode ?? "auto") === "manual") {
       // C4a: write-only checkpoint. Stop right after the draft — skip the
@@ -3146,6 +3160,7 @@ export class PipelineRunner {
       const logicIdentity = this.resolveOverride("auditor");
       const commercialIdentity = this.resolveOverride("commercial-reader");
       const auditor = new ContinuityAuditor(this.agentCtxFor("auditor", bookId));
+      semanticAuditor = auditor;
       const commercialReader = new CommercialReaderAgent(this.agentCtxFor("commercial-reader", bookId));
       boundedReviewCallbacks = {
         reviewLogic: async (content, candidateSha) => {
@@ -3394,6 +3409,7 @@ export class PipelineRunner {
       reducedControlInput,
       preservedReviewPlan !== undefined || chapterTransaction !== undefined,
       chapterTransaction?.transactionId,
+      semanticAuthorityEnvelope,
     );
     const finalTitleResolution = resolveDuplicateTitle(
       persistenceOutput.title,
@@ -3524,6 +3540,8 @@ export class PipelineRunner {
       logWarn: (message) => this.logWarn(pipelineLang, message),
       logger: this.config.logger,
       ...(chapterTransaction ? {
+        authorityEnvelope: semanticAuthorityEnvelope,
+        settlementRetryBudget,
         semanticRecovery: {
           allowSemanticRetry: true,
           onSemanticRetry: async () => {
@@ -3561,15 +3579,98 @@ export class PipelineRunner {
     });
     let convergenceExtractorUsage = truthValidation.stateUsage.extractor;
     let convergenceValidatorUsage = truthValidation.stateUsage.validator;
+    let semanticAdjudicationUsage: RoleTokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+    let semanticUsageRecorded = false;
+    const denySemanticContentRepair = (reason: string): void => {
+      const finding = {
+        kind: "AMBIGUOUS" as const,
+        findingId: "semantic-authority-adjudication-denied",
+        description: reason,
+      };
+      truthValidation = {
+        ...truthValidation,
+        validation: {
+          passed: false,
+          repairRequired: false,
+          disposition: "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED",
+          findings: [finding],
+          warnings: [{ category: finding.kind, description: finding.description }],
+          proseAuthorityEvidence: { status: "AMBIGUOUS", currentProse: [], committedAuthority: [] },
+        },
+        repairDisposition: "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED",
+      };
+    };
     while (truthValidation.repairDisposition === "CONTENT_REPAIR_REQUIRED") {
-      if (!chapterTransaction || !autonomousReviewResult || !boundedReviewCallbacks) {
+      if (!chapterTransaction || !autonomousReviewResult || !boundedReviewCallbacks || !semanticAuditor || !semanticAuthorityEnvelope) {
         throw new Error("CONTENT_REPAIR_REQUIRES_BOUNDED_TRANSACTION_AUTHORITY");
       }
       const contentFindings = (truthValidation.validation.findings ?? [])
         .filter((finding) => finding.kind === "PROSE_AUTHORITY_CONTRADICTION");
       if (contentFindings.length === 0
-        || contentFindings.some((finding) => !finding.candidate || !finding.committed)) {
-        throw new Error("CONTENT_REPAIR_REQUIRES_PROVEN_STRUCTURED_EVIDENCE");
+        || contentFindings.some((finding) => !finding.candidate || !finding.committed || !finding.authorityEnvelopeIdentity)) {
+        denySemanticContentRepair("Content repair nomination lacks complete transaction-bound structured evidence.");
+        break;
+      }
+      const semanticBatch = buildSemanticAdjudicationBatch({
+        candidateContent: finalContent,
+        envelope: semanticAuthorityEnvelope,
+        nominations: contentFindings.map((finding) => {
+          const candidate = finding.candidate!;
+          const committed = finding.committed!;
+          const assertion: SemanticCandidateFactAssertion = {
+            assertionId: candidate.assertionId!,
+            kind: candidate.kind!,
+            candidateSha256: candidate.candidateSha256!,
+            recordId: candidate.recordId!,
+            factKey: candidate.factKey!,
+            value: candidate.value,
+            quote: candidate.quote,
+            startUtf16: candidate.startUtf16!,
+            endUtf16: candidate.endUtf16!,
+            ...(candidate.fromValue !== undefined ? { fromValue: candidate.fromValue } : {}),
+          };
+          const committedRecord: SemanticAuthorityRecord = {
+            recordId: committed.recordId,
+            factKey: committed.factKey!,
+            fieldPath: committed.fieldPath!,
+            value: committed.value,
+            source: committed.source!,
+            sourceRelativePath: committed.sourceRelativePath!,
+            sourceSha256: committed.sourceSha256!,
+            tier: committed.tier!,
+            priority: committed.priority!,
+          };
+          return {
+            findingId: finding.findingId,
+            description: finding.description,
+            assertion,
+            committedRecord,
+            envelopeIdentity: finding.authorityEnvelopeIdentity!,
+          };
+        }),
+      });
+      if (semanticBatch.status !== "READY") {
+        denySemanticContentRepair(semanticBatch.issues.join(" ") || "Semantic authority adjudication batch is ambiguous.");
+        break;
+      }
+      const semanticIdentity = this.resolveOverride("auditor");
+      await this.config.onAutonomousStage?.({
+        stage: "SETTLING_STATE",
+        role: "logic-canon-auditor",
+        provider: semanticIdentity.client.service ?? semanticIdentity.client.provider,
+        model: semanticIdentity.model,
+        transactionId: chapterTransaction.transactionId,
+      });
+      const semanticAdjudication = await semanticAuditor.adjudicateSemanticAuthority(semanticBatch);
+      semanticAdjudicationUsage = PipelineRunner.addUsage(
+        semanticAdjudicationUsage,
+        semanticAdjudication.tokenUsage ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      );
+      if (semanticAdjudication.status !== "AUTHORIZED"
+        || semanticAdjudication.authorizedFindingIds.length !== contentFindings.length
+        || contentFindings.some((finding) => !semanticAdjudication.authorizedFindingIds.includes(finding.findingId))) {
+        denySemanticContentRepair(semanticAdjudication.issues.join(" ") || "Independent semantic authority adjudication denied prose repair.");
+        break;
       }
       const convergedReview = await runBoundedReviewCycle({
         initialContent: finalContent,
@@ -3587,6 +3688,11 @@ export class PipelineRunner {
       autonomousReviewResult = convergedReview;
       roleUsage = { ...(preservedReviewPlan?.historicalRoleUsage ?? {}) };
       if (!preservedReviewPlan) roleUsage.writer = output.tokenUsage ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+      roleUsage["logic-canon-auditor"] = PipelineRunner.addUsage(
+        roleUsage["logic-canon-auditor"] ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        semanticAdjudicationUsage,
+      );
+      semanticUsageRecorded = true;
       for (const [role, usage] of Object.entries(convergedReview.usageByRole)) {
         roleUsage[role] = PipelineRunner.addUsage(roleUsage[role] ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 }, usage);
       }
@@ -3666,6 +3772,7 @@ export class PipelineRunner {
         reducedControlInput,
         true,
         chapterTransaction.transactionId,
+        semanticAuthorityEnvelope,
       );
       const validatorIdentity = this.resolveOverride("state-validator");
       await this.config.onAutonomousStage?.({
@@ -3719,6 +3826,8 @@ export class PipelineRunner {
             });
           },
         },
+        authorityEnvelope: semanticAuthorityEnvelope,
+        settlementRetryBudget,
       });
       convergenceExtractorUsage = PipelineRunner.addUsage(convergenceExtractorUsage, nextTruthValidation.stateUsage.extractor);
       convergenceValidatorUsage = PipelineRunner.addUsage(convergenceValidatorUsage, nextTruthValidation.stateUsage.validator);
@@ -3735,6 +3844,12 @@ export class PipelineRunner {
     auditResult = truthValidation.auditResult;
     if (chapterTransaction) {
       roleUsage ??= {};
+      if (!semanticUsageRecorded) {
+        roleUsage["logic-canon-auditor"] = PipelineRunner.addUsage(
+          roleUsage["logic-canon-auditor"] ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+          semanticAdjudicationUsage,
+        );
+      }
       roleUsage["final-state-extractor"] = PipelineRunner.addUsage(
         roleUsage["final-state-extractor"] ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
         truthValidation.stateUsage.extractor,
@@ -4883,6 +4998,61 @@ ${matrix}`,
     };
   }
 
+  private async buildTransactionSemanticAuthorityEnvelope(
+    bookDir: string,
+    transaction: ChapterTransactionHandle,
+  ): Promise<SemanticAuthorityEnvelope> {
+    const chain = await verifyChapterCommitChain({ bookDir });
+    const latestCommit = chain.commits.at(-1);
+    const authorityKind = latestCommit ? "CHAPTER_COMMIT" as const : "GENESIS" as const;
+    const authorityChapterNumber = latestCommit?.chapterNumber ?? chain.genesis.lastTrustedChapter;
+    const authoritySha256 = latestCommit?.commitSha256 ?? chain.genesis.genesisSha256;
+    const authorityRoot = latestCommit
+      ? join(bookDir, "story", "commits", `chapter-${String(latestCommit.chapterNumber).padStart(4, "0")}`, "state")
+      : join(bookDir, "story", "snapshots", String(chain.genesis.lastTrustedChapter));
+    const currentStateRelativePath = latestCommit ? "current_state.json" : "state/current_state.json";
+    const hooksRelativePath = latestCommit ? "hooks.json" : "state/hooks.json";
+    const currentStateEntry = (latestCommit?.stateFiles ?? chain.genesis.trustedSnapshotFiles)
+      .find((entry) => entry.relativePath === currentStateRelativePath);
+    const hooksEntry = (latestCommit?.stateFiles ?? chain.genesis.trustedSnapshotFiles)
+      .find((entry) => entry.relativePath === hooksRelativePath);
+    const currentState = await readFile(join(authorityRoot, currentStateRelativePath), "utf-8").catch(() => "");
+    const hooks = await readFile(join(authorityRoot, hooksRelativePath), "utf-8").catch(() => "");
+    return buildSemanticAuthorityEnvelope({
+      transaction: {
+        transactionId: transaction.transactionId,
+        bookId: transaction.bookId,
+        chapterNumber: transaction.chapterNumber,
+        previousAuthoritySha256: transaction.previousAuthoritySha256,
+      },
+      authority: {
+        kind: authorityKind,
+        chapterNumber: authorityChapterNumber,
+        authoritySha256,
+        currentState: {
+          relativePath: toPosixPath(join(
+            "story",
+            latestCommit ? join("commits", `chapter-${String(latestCommit.chapterNumber).padStart(4, "0")}`, "state") : join("snapshots", String(chain.genesis.lastTrustedChapter)),
+            currentStateRelativePath,
+          )),
+          content: currentState,
+          sha256: currentStateEntry?.sha256 ?? "",
+          authorityMember: currentStateEntry !== undefined,
+        },
+        hooks: {
+          relativePath: toPosixPath(join(
+            "story",
+            latestCommit ? join("commits", `chapter-${String(latestCommit.chapterNumber).padStart(4, "0")}`, "state") : join("snapshots", String(chain.genesis.lastTrustedChapter)),
+            hooksRelativePath,
+          )),
+          content: hooks,
+          sha256: hooksEntry?.sha256 ?? "",
+          authorityMember: hooksEntry !== undefined,
+        },
+      },
+    });
+  }
+
   private async buildPersistenceOutput(
     bookId: string,
     book: BookConfig,
@@ -4898,6 +5068,7 @@ ${matrix}`,
     },
     forceAnalyze = false,
     transactionId?: string,
+    authorityEnvelope?: SemanticAuthorityEnvelope,
   ): Promise<WriteChapterOutput> {
     if (!forceAnalyze && finalContent === output.content) {
       return output;
@@ -4913,6 +5084,7 @@ ${matrix}`,
       chapterIntent: reducedControlInput?.chapterIntent,
       contextPackage: reducedControlInput?.contextPackage,
       ruleStack: reducedControlInput?.ruleStack,
+      authorityEnvelope,
       ...(transactionId ? {
         semanticRecovery: {
           allowSemanticRetry: true,

@@ -3,6 +3,12 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ContinuityAuditor } from "../agents/continuity.js";
+import {
+  bindCandidateFactEvidence,
+  buildSemanticAdjudicationBatch,
+  buildSemanticAuthorityEnvelope,
+} from "../agents/semantic-authority.js";
+import { createHash } from "node:crypto";
 
 const ZERO_USAGE = {
   promptTokens: 0,
@@ -492,5 +498,144 @@ describe("ContinuityAuditor", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  it("uses the existing auditor for one canonically bound focused semantic-adjudication batch", async () => {
+    const currentState = JSON.stringify({
+      chapter: 5,
+      facts: [{
+        subject: "character", predicate: "location", object: "Gate",
+        validFromChapter: 5, validUntilChapter: null, sourceChapter: 5,
+      }],
+    });
+    const hooks = JSON.stringify({ hooks: [] });
+    const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+    const envelope = buildSemanticAuthorityEnvelope({
+      transaction: {
+        transactionId: "chapter-txn-focused", bookId: "book-focused", chapterNumber: 6,
+        previousAuthoritySha256: "a".repeat(64),
+      },
+      authority: {
+        kind: "CHAPTER_COMMIT", chapterNumber: 5, authoritySha256: "a".repeat(64),
+        currentState: { relativePath: "current_state.json", content: currentState, sha256: digest(currentState), authorityMember: true },
+        hooks: { relativePath: "hooks.json", content: hooks, sha256: digest(hooks), authorityMember: true },
+      },
+    });
+    const content = "The character remained at Harbor.";
+    const record = envelope.records[0]!;
+    const evidence = bindCandidateFactEvidence(content, envelope, [{
+      kind: "CANDIDATE_ASSERTION", recordId: record.recordId, value: "Harbor", quote: content,
+      startUtf16: 0, endUtf16: content.length,
+    }]);
+    const batch = buildSemanticAdjudicationBatch({
+      candidateContent: content,
+      envelope,
+      nominations: [{
+        findingId: "location-conflict", description: "silent location conflict",
+        assertion: evidence.assertions[0]!, committedRecord: record, envelopeIdentity: envelope.identity,
+      }],
+    });
+    const agent = new ContinuityAuditor({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model",
+      projectRoot: process.cwd(),
+    });
+    const chat = vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({
+        content: JSON.stringify({
+          batchHash: batch.batchHash,
+          items: batch.items.map((item) => ({
+            ...item,
+            candidateAssertsClaimedValue: true,
+            semanticConflict: true,
+            explicitTransition: false,
+            uncertain: false,
+          })),
+        }),
+        usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 },
+      });
+
+    await expect(agent.adjudicateSemanticAuthority(batch)).resolves.toMatchObject({
+      status: "AUTHORIZED",
+      authorizedFindingIds: ["location-conflict"],
+      tokenUsage: { totalTokens: 5 },
+    });
+    const messages = chat.mock.calls[0]?.[0] as ReadonlyArray<{ content: string }>;
+    const prompt = messages.map((message) => message.content).join("\n");
+    expect(prompt).toContain(batch.batchHash);
+    expect(prompt).toContain(envelope.identity.transactionId);
+    expect(prompt).toContain(record.sourceSha256);
+    expect(prompt).toContain("route authorization only");
+  });
+
+  it("includes the exact SHA-bound full candidate once for context-sensitive semantic adjudication", async () => {
+    const currentState = JSON.stringify({
+      chapter: 5,
+      facts: [{
+        subject: "character", predicate: "location", object: "Gate",
+        validFromChapter: 5, validUntilChapter: null, sourceChapter: 5,
+      }],
+    });
+    const hooks = JSON.stringify({ hooks: [] });
+    const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+    const envelope = buildSemanticAuthorityEnvelope({
+      transaction: {
+        transactionId: "chapter-txn-context", bookId: "book-context", chapterNumber: 6,
+        previousAuthoritySha256: "a".repeat(64),
+      },
+      authority: {
+        kind: "CHAPTER_COMMIT", chapterNumber: 5, authoritySha256: "a".repeat(64),
+        currentState: { relativePath: "current_state.json", content: currentState, sha256: digest(currentState), authorityMember: true },
+        hooks: { relativePath: "hooks.json", content: hooks, sha256: digest(hooks), authorityMember: true },
+      },
+    });
+    const content = "She left Gate and reached Harbor.";
+    const record = envelope.records[0]!;
+    const quote = "Harbor";
+    const evidence = bindCandidateFactEvidence(content, envelope, [{
+      kind: "CANDIDATE_ASSERTION", recordId: record.recordId, value: quote, quote,
+      startUtf16: content.indexOf(quote), endUtf16: content.indexOf(quote) + quote.length,
+    }]);
+    const batch = buildSemanticAdjudicationBatch({
+      candidateContent: content,
+      envelope,
+      nominations: [{
+        findingId: "location-context", description: "narrow value-only quote",
+        assertion: evidence.assertions[0]!, committedRecord: record, envelopeIdentity: envelope.identity,
+      }],
+    });
+    const agent = new ContinuityAuditor({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model",
+      projectRoot: process.cwd(),
+    });
+    const chat = vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({
+        content: JSON.stringify({
+          batchHash: batch.batchHash,
+          items: batch.items.map((item) => ({
+            ...item,
+            candidateAssertsClaimedValue: true,
+            semanticConflict: true,
+            explicitTransition: true,
+            uncertain: false,
+          })),
+        }),
+        usage: ZERO_USAGE,
+      });
+
+    await expect(agent.adjudicateSemanticAuthority(batch)).resolves.toMatchObject({
+      status: "AMBIGUOUS",
+      authorizedFindingIds: [],
+    });
+    const messages = chat.mock.calls[0]?.[0] as ReadonlyArray<{ content: string }>;
+    const prompt = messages.map((message) => message.content).join("\n");
+    expect(prompt.split(content)).toHaveLength(2);
   });
 });

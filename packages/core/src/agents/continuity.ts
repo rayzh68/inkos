@@ -14,6 +14,11 @@ import {
   readCurrentStateWithFallback,
 } from "../utils/outline-paths.js";
 import { join } from "node:path";
+import {
+  parseSemanticAdjudicationResponse,
+  type SemanticAdjudicationBatch,
+  type SemanticAdjudicationResult,
+} from "./semantic-authority.js";
 
 export interface AuditResult {
   readonly passed: boolean;
@@ -385,6 +390,44 @@ function buildDimensionList(
 export class ContinuityAuditor extends BaseAgent {
   get name(): string {
     return "continuity-auditor";
+  }
+
+  async adjudicateSemanticAuthority(
+    batch: SemanticAdjudicationBatch,
+  ): Promise<SemanticAdjudicationResult & { readonly tokenUsage?: AuditResult["tokenUsage"] }> {
+    if (batch.status !== "READY") {
+      return {
+        status: "AMBIGUOUS",
+        authorizedFindingIds: [],
+        issues: ["Semantic adjudication batch was not ready."],
+      };
+    }
+    const response = await this.chat([
+      {
+        role: "system",
+        content: [
+          "You are performing one focused semantic-authority adjudication.",
+          "This is route authorization only. It is not final literary review evidence and must not score the candidate.",
+          "Return exactly one JSON object with batchHash and items. Preserve every supplied binding field byte-for-byte.",
+          "For each item add exactly four booleans: candidateAssertsClaimedValue, semanticConflict, explicitTransition, uncertain.",
+          "Inspect each quote and UTF-16 span inside candidateContent, the exact full candidate prose bound to the batch hash.",
+          "Authorize only an unambiguous semantic conflict with no explicit transition. Never infer missing facts.",
+        ].join("\n"),
+      },
+      {
+        role: "user",
+        content: JSON.stringify({
+          batchHash: batch.batchHash,
+          envelopeIdentity: batch.envelopeIdentity,
+          candidateContent: batch.candidateContent,
+          items: batch.items,
+        }, null, 2),
+      },
+    ], { temperature: 0, maxTokens: 4096 });
+    return {
+      ...parseSemanticAdjudicationResponse(response.content, batch),
+      tokenUsage: response.usage,
+    };
   }
 
   async auditChapter(

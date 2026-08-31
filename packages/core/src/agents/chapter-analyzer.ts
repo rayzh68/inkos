@@ -22,10 +22,15 @@ import {
   readCurrentStateWithFallback,
 } from "../utils/outline-paths.js";
 import {
-  bindCandidateFactEvidence,
+  bindCandidateFactEvidence as bindLegacyCandidateFactEvidence,
   buildCommittedAuthorityCatalog,
   renderCommittedAuthorityCatalog,
 } from "./state-validator.js";
+import {
+  bindCandidateFactEvidence as bindSemanticCandidateFactEvidence,
+  renderSemanticAuthorityEnvelope,
+  type SemanticAuthorityEnvelope,
+} from "./semantic-authority.js";
 
 export interface AnalyzeChapterInput {
   readonly book: BookConfig;
@@ -36,6 +41,7 @@ export interface AnalyzeChapterInput {
   readonly chapterIntent?: string;
   readonly contextPackage?: ContextPackage;
   readonly ruleStack?: RuleStack;
+  readonly authorityEnvelope?: SemanticAuthorityEnvelope;
   readonly semanticRecovery?: {
     readonly allowSemanticRetry?: boolean;
     readonly onSemanticRetry?: () => Promise<void> | void;
@@ -120,7 +126,9 @@ export class ChapterAnalyzerAgent extends BaseAgent {
       ? this.buildReducedControlBlock(input.chapterIntent, input.contextPackage, input.ruleStack, resolvedLanguage)
       : "";
 
-    const authorityCatalog = buildCommittedAuthorityCatalog(currentState, hooksWorkingSet, chapterNumber);
+    const authorityCatalog = input.authorityEnvelope
+      ? []
+      : buildCommittedAuthorityCatalog(currentState, hooksWorkingSet, chapterNumber);
     const systemPrompt = `${this.buildSystemPrompt(
       book,
       genreProfile,
@@ -191,7 +199,9 @@ After all normal output sections, emit exactly one optional section named === CA
         : "",
     })}
 
-${renderCommittedAuthorityCatalog(authorityCatalog)}`;
+${input.authorityEnvelope
+    ? renderSemanticAuthorityEnvelope(input.authorityEnvelope)
+    : renderCommittedAuthorityCatalog(authorityCatalog)}`;
 
     const messages = [
       { role: "system" as const, content: systemPrompt },
@@ -240,11 +250,10 @@ ${renderCommittedAuthorityCatalog(authorityCatalog)}`;
     }
     const canonicalContent = chapterContent;
     const canonicalWordCount = countChapterLength(canonicalContent, countingMode);
-    const candidateFactEvidence = bindCandidateFactEvidence(
-      canonicalContent,
-      authorityCatalog,
-      extractCandidateFactEvidenceSection(semanticContent),
-    );
+    const rawCandidateFactEvidence = extractCandidateFactEvidenceSection(semanticContent);
+    const candidateFactEvidence = input.authorityEnvelope
+      ? bindSemanticCandidateFactEvidence(canonicalContent, input.authorityEnvelope, rawCandidateFactEvidence)
+      : bindLegacyCandidateFactEvidence(canonicalContent, authorityCatalog, rawCandidateFactEvidence);
 
     // If LLM didn't return a title, use the one from input or derive from chapter number
     if (

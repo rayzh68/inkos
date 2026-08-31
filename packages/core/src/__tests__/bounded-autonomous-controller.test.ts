@@ -1073,6 +1073,47 @@ describe("bounded autonomous production controller", () => {
     expect(result.nextChapter).toBe(2);
   });
 
+  it("charges focused SETTLING_STATE logic-canon adjudication to the existing budget and replays COMPLETE with zero transport", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-focused-adjudication-budget-"));
+    try {
+      const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
+      await mkdir(runtimeDir, { recursive: true });
+      await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
+        jobId: "job", status: "RUNNING", mode: "current-volume", nextChapter: 6,
+      }));
+      const stage = {
+        stage: "SETTLING_STATE", role: "logic-canon-auditor", provider: "test", model: "model",
+        transactionId: "chapter-txn-focused",
+      };
+      let transports = 0;
+      const request = { provider: "test", model: "model", inputFingerprint: "a".repeat(64) };
+      const execution = createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId: "job", getActiveStage: () => stage });
+      await execution.runProviderCall(6, async () => {
+        transports += 1;
+        return { content: "focused agreement", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, request);
+
+      const restarted = createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId: "job", getActiveStage: () => stage });
+      const replay = await restarted.runProviderCall(6, async () => {
+        transports += 1;
+        throw new Error("focused COMPLETE replay must not transport");
+      }, request);
+
+      expect(replay.content).toBe("focused agreement");
+      expect(transports).toBe(1);
+      const runtime = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
+      expect(runtime.providerAttemptHistory).toEqual([
+        expect.objectContaining({
+          role: "logic-canon-auditor",
+          transactionId: "chapter-txn-focused",
+          classification: "SUCCESS",
+        }),
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("continues full-book production after a repairable arbitrary future chapter commits", async () => {
     let next = 4;
     const calls: number[] = [];

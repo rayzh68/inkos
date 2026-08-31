@@ -162,11 +162,17 @@ describe("chapter transaction convergence", () => {
 
   const body = Array.from({ length: 2200 }, (_, index) => `w${index}`).join(" ");
   const lengthSpec = { target: 2200, softMin: 1980, softMax: 2420, hardMin: 1760, hardMax: 2640, countingMode: "en_words" as const };
+  const defaultProviderOperations = [
+    { role: "writer", stage: "WRITING", provider: "test-provider", model: "test-model" },
+    { role: "auditor", stage: "LOGIC_REVIEW", provider: "test-provider", model: "logic-model" },
+    { role: "commercial-reader", stage: "READER_REVIEW", provider: "test-provider", model: "commercial-model" },
+  ];
 
   async function stagePassing(
     bookDir: string,
     chapterNumber = 5,
     transform?: (input: Parameters<typeof stageChapterCommitCandidate>[0]) => Parameters<typeof stageChapterCommitCandidate>[0],
+    providerOperations = defaultProviderOperations,
   ) {
     const transaction = await beginChapterTransaction({
       bookDir, bookId: "book-a", chapterNumber, productionAuthority: "blueprint:v1",
@@ -174,11 +180,7 @@ describe("chapter transaction convergence", () => {
     const responseDir = join(bookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
     await mkdir(responseDir, { recursive: true });
     const providerReferences = [];
-    for (const operation of [
-      { role: "writer", stage: "WRITING", provider: "test-provider", model: "test-model" },
-      { role: "auditor", stage: "LOGIC_REVIEW", provider: "test-provider", model: "logic-model" },
-      { role: "commercial-reader", stage: "READER_REVIEW", provider: "test-provider", model: "commercial-model" },
-    ]) {
+    for (const operation of providerOperations) {
       const logicalOperationId = `provider-step-${transaction.hash(`${transaction.transactionId}:${operation.role}:${operation.stage}`)}`;
       const artifactRelativePath = `story/runtime/bounded-autonomous/provider-responses/${logicalOperationId}.json`;
       const responseContent = `${operation.role} model output for chapter ${chapterNumber}`;
@@ -349,6 +351,24 @@ describe("chapter transaction convergence", () => {
     const { bookDir } = await fixture();
     await expect(stagePassing(bookDir, 5, (input) => ({ ...input, providerReferences: [] })))
       .rejects.toThrow(/Provider operation authority/i);
+  });
+
+  it("does not let focused SETTLING_STATE adjudication satisfy final logic review authority", async () => {
+    const { bookDir } = await fixture();
+    await expect(stagePassing(bookDir, 5, undefined, [
+      defaultProviderOperations[0]!,
+      { role: "logic-canon-auditor", stage: "SETTLING_STATE", provider: "test-provider", model: "logic-model" },
+      defaultProviderOperations[2]!,
+    ])).rejects.toThrow(/logic-canon-auditor Provider authority is missing/i);
+  });
+
+  it("requires READER_REVIEW stage for final reader Provider authority", async () => {
+    const { bookDir } = await fixture();
+    await expect(stagePassing(bookDir, 5, undefined, [
+      defaultProviderOperations[0]!,
+      defaultProviderOperations[1]!,
+      { role: "commercial-reader", stage: "SETTLING_STATE", provider: "test-provider", model: "commercial-model" },
+    ])).rejects.toThrow(/commercial-reader Provider authority is missing/i);
   });
 
   it("fails semantic verification when a referenced Provider artifact is tampered", async () => {
