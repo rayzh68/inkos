@@ -1,16 +1,18 @@
 import type { AuditIssue } from "../agents/continuity.js";
 import type {
+  StateValidationAuthorityContext,
   ValidationResult,
   ValidationWarning,
 } from "../agents/state-validator.js";
 import type { StateValidatorAgent } from "../agents/state-validator.js";
-import type { WriteChapterOutput } from "../agents/writer.js";
+import type { CandidateFactEvidence, WriteChapterOutput } from "../agents/writer.js";
 import type { WriterAgent } from "../agents/writer.js";
 import type { Logger } from "../utils/logger.js";
 import type { BookConfig } from "../models/book.js";
 import type { ChapterMeta } from "../models/chapter.js";
 import type { ContextPackage, RuleStack } from "../models/input-governance.js";
 import type { LengthLanguage } from "../utils/length-metrics.js";
+import type { SemanticAuthorityEnvelope } from "../agents/semantic-authority.js";
 
 export interface SettlementRetryParams {
   readonly writer: Pick<WriterAgent, "settleChapterState">;
@@ -29,7 +31,11 @@ export interface SettlementRetryParams {
   };
   readonly oldState: string;
   readonly oldHooks: string;
+  readonly oldLedger: string;
   readonly originalValidation: ValidationResult;
+  readonly authorityContext?: StateValidationAuthorityContext;
+  readonly candidateFactEvidence?: CandidateFactEvidence;
+  readonly authorityEnvelope?: SemanticAuthorityEnvelope;
   readonly language: LengthLanguage;
   readonly logWarn?: (message: { zh: string; en: string }) => void;
   readonly logger?: Pick<Logger, "warn">;
@@ -40,6 +46,11 @@ export interface SettlementRetryParams {
 export type SettlementRetryResult =
   | {
     readonly kind: "recovered";
+    readonly output: WriteChapterOutput;
+    readonly validation: ValidationResult;
+  }
+  | {
+    readonly kind: "content-repair-required";
     readonly output: WriteChapterOutput;
     readonly validation: ValidationResult;
   }
@@ -78,7 +89,7 @@ export async function retrySettlementAfterValidationFailure(
   let retryValidation: ValidationResult;
   try {
     await params.onValidatorRetry?.();
-    retryValidation = await params.validator.validate(
+    const validationArgs = [
       params.content,
       params.chapterNumber,
       params.oldState,
@@ -86,8 +97,16 @@ export async function retrySettlementAfterValidationFailure(
       params.oldHooks,
       retryOutput.updatedHooks,
       params.language,
-    );
+      params.authorityContext,
+      undefined,
+      { oldLedger: params.oldLedger, newLedger: retryOutput.updatedLedger },
+      params.candidateFactEvidence,
+    ] as const;
+    retryValidation = params.authorityEnvelope
+      ? await params.validator.validate(...validationArgs, params.authorityEnvelope)
+      : await params.validator.validate(...validationArgs);
   } catch (error) {
+    if (error instanceof Error && error.message === "AUTONOMOUS_STAGE_ADMISSION_STOPPED") throw error;
     throw new Error(`State validation retry failed for chapter ${params.chapterNumber}: ${String(error)}`);
   }
 
@@ -101,9 +120,17 @@ export async function retrySettlementAfterValidationFailure(
     }
   }
 
-  if (retryValidation.passed && !retryValidation.repairRequired) {
+  if (retryValidation.disposition === "PASS") {
     return {
       kind: "recovered",
+      output: retryOutput,
+      validation: retryValidation,
+    };
+  }
+
+  if (retryValidation.disposition === "CONTENT_REPAIR_REQUIRED") {
+    return {
+      kind: "content-repair-required",
       output: retryOutput,
       validation: retryValidation,
     };

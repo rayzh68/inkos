@@ -240,7 +240,18 @@ export async function runBoundedReviewCycle(params: {
     stage: "LOGIC_REVIEW" | "READER_REVIEW" | "REVISING_1" | "RESCUE_REVISING_2",
     detail?: { readonly semanticRetry: 1 },
   ) => Promise<void> | void;
+  /** Existing same-transaction lineage when truth validation discovers a prose defect after review. */
+  readonly priorResult?: BoundedReviewResult;
+  /** A structured, proven prose-authority finding that must consume only the next unused revision slot. */
+  readonly requiredContentRepairFinding?: ReviewFinding;
 }): Promise<BoundedReviewResult> {
+  if (params.priorResult && params.requiredContentRepairFinding) {
+    return continueBoundedReviewAfterTruthFinding({
+      ...params,
+      priorResult: params.priorResult,
+      requiredContentRepairFinding: params.requiredContentRepairFinding,
+    });
+  }
   const usageByRole: Record<string, RoleTokenUsage> = {};
   const candidates: BoundedCandidate[] = [];
   let content = params.initialContent;
@@ -369,6 +380,134 @@ export async function runBoundedReviewCycle(params: {
     status: finalBlocking ? "HELD_AFTER_TWO_REVISIONS" : "BLOCKED_CRITICAL_FINDINGS",
     grade: currentGrade === "E" ? "E" : "D",
     finalContent: current.content,
+    revisionCount: 2,
+    candidates,
+    bestCandidate: current,
+    holdReason: finalBlocking ? "REVISION_LIMIT_REACHED" : "LENGTH_BUDGET_VIOLATION",
+    usageByRole,
+  };
+}
+
+async function continueBoundedReviewAfterTruthFinding(params: {
+  readonly initialContent: string;
+  readonly lengthSpec: LengthSpec;
+  readonly priorResult: BoundedReviewResult;
+  readonly requiredContentRepairFinding: ReviewFinding;
+  readonly reviewLogic: Reviewer;
+  readonly reviewCommercial: Reviewer;
+  readonly revise: (
+    content: string,
+    findings: ReadonlyArray<ReviewFinding>,
+    round: 1 | 2,
+  ) => Promise<{ readonly content: string; readonly tokenUsage?: RoleTokenUsage }>;
+  readonly onStage?: (
+    stage: "LOGIC_REVIEW" | "READER_REVIEW" | "REVISING_1" | "RESCUE_REVISING_2",
+    detail?: { readonly semanticRetry: 1 },
+  ) => Promise<void> | void;
+}): Promise<BoundedReviewResult> {
+  const usageByRole: Record<string, RoleTokenUsage> = { ...params.priorResult.usageByRole };
+  const candidates = [...params.priorResult.candidates];
+  let content = params.priorResult.finalContent;
+  let current = params.priorResult.bestCandidate;
+
+  if (params.priorResult.revisionCount >= 2) {
+    return {
+      status: "HELD_AFTER_TWO_REVISIONS",
+      grade: "D",
+      finalContent: content,
+      revisionCount: 2,
+      candidates,
+      bestCandidate: current,
+      holdReason: "REVISION_LIMIT_REACHED",
+      usageByRole,
+    };
+  }
+
+  const reviewCandidate = async (
+    stage: "LOGIC_REVIEW" | "READER_REVIEW",
+    reviewer: Reviewer,
+    candidateContent: string,
+    candidateSha: string,
+  ): Promise<ScoredReview> => {
+    await params.onStage?.(stage);
+    let result = bindReview(await reviewer(candidateContent, candidateSha), candidateSha);
+    usageByRole[result.reviewerRole] = usageAdd(usageByRole[result.reviewerRole], result.tokenUsage);
+    if (result.decision !== "INVALID_OUTPUT") return result;
+    await params.onStage?.(stage, { semanticRetry: 1 });
+    result = bindReview(await reviewer(candidateContent, candidateSha), candidateSha);
+    usageByRole[result.reviewerRole] = usageAdd(usageByRole[result.reviewerRole], result.tokenUsage);
+    return result;
+  };
+
+  let pendingFindings: ReadonlyArray<ReviewFinding> = [params.requiredContentRepairFinding];
+  const firstRound = (params.priorResult.revisionCount + 1) as 1 | 2;
+  for (let round = firstRound; round <= 2; round += 1) {
+    const boundedRound = round as 1 | 2;
+    await params.onStage?.(boundedRound === 1 ? "REVISING_1" : "RESCUE_REVISING_2");
+    const revised = await params.revise(content, pendingFindings, boundedRound);
+    usageByRole.reviser = usageAdd(usageByRole.reviser, revised.tokenUsage);
+    content = revised.content;
+    const candidateSha = sha256(content);
+    const logic = await reviewCandidate("LOGIC_REVIEW", params.reviewLogic, content, candidateSha);
+    const commercial = await reviewCandidate("READER_REVIEW", params.reviewCommercial, content, candidateSha);
+    const lengthCount = countChapterLength(content, params.lengthSpec.countingMode);
+    current = {
+      label: boundedRound === 1 ? "REVISION_1" : "REVISION_2",
+      content,
+      sha256: candidateSha,
+      reviews: [logic, commercial],
+      combinedScore: logic.totalScore + commercial.totalScore,
+      lengthCount,
+      lengthInHardRange: !isOutsideHardRange(lengthCount, params.lengthSpec),
+    };
+    candidates.push(current);
+    const currentGrade = grade(logic, commercial);
+    const invalidRole = logic.decision === "INVALID_OUTPUT"
+      ? "logic-canon-auditor"
+      : commercial.decision === "INVALID_OUTPUT" ? "commercial-reader" : undefined;
+    if (invalidRole) {
+      return {
+        status: "REVIEW_OUTPUT_INVALID", grade: "E", finalContent: content, revisionCount: boundedRound,
+        candidates, bestCandidate: current, holdReason: "INVALID_OUTPUT", invalidReviewerRole: invalidRole,
+        usageByRole,
+      };
+    }
+    if (logic.authorityBlocker || commercial.authorityBlocker) {
+      return {
+        status: "BLOCKED_CRITICAL_FINDINGS", grade: "D", finalContent: content, revisionCount: boundedRound,
+        candidates, bestCandidate: current, holdReason: "AUTHORITY_BLOCKER", usageByRole,
+      };
+    }
+    if (logic.decision === "HELD" || commercial.decision === "HELD") {
+      return {
+        status: "BLOCKED_CRITICAL_FINDINGS", grade: "D", finalContent: content, revisionCount: boundedRound,
+        candidates, bestCandidate: current, usageByRole,
+      };
+    }
+    if (isApprovedCandidate(current, currentGrade)) {
+      return {
+        status: "APPROVED", grade: currentGrade, finalContent: content, revisionCount: boundedRound,
+        candidates, bestCandidate: current, usageByRole,
+      };
+    }
+    pendingFindings = [
+      ...logic.findings,
+      ...commercial.findings,
+      ...(!current.lengthInHardRange ? [lengthBudgetFinding(current.lengthCount, params.lengthSpec)] : []),
+    ];
+  }
+
+  if (current.lengthInHardRange && hasCompleteBoundReviews(current) && !hasLiteraryBlocker(current)) {
+    return {
+      status: "ACCEPTED_WITH_FINDINGS", grade: "D", finalContent: content, revisionCount: 2,
+      candidates, bestCandidate: current, usageByRole,
+    };
+  }
+  const finalBlocking = hasLiteraryBlocker(current);
+  return {
+    status: finalBlocking ? "HELD_AFTER_TWO_REVISIONS" : "BLOCKED_CRITICAL_FINDINGS",
+    grade: "D",
+    finalContent: content,
     revisionCount: 2,
     candidates,
     bestCandidate: current,

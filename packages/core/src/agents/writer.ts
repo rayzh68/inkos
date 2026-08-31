@@ -98,6 +98,25 @@ export interface TokenUsage {
   readonly actualCostUsd?: number;
 }
 
+export interface CandidateFactAssertion {
+  readonly assertionId: string;
+  readonly kind: "CANDIDATE_ASSERTION" | "EXPLICIT_TRANSITION";
+  readonly candidateSha256: string;
+  readonly recordId: string;
+  readonly factKey: string;
+  readonly value: string;
+  readonly quote: string;
+  readonly startUtf16: number;
+  readonly endUtf16: number;
+  readonly fromValue?: string;
+}
+
+export interface CandidateFactEvidence {
+  readonly candidateSha256: string;
+  readonly assertions: ReadonlyArray<CandidateFactAssertion>;
+  readonly issues: ReadonlyArray<string>;
+}
+
 export interface WriteChapterOutput {
   readonly chapterNumber: number;
   readonly title: string;
@@ -123,6 +142,8 @@ export interface WriteChapterOutput {
     readonly description: string;
     readonly suggestion: string;
   }>;
+  /** Ephemeral host-bound evidence from the final ChapterAnalyzer response; never persisted as runtime truth schema. */
+  readonly candidateFactEvidence?: CandidateFactEvidence;
   readonly tokenUsage?: TokenUsage;
 }
 

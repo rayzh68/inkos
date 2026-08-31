@@ -3020,6 +3020,9 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         chapterReviewMode: "auto",
         boundedAutonomousReview: true,
         onAutonomousStage: async (event) => {
+          if (event.provider !== null && event.model !== null) {
+            autonomousJobs.assertStageAdmission(bookId);
+          }
           activeStage = event;
           if (durableClaimFailure) throw durableClaimFailure;
           if (durableClaim) await refreshAutonomousJobClaim(root, bookId, durableClaim);
@@ -3093,6 +3096,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         bookId,
         jobId,
         getActiveStage: () => activeStage,
+        assertModelCallAdmission: () => autonomousJobs.assertStageAdmission(bookId),
       });
       if (!recoveringProviderWait) {
         await saveAutonomousRuntime(root, bookId, {

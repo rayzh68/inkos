@@ -745,7 +745,9 @@ export async function stageChapterCommitCandidate(input: {
   for (const reference of input.providerReferences) await verifyProviderReference(input.bookDir, transaction.record, reference);
   for (const reviewer of input.review.reviewerEvidence) {
     const acceptedRoles = reviewer.reviewerRole === "logic-canon-auditor" ? ["logic-canon-auditor", "auditor"] : ["commercial-reader"];
+    const expectedStage = reviewer.reviewerRole === "logic-canon-auditor" ? "LOGIC_REVIEW" : "READER_REVIEW";
     if (!input.providerReferences.some((reference) => acceptedRoles.includes(reference.role)
+      && reference.stage === expectedStage
       && reference.provider === reviewer.provider && reference.requestedModel === reviewer.model)) {
       throw new Error(`Chapter commit ${reviewer.reviewerRole} Provider authority is missing`);
     }
@@ -871,7 +873,9 @@ async function verifyBundle(root: string, chapterNumber: number): Promise<Chapte
   }
   for (const reviewer of reviewEvidence.reviewerEvidence) {
     const acceptedRoles = reviewer.reviewerRole === "logic-canon-auditor" ? ["logic-canon-auditor", "auditor"] : ["commercial-reader"];
+    const expectedStage = reviewer.reviewerRole === "logic-canon-auditor" ? "LOGIC_REVIEW" : "READER_REVIEW";
     if (!references.some((reference) => acceptedRoles.includes(reference.role)
+      && reference.stage === expectedStage
       && reference.provider === reviewer.provider && reference.requestedModel === reviewer.model)) {
       throw new Error(`Chapter ${chapterNumber} reviewer Provider authority mismatch`);
     }

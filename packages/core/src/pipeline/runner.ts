@@ -17,6 +17,13 @@ import { ComposerAgent, composeGovernedChapter, contextBudgetFromClient, type Co
 import { WriterAgent, type WriteChapterInput, type WriteChapterOutput } from "../agents/writer.js";
 import { ChapterAnalyzerAgent } from "../agents/chapter-analyzer.js";
 import { ContinuityAuditor } from "../agents/continuity.js";
+import {
+  buildSemanticAdjudicationBatch,
+  buildSemanticAuthorityEnvelope,
+  type CandidateFactAssertion as SemanticCandidateFactAssertion,
+  type SemanticAuthorityEnvelope,
+  type SemanticAuthorityRecord,
+} from "../agents/semantic-authority.js";
 import { CommercialReaderAgent } from "../agents/commercial-reader.js";
 import { ReviserAgent, DEFAULT_REVISE_MODE, type ReviseMode } from "../agents/reviser.js";
 import { StateValidatorAgent, type ValidationResult, type ValidationWarning } from "../agents/state-validator.js";
@@ -1700,9 +1707,10 @@ export class PipelineRunner {
       );
       const baselineChapter = targetChapter - 1;
       const baselineStoryDir = join(bookDir, "story", "snapshots", String(baselineChapter));
-      const [baselineState, baselineHooks] = await Promise.all([
+      const [baselineState, baselineHooks, baselineLedger] = await Promise.all([
         readFile(join(baselineStoryDir, "current_state.md"), "utf-8"),
         readFile(join(baselineStoryDir, "pending_hooks.md"), "utf-8"),
+        readFile(join(baselineStoryDir, "particle_ledger.md"), "utf-8").catch(() => ""),
       ]).catch((error) => {
         throw new Error(
           `Cannot revise chapter ${targetChapter} safely: baseline snapshot ${baselineChapter} is unavailable (${String(error)})`,
@@ -1760,8 +1768,11 @@ export class PipelineRunner {
         baselineHooks,
         settledRevision.updatedHooks,
         language,
+        undefined,
+        undefined,
+        { oldLedger: baselineLedger, newLedger: settledRevision.updatedLedger },
       );
-      if (!stateValidation.passed || stateValidation.repairRequired) {
+      if (stateValidation.disposition === "STATE_REPAIR_REQUIRED") {
         const recovery = await retrySettlementAfterValidationFailure({
           writer,
           validator: stateValidator,
@@ -1780,10 +1791,14 @@ export class PipelineRunner {
             : undefined,
           oldState: baselineState,
           oldHooks: baselineHooks,
+          oldLedger: baselineLedger,
           originalValidation: stateValidation,
           language,
           logger: this.config.logger,
         });
+        if (recovery.kind === "content-repair-required") {
+          throw new Error("REVISION_STATE_VALIDATION_DISPOSITION_CONTENT_REPAIR_REQUIRED_NOT_ALLOWED");
+        }
         if (recovery.kind === "degraded") {
           return {
             chapterNumber: targetChapter,
@@ -1812,6 +1827,8 @@ export class PipelineRunner {
         }
         settledRevision = recovery.output;
         stateValidation = recovery.validation;
+      } else if (stateValidation.disposition !== "PASS") {
+        throw new Error(`REVISION_STATE_VALIDATION_DISPOSITION_${stateValidation.disposition ?? "MISSING"}_NOT_ALLOWED`);
       }
       const postRevision = await this.evaluateMergedAudit({
         auditor,
@@ -2079,9 +2096,10 @@ export class PipelineRunner {
         throw new Error("STATE_REBASELINE_PENDING_CHAPTER_MISMATCH");
       }
       const baselineDir = join(bookDir, "story", "snapshots", String(plan.baselineChapterNumber));
-      const [oldState, oldHooks] = await Promise.all([
+      const [oldState, oldHooks, oldLedger] = await Promise.all([
         readFile(join(baselineDir, "current_state.md"), "utf-8"),
         readFile(join(baselineDir, "pending_hooks.md"), "utf-8"),
+        readFile(join(baselineDir, "particle_ledger.md"), "utf-8").catch(() => ""),
       ]).catch((error) => {
         throw new Error("STATE_REBASELINE_BASELINE_UNAVAILABLE", { cause: error });
       });
@@ -2136,22 +2154,25 @@ export class PipelineRunner {
       let validation = await stagedValidator.validate(
         plan.rescue.candidateBody, plan.pendingChapterNumber,
         oldState, output.updatedState, oldHooks, output.updatedHooks, language,
+        undefined, undefined, { oldLedger, newLedger: output.updatedLedger },
       );
       let providerCallCount: 3 | 6 = 3;
-      if (!validation.passed || validation.repairRequired) {
+      if (validation.disposition === "STATE_REPAIR_REQUIRED") {
         providerCallCount = 6;
         const retry = await retrySettlementAfterValidationFailure({
           writer: stagedWriter, validator: stagedValidator, book, bookDir,
           chapterNumber: plan.pendingChapterNumber, baselineChapter: plan.baselineChapterNumber,
           title: target.title, content: plan.rescue.candidateBody,
-          oldState, oldHooks, originalValidation: validation, language,
+          oldState, oldHooks, oldLedger, originalValidation: validation, language,
           logger: this.config.logger,
         });
         if (retry.kind !== "recovered") throw new Error("STATE_REBASELINE_VALIDATION_FAILED");
         output = retry.output;
         validation = retry.validation;
+      } else if (validation.disposition !== "PASS") {
+        throw new Error(`STATE_VALIDATION_DISPOSITION_STATE_REBASELINE_${validation.disposition ?? "MISSING"}_NOT_ALLOWED`);
       }
-      if (!validation.passed || validation.repairRequired) throw new Error("STATE_REBASELINE_VALIDATION_FAILED");
+      if (validation.disposition !== "PASS") throw new Error("STATE_REBASELINE_VALIDATION_FAILED");
 
       await writer.saveChapter(bookDir, output, profile.numericalSystem, language);
       await this.syncLegacyStructuredStateFromMarkdown(bookDir, plan.pendingChapterNumber, output);
@@ -3017,6 +3038,12 @@ export class PipelineRunner {
       }
       if (!chapterTransaction || chapterTransaction.chapterNumber !== chapterNumber) throw new Error("CHAPTER_TRANSACTION_MUST_EXIST_BEFORE_PREPARING");
     }
+    const semanticAuthorityEnvelope = chapterTransaction
+      ? await this.buildTransactionSemanticAuthorityEnvelope(bookDir, chapterTransaction)
+      : undefined;
+    const settlementRetryBudget = chapterTransaction
+      ? { remaining: 1 as 0 | 1 }
+      : undefined;
     const stageLanguage = await this.resolveBookLanguage(book);
     this.logStage(stageLanguage, { zh: "准备章节输入", en: "preparing chapter inputs" });
     const writeInput = await this.prepareWriteInput(
@@ -3107,6 +3134,9 @@ export class PipelineRunner {
     let autonomousReviewResult: BoundedReviewResult | undefined;
     let preservedTerminalReviewResult: BoundedReviewResult | undefined;
     let roleUsage: Record<string, RoleTokenUsage> | undefined;
+    let boundedReviewCallbacks: Pick<Parameters<typeof runBoundedReviewCycle>[0], "reviewLogic" | "reviewCommercial" | "revise" | "onStage"> | undefined;
+    let recordTransactionReviewResult: ((result: BoundedReviewResult) => Promise<string | undefined>) | undefined;
+    let semanticAuditor: ContinuityAuditor | undefined;
 
     if ((this.config.chapterReviewMode ?? "auto") === "manual") {
       // C4a: write-only checkpoint. Stop right after the draft — skip the
@@ -3130,11 +3160,9 @@ export class PipelineRunner {
       const logicIdentity = this.resolveOverride("auditor");
       const commercialIdentity = this.resolveOverride("commercial-reader");
       const auditor = new ContinuityAuditor(this.agentCtxFor("auditor", bookId));
+      semanticAuditor = auditor;
       const commercialReader = new CommercialReaderAgent(this.agentCtxFor("commercial-reader", bookId));
-      autonomousReviewResult = await runBoundedReviewCycle({
-        initialContent: output.content,
-        lengthSpec,
-        ...(preservedReviewPlan ? { initialReviews: preservedReviewPlan.initialReviews } : {}),
+      boundedReviewCallbacks = {
         reviewLogic: async (content, candidateSha) => {
           const review = scoredLogicReviewFromAudit(await auditor.auditChapter(
             bookDir,
@@ -3204,6 +3232,12 @@ export class PipelineRunner {
             ...(chapterTransaction ? { transactionId: chapterTransaction.transactionId } : {}),
           });
         },
+      };
+      autonomousReviewResult = await runBoundedReviewCycle({
+        initialContent: output.content,
+        lengthSpec,
+        ...(preservedReviewPlan ? { initialReviews: preservedReviewPlan.initialReviews } : {}),
+        ...boundedReviewCallbacks,
       });
       roleUsage = { ...(preservedReviewPlan?.historicalRoleUsage ?? {}) };
       if (!preservedReviewPlan) roleUsage.writer = output.tokenUsage ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
@@ -3214,18 +3248,18 @@ export class PipelineRunner {
         (sum, usage) => PipelineRunner.addUsage(sum, usage),
         { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
       );
-      const transactionReviewEvidencePath = chapterTransaction
-        ? await recordChapterTransactionReviewResult({
+      recordTransactionReviewResult = async (result) => chapterTransaction
+        ? recordChapterTransactionReviewResult({
             bookDir,
             transactionId: chapterTransaction.transactionId,
             result: {
-              status: autonomousReviewResult.status,
-              grade: autonomousReviewResult.grade,
-              revisionCount: autonomousReviewResult.revisionCount,
-              holdReason: autonomousReviewResult.holdReason ?? null,
-              invalidReviewerRole: autonomousReviewResult.invalidReviewerRole ?? null,
-              bestCandidateSha256: autonomousReviewResult.bestCandidate.sha256,
-              candidates: autonomousReviewResult.candidates.map((candidate) => ({
+              status: result.status,
+              grade: result.grade,
+              revisionCount: result.revisionCount,
+              holdReason: result.holdReason ?? null,
+              invalidReviewerRole: result.invalidReviewerRole ?? null,
+              bestCandidateSha256: result.bestCandidate.sha256,
+              candidates: result.candidates.map((candidate) => ({
                 label: candidate.label,
                 sha256: candidate.sha256,
                 combinedScore: candidate.combinedScore,
@@ -3267,6 +3301,7 @@ export class PipelineRunner {
       if (autonomousReviewResult.status === "HELD_AFTER_TWO_REVISIONS"
         || autonomousReviewResult.status === "BLOCKED_CRITICAL_FINDINGS"
         || autonomousReviewResult.status === "REVIEW_OUTPUT_INVALID") {
+        const transactionReviewEvidencePath = await recordTransactionReviewResult?.(autonomousReviewResult);
         const candidateEvidencePath = transactionReviewEvidencePath ?? await this.persistBoundedReviewEvidence(
           bookDir, chapterNumber, autonomousReviewResult,
           preservedReviewPlan ? "preserved-review-resume" : undefined,
@@ -3374,6 +3409,7 @@ export class PipelineRunner {
       reducedControlInput,
       preservedReviewPlan !== undefined || chapterTransaction !== undefined,
       chapterTransaction?.transactionId,
+      semanticAuthorityEnvelope,
     );
     const finalTitleResolution = resolveDuplicateTitle(
       persistenceOutput.title,
@@ -3479,7 +3515,7 @@ export class PipelineRunner {
         transactionId: chapterTransaction.transactionId,
       });
     }
-    const truthValidation = await validateChapterTruthPersistence({
+    let truthValidation = await validateChapterTruthPersistence({
       writer,
       validator,
       book,
@@ -3504,6 +3540,8 @@ export class PipelineRunner {
       logWarn: (message) => this.logWarn(pipelineLang, message),
       logger: this.config.logger,
       ...(chapterTransaction ? {
+        authorityEnvelope: semanticAuthorityEnvelope,
+        settlementRetryBudget,
         semanticRecovery: {
           allowSemanticRetry: true,
           onSemanticRetry: async () => {
@@ -3539,12 +3577,279 @@ export class PipelineRunner {
         },
       } : {}),
     });
+    let convergenceExtractorUsage = truthValidation.stateUsage.extractor;
+    let convergenceValidatorUsage = truthValidation.stateUsage.validator;
+    let semanticAdjudicationUsage: RoleTokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+    let semanticUsageRecorded = false;
+    const denySemanticContentRepair = (reason: string): void => {
+      const finding = {
+        kind: "AMBIGUOUS" as const,
+        findingId: "semantic-authority-adjudication-denied",
+        description: reason,
+      };
+      truthValidation = {
+        ...truthValidation,
+        validation: {
+          passed: false,
+          repairRequired: false,
+          disposition: "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED",
+          findings: [finding],
+          warnings: [{ category: finding.kind, description: finding.description }],
+          proseAuthorityEvidence: { status: "AMBIGUOUS", currentProse: [], committedAuthority: [] },
+        },
+        repairDisposition: "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED",
+      };
+    };
+    while (truthValidation.repairDisposition === "CONTENT_REPAIR_REQUIRED") {
+      if (!chapterTransaction || !autonomousReviewResult || !boundedReviewCallbacks || !semanticAuditor || !semanticAuthorityEnvelope) {
+        throw new Error("CONTENT_REPAIR_REQUIRES_BOUNDED_TRANSACTION_AUTHORITY");
+      }
+      const contentFindings = (truthValidation.validation.findings ?? [])
+        .filter((finding) => finding.kind === "PROSE_AUTHORITY_CONTRADICTION");
+      if (contentFindings.length === 0
+        || contentFindings.some((finding) => !finding.candidate || !finding.committed || !finding.authorityEnvelopeIdentity)) {
+        denySemanticContentRepair("Content repair nomination lacks complete transaction-bound structured evidence.");
+        break;
+      }
+      const semanticBatch = buildSemanticAdjudicationBatch({
+        candidateContent: finalContent,
+        envelope: semanticAuthorityEnvelope,
+        nominations: contentFindings.map((finding) => {
+          const candidate = finding.candidate!;
+          const committed = finding.committed!;
+          const assertion: SemanticCandidateFactAssertion = {
+            assertionId: candidate.assertionId!,
+            kind: candidate.kind!,
+            candidateSha256: candidate.candidateSha256!,
+            recordId: candidate.recordId!,
+            factKey: candidate.factKey!,
+            value: candidate.value,
+            quote: candidate.quote,
+            startUtf16: candidate.startUtf16!,
+            endUtf16: candidate.endUtf16!,
+            ...(candidate.fromValue !== undefined ? { fromValue: candidate.fromValue } : {}),
+          };
+          const committedRecord: SemanticAuthorityRecord = {
+            recordId: committed.recordId,
+            factKey: committed.factKey!,
+            fieldPath: committed.fieldPath!,
+            value: committed.value,
+            source: committed.source!,
+            sourceRelativePath: committed.sourceRelativePath!,
+            sourceSha256: committed.sourceSha256!,
+            tier: committed.tier!,
+            priority: committed.priority!,
+          };
+          return {
+            findingId: finding.findingId,
+            description: finding.description,
+            assertion,
+            committedRecord,
+            envelopeIdentity: finding.authorityEnvelopeIdentity!,
+          };
+        }),
+      });
+      if (semanticBatch.status !== "READY") {
+        denySemanticContentRepair(semanticBatch.issues.join(" ") || "Semantic authority adjudication batch is ambiguous.");
+        break;
+      }
+      const semanticIdentity = this.resolveOverride("auditor");
+      await this.config.onAutonomousStage?.({
+        stage: "SETTLING_STATE",
+        role: "logic-canon-auditor",
+        provider: semanticIdentity.client.service ?? semanticIdentity.client.provider,
+        model: semanticIdentity.model,
+        transactionId: chapterTransaction.transactionId,
+      });
+      const semanticAdjudication = await semanticAuditor.adjudicateSemanticAuthority(semanticBatch);
+      semanticAdjudicationUsage = PipelineRunner.addUsage(
+        semanticAdjudicationUsage,
+        semanticAdjudication.tokenUsage ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      );
+      if (semanticAdjudication.status !== "AUTHORIZED"
+        || semanticAdjudication.authorizedFindingIds.length !== contentFindings.length
+        || contentFindings.some((finding) => !semanticAdjudication.authorizedFindingIds.includes(finding.findingId))) {
+        denySemanticContentRepair(semanticAdjudication.issues.join(" ") || "Independent semantic authority adjudication denied prose repair.");
+        break;
+      }
+      const convergedReview = await runBoundedReviewCycle({
+        initialContent: finalContent,
+        lengthSpec,
+        ...boundedReviewCallbacks,
+        priorResult: autonomousReviewResult,
+        requiredContentRepairFinding: {
+          findingId: `state-validator-content-${autonomousReviewResult.revisionCount + 1}`,
+          severity: "CRITICAL",
+          evidence: `Current prose evidence:\n${contentFindings.map((finding) => `- ${finding.candidate!.quote}`).join("\n")}`,
+          impact: `Committed authority evidence:\n${contentFindings.map((finding) => `- ${finding.committed!.quote}`).join("\n")}`,
+          requiredOutcome: contentFindings.map((finding) => `[${finding.findingId}] ${finding.description}`).join("\n"),
+        },
+      });
+      autonomousReviewResult = convergedReview;
+      roleUsage = { ...(preservedReviewPlan?.historicalRoleUsage ?? {}) };
+      if (!preservedReviewPlan) roleUsage.writer = output.tokenUsage ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+      roleUsage["logic-canon-auditor"] = PipelineRunner.addUsage(
+        roleUsage["logic-canon-auditor"] ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        semanticAdjudicationUsage,
+      );
+      semanticUsageRecorded = true;
+      for (const [role, usage] of Object.entries(convergedReview.usageByRole)) {
+        roleUsage[role] = PipelineRunner.addUsage(roleUsage[role] ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 }, usage);
+      }
+      totalUsage = Object.values(roleUsage).reduce(
+        (sum, usage) => PipelineRunner.addUsage(sum, usage),
+        { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      );
+      if (convergedReview.status === "HELD_AFTER_TWO_REVISIONS"
+        || convergedReview.status === "BLOCKED_CRITICAL_FINDINGS"
+        || convergedReview.status === "REVIEW_OUTPUT_INVALID") {
+        const transactionReviewEvidencePath = await recordTransactionReviewResult?.(convergedReview);
+        const candidateEvidencePath = transactionReviewEvidencePath ?? await this.persistBoundedReviewEvidence(
+          bookDir, chapterNumber, convergedReview,
+          preservedReviewPlan ? "preserved-review-resume" : undefined,
+        );
+        const terminalReviews = convergedReview.bestCandidate.reviews;
+        const findings = terminalReviews.flatMap((review) => review.findings);
+        return {
+          chapterNumber,
+          title: persistenceOutput.title,
+          wordCount: countChapterLength(convergedReview.finalContent, lengthSpec.countingMode),
+          auditResult: {
+            passed: false,
+            overallScore: terminalReviews.length > 0
+              ? Math.round(terminalReviews.reduce((sum, review) => sum + review.totalScore, 0) / terminalReviews.length)
+              : 0,
+            issues: this.reviewFindingsAsAuditIssues(findings),
+            summary: `BLOCKED_CRITICAL_FINDINGS: ${convergedReview.holdReason ?? "CRITICAL_OR_MAJOR_FINDINGS_REMAIN"}`,
+          },
+          revised: convergedReview.revisionCount > 0,
+          status: convergedReview.status === "BLOCKED_CRITICAL_FINDINGS"
+            ? "blocked-critical-findings"
+            : convergedReview.status === "REVIEW_OUTPUT_INVALID"
+              ? "review-output-invalid"
+              : "held-after-two-revisions",
+          tokenUsage: totalUsage,
+          roleUsage,
+          autonomousReview: this.projectBoundedReview(convergedReview),
+          candidateEvidencePath,
+          ...(writeInput.contextTrace ? { contextTrace: writeInput.contextTrace } : {}),
+        };
+      }
+
+      finalContent = convergedReview.finalContent;
+      finalWordCount = countChapterLength(finalContent, lengthSpec.countingMode);
+      revised = convergedReview.revisionCount > 0;
+      postReviseCount = revised ? finalWordCount : 0;
+      repairApplied = revised;
+      const terminalReviews = convergedReview.bestCandidate.reviews;
+      const findings = terminalReviews.flatMap((review) => review.findings);
+      auditResult = {
+        passed: convergedReview.status === "APPROVED",
+        overallScore: terminalReviews.length > 0
+          ? Math.round(terminalReviews.reduce((sum, review) => sum + review.totalScore, 0) / terminalReviews.length)
+          : 0,
+        issues: this.reviewFindingsAsAuditIssues(findings),
+        summary: convergedReview.status === "APPROVED"
+          ? `Bounded autonomous review ${convergedReview.grade} approved.`
+          : `Bounded autonomous review ${convergedReview.grade} accepted with deferred non-blocking findings.`,
+      };
+      const extractorIdentity = this.resolveOverride("chapter-analyzer");
+      await this.config.onAutonomousStage?.({
+        stage: "SETTLING_STATE",
+        role: "final-state-extractor",
+        provider: extractorIdentity.client.service ?? extractorIdentity.client.provider,
+        model: extractorIdentity.model,
+        transactionId: chapterTransaction.transactionId,
+      });
+      persistenceOutput = await this.buildPersistenceOutput(
+        bookId,
+        book,
+        bookDir,
+        chapterNumber,
+        { ...output, title: persistenceOutput.title },
+        finalContent,
+        lengthSpec.countingMode,
+        reducedControlInput,
+        true,
+        chapterTransaction.transactionId,
+        semanticAuthorityEnvelope,
+      );
+      const validatorIdentity = this.resolveOverride("state-validator");
+      await this.config.onAutonomousStage?.({
+        stage: "SETTLING_STATE",
+        role: "state-validator",
+        provider: validatorIdentity.client.service ?? validatorIdentity.client.provider,
+        model: validatorIdentity.model,
+        transactionId: chapterTransaction.transactionId,
+      });
+      const nextTruthValidation = await validateChapterTruthPersistence({
+        writer,
+        validator,
+        book,
+        bookDir,
+        chapterNumber,
+        title: persistenceOutput.title,
+        content: finalContent,
+        persistenceOutput,
+        auditResult,
+        previousTruth: { oldState, oldHooks, oldLedger },
+        authorityContext: {
+          storyFrame: authorityStoryFrame,
+          bookRules: authorityBookRules,
+          chapterSummaries: authorityChapterSummaries,
+        },
+        reducedControlInput,
+        language: pipelineLang,
+        logWarn: (message) => this.logWarn(pipelineLang, message),
+        logger: this.config.logger,
+        semanticRecovery: {
+          allowSemanticRetry: true,
+          onSemanticRetry: async () => {
+            await this.config.onAutonomousStage?.({
+              stage: "SETTLING_STATE", role: "state-validator-semantic-retry",
+              provider: validatorIdentity.client.service ?? validatorIdentity.client.provider,
+              model: validatorIdentity.model, transactionId: chapterTransaction.transactionId,
+            });
+          },
+          onSettlementExtractorRetry: async () => {
+            await this.config.onAutonomousStage?.({
+              stage: "SETTLING_STATE", role: "final-state-extractor-settlement-repair",
+              provider: extractorIdentity.client.service ?? extractorIdentity.client.provider,
+              model: extractorIdentity.model, transactionId: chapterTransaction.transactionId,
+            });
+          },
+          onSettlementValidatorRetry: async () => {
+            await this.config.onAutonomousStage?.({
+              stage: "SETTLING_STATE", role: "state-validator-settlement-repair",
+              provider: validatorIdentity.client.service ?? validatorIdentity.client.provider,
+              model: validatorIdentity.model, transactionId: chapterTransaction.transactionId,
+            });
+          },
+        },
+        authorityEnvelope: semanticAuthorityEnvelope,
+        settlementRetryBudget,
+      });
+      convergenceExtractorUsage = PipelineRunner.addUsage(convergenceExtractorUsage, nextTruthValidation.stateUsage.extractor);
+      convergenceValidatorUsage = PipelineRunner.addUsage(convergenceValidatorUsage, nextTruthValidation.stateUsage.validator);
+      truthValidation = nextTruthValidation;
+    }
+    truthValidation = {
+      ...truthValidation,
+      stateUsage: { extractor: convergenceExtractorUsage, validator: convergenceValidatorUsage },
+    };
+    if (autonomousReviewResult) await recordTransactionReviewResult?.(autonomousReviewResult);
     let chapterStatus: ChapterPipelineResult["status"] | null = truthValidation.chapterStatus;
     let degradedIssues: ReadonlyArray<AuditIssue> = truthValidation.degradedIssues;
     persistenceOutput = truthValidation.persistenceOutput;
     auditResult = truthValidation.auditResult;
     if (chapterTransaction) {
       roleUsage ??= {};
+      if (!semanticUsageRecorded) {
+        roleUsage["logic-canon-auditor"] = PipelineRunner.addUsage(
+          roleUsage["logic-canon-auditor"] ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+          semanticAdjudicationUsage,
+        );
+      }
       roleUsage["final-state-extractor"] = PipelineRunner.addUsage(
         roleUsage["final-state-extractor"] ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
         truthValidation.stateUsage.extractor,
@@ -3785,9 +4090,10 @@ export class PipelineRunner {
     const content = await this.readChapterContent(bookDir, targetChapter);
     const baselineChapter = targetChapter - 1;
     const baselineStoryDir = join(bookDir, "story", "snapshots", String(baselineChapter));
-    const [oldState, oldHooks] = await Promise.all([
+    const [oldState, oldHooks, oldLedger] = await Promise.all([
       readFile(join(baselineStoryDir, "current_state.md"), "utf-8"),
       readFile(join(baselineStoryDir, "pending_hooks.md"), "utf-8"),
+      readFile(join(baselineStoryDir, "particle_ledger.md"), "utf-8").catch(() => ""),
     ]).catch((error) => {
       throw new Error(
         `Cannot repair chapter ${targetChapter} safely: baseline snapshot ${baselineChapter} is unavailable (${String(error)})`,
@@ -3813,9 +4119,12 @@ export class PipelineRunner {
       oldHooks,
       repairedOutput.updatedHooks,
       pipelineLang,
+      undefined,
+      undefined,
+      { oldLedger, newLedger: repairedOutput.updatedLedger },
     );
 
-    if (!validation.passed) {
+    if (validation.disposition === "STATE_REPAIR_REQUIRED") {
       const recovery = await retrySettlementAfterValidationFailure({
         writer,
         validator,
@@ -3827,22 +4136,28 @@ export class PipelineRunner {
         content,
         oldState,
         oldHooks,
+        oldLedger,
         originalValidation: validation,
         language: pipelineLang,
         logWarn: (message) => this.logWarn(pipelineLang, message),
         logger: this.config.logger,
       });
       if (recovery.kind !== "recovered") {
+        const failureDescription = recovery.kind === "degraded"
+          ? recovery.issues[0]?.description
+          : recovery.validation.warnings[0]?.description;
         throw new Error(
-          recovery.issues[0]?.description
+          failureDescription
             ?? `State repair still failed for chapter ${targetChapter}.`,
         );
       }
       repairedOutput = recovery.output;
       validation = recovery.validation;
+    } else if (validation.disposition !== "PASS") {
+      throw new Error(`STATE_VALIDATION_DISPOSITION_STATE_REPAIR_${validation.disposition ?? "MISSING"}_NOT_ALLOWED`);
     }
 
-    if (!validation.passed) {
+    if (validation.disposition !== "PASS") {
       throw new Error(`State repair still failed for chapter ${targetChapter}.`);
     }
 
@@ -3914,9 +4229,10 @@ export class PipelineRunner {
     const content = await this.readChapterContent(bookDir, targetChapter);
     const baselineChapter = targetChapter - 1;
     const baselineStoryDir = join(bookDir, "story", "snapshots", String(baselineChapter));
-    const [oldState, oldHooks] = await Promise.all([
+    const [oldState, oldHooks, oldLedger] = await Promise.all([
       readFile(join(baselineStoryDir, "current_state.md"), "utf-8"),
       readFile(join(baselineStoryDir, "pending_hooks.md"), "utf-8"),
+      readFile(join(baselineStoryDir, "particle_ledger.md"), "utf-8").catch(() => ""),
     ]).catch((error) => {
       throw new Error(
         `Cannot sync chapter ${targetChapter} safely: baseline snapshot ${baselineChapter} is unavailable (${String(error)})`,
@@ -3954,9 +4270,12 @@ export class PipelineRunner {
       oldHooks,
       syncedOutput.updatedHooks,
       pipelineLang,
+      undefined,
+      undefined,
+      { oldLedger, newLedger: syncedOutput.updatedLedger },
     );
 
-    if (!validation.passed) {
+    if (validation.disposition === "STATE_REPAIR_REQUIRED") {
       const recovery = await retrySettlementAfterValidationFailure({
         writer,
         validator,
@@ -3976,22 +4295,28 @@ export class PipelineRunner {
           : undefined,
         oldState,
         oldHooks,
+        oldLedger,
         originalValidation: validation,
         language: pipelineLang,
         logWarn: (message) => this.logWarn(pipelineLang, message),
         logger: this.config.logger,
       });
       if (recovery.kind !== "recovered") {
+        const failureDescription = recovery.kind === "degraded"
+          ? recovery.issues[0]?.description
+          : recovery.validation.warnings[0]?.description;
         throw new Error(
-          recovery.issues[0]?.description
+          failureDescription
             ?? `Chapter sync still failed for chapter ${targetChapter}.`,
         );
       }
       syncedOutput = recovery.output;
       validation = recovery.validation;
+    } else if (validation.disposition !== "PASS") {
+      throw new Error(`STATE_VALIDATION_DISPOSITION_CHAPTER_RESYNC_${validation.disposition ?? "MISSING"}_NOT_ALLOWED`);
     }
 
-    if (!validation.passed) {
+    if (validation.disposition !== "PASS") {
       throw new Error(`Chapter sync still failed for chapter ${targetChapter}.`);
     }
 
@@ -4673,6 +4998,61 @@ ${matrix}`,
     };
   }
 
+  private async buildTransactionSemanticAuthorityEnvelope(
+    bookDir: string,
+    transaction: ChapterTransactionHandle,
+  ): Promise<SemanticAuthorityEnvelope> {
+    const chain = await verifyChapterCommitChain({ bookDir });
+    const latestCommit = chain.commits.at(-1);
+    const authorityKind = latestCommit ? "CHAPTER_COMMIT" as const : "GENESIS" as const;
+    const authorityChapterNumber = latestCommit?.chapterNumber ?? chain.genesis.lastTrustedChapter;
+    const authoritySha256 = latestCommit?.commitSha256 ?? chain.genesis.genesisSha256;
+    const authorityRoot = latestCommit
+      ? join(bookDir, "story", "commits", `chapter-${String(latestCommit.chapterNumber).padStart(4, "0")}`, "state")
+      : join(bookDir, "story", "snapshots", String(chain.genesis.lastTrustedChapter));
+    const currentStateRelativePath = latestCommit ? "current_state.json" : "state/current_state.json";
+    const hooksRelativePath = latestCommit ? "hooks.json" : "state/hooks.json";
+    const currentStateEntry = (latestCommit?.stateFiles ?? chain.genesis.trustedSnapshotFiles)
+      .find((entry) => entry.relativePath === currentStateRelativePath);
+    const hooksEntry = (latestCommit?.stateFiles ?? chain.genesis.trustedSnapshotFiles)
+      .find((entry) => entry.relativePath === hooksRelativePath);
+    const currentState = await readFile(join(authorityRoot, currentStateRelativePath), "utf-8").catch(() => "");
+    const hooks = await readFile(join(authorityRoot, hooksRelativePath), "utf-8").catch(() => "");
+    return buildSemanticAuthorityEnvelope({
+      transaction: {
+        transactionId: transaction.transactionId,
+        bookId: transaction.bookId,
+        chapterNumber: transaction.chapterNumber,
+        previousAuthoritySha256: transaction.previousAuthoritySha256,
+      },
+      authority: {
+        kind: authorityKind,
+        chapterNumber: authorityChapterNumber,
+        authoritySha256,
+        currentState: {
+          relativePath: toPosixPath(join(
+            "story",
+            latestCommit ? join("commits", `chapter-${String(latestCommit.chapterNumber).padStart(4, "0")}`, "state") : join("snapshots", String(chain.genesis.lastTrustedChapter)),
+            currentStateRelativePath,
+          )),
+          content: currentState,
+          sha256: currentStateEntry?.sha256 ?? "",
+          authorityMember: currentStateEntry !== undefined,
+        },
+        hooks: {
+          relativePath: toPosixPath(join(
+            "story",
+            latestCommit ? join("commits", `chapter-${String(latestCommit.chapterNumber).padStart(4, "0")}`, "state") : join("snapshots", String(chain.genesis.lastTrustedChapter)),
+            hooksRelativePath,
+          )),
+          content: hooks,
+          sha256: hooksEntry?.sha256 ?? "",
+          authorityMember: hooksEntry !== undefined,
+        },
+      },
+    });
+  }
+
   private async buildPersistenceOutput(
     bookId: string,
     book: BookConfig,
@@ -4688,6 +5068,7 @@ ${matrix}`,
     },
     forceAnalyze = false,
     transactionId?: string,
+    authorityEnvelope?: SemanticAuthorityEnvelope,
   ): Promise<WriteChapterOutput> {
     if (!forceAnalyze && finalContent === output.content) {
       return output;
@@ -4703,6 +5084,7 @@ ${matrix}`,
       chapterIntent: reducedControlInput?.chapterIntent,
       contextPackage: reducedControlInput?.contextPackage,
       ruleStack: reducedControlInput?.ruleStack,
+      authorityEnvelope,
       ...(transactionId ? {
         semanticRecovery: {
           allowSemanticRetry: true,
