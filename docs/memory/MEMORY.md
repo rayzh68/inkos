@@ -99,6 +99,20 @@
 - Chapter authority 仍要求 final state validation 成功并形成 Chapter Commit 后才能启动 N+1；parser compatibility 不构成跳过 transaction/Commit gate 的授权。
 - 该边界修正已通过 `GPT_CHAPTER006_SETTLEMENT_FIX_SOURCE_REVIEW`，以 reviewed head `2e61e146a22709f70770c386a8f290bd14c5f3c5` 经 PR `rayzh68/inkos#17` merge；merge commit 为 `4012ed1f7e6c033114a1e5d087803a6da70b6d68`。
 
+### Autonomous chapter convergence system closure
+
+- 单章只有在 final prose、fresh final review authority 与 final state 对同一最终候选完成收敛并通过验证后，才能形成 Chapter Commit。
+- State/canon validation 可以发现普通审核遗漏的 content defect；可修复的 content defect 必须反馈到既有 bounded prose revision chain，不能在 state settlement 中静默改写正文语义。
+- Host 不声称理解自然语言语义。Host 只证明 provenance、identity、authority priority、hash、transaction binding 与 budget；自动 prose repair 还必须由两个既有独立语义职责对同一 structured committed fact 达成一致。
+- 只有经过验证的 committed structured `current_state.json` / `hooks.json` records 能授权自动 prose repair；无法证明的文学歧义、冲突 evidence、显式 transition 或不确定判断必须 fail closed。
+- 正文改变后，旧 reviewer authority、state extraction 和 state validation 全部失效；新候选必须重新取得 fresh Logic/Canon review、fresh Reader review、fresh state build 与 fresh validation。
+- State-only failure 继续留在 settlement repair；mixed failure 先修正文，再重建与复核 state。
+- Convergence 不得重置预算：prose revision 仍只有 `REVISION_1 + REVISION_2`，settlement retry 仍为每个 active Chapter Transaction 一次，logical calls / Provider transports 仍为 `18 / 24`。
+- Exact-once Provider replay、Chapter Transaction 与 N+1 authority 始终是强制约束；matching `COMPLETE` replay 不得增加 transport，N+1 不得越过未 Commit 的 N。
+- Stop 必须作用于实际 model-call admission，而不能只依赖 high-level pipeline stage；已 admission 的调用可完成并持久化 truthful evidence，但不得启动下一调用。
+- Focused semantic adjudication 只授权或拒绝 content-repair route，不能成为 final reviewer authority；最终 Logic/Canon 与 Reader evidence 分别要求 `LOGIC_REVIEW` 与 `READER_REVIEW` stage。
+- 该系统性闭环已通过 `GPT_AUTONOMOUS_CONVERGENCE_RE_REVIEW`，reviewed head `d74a0a4869894828a679ee194ce62bdefe5fff80` 经 PR `rayzh68/inkos#18` 以 merge commit `d684c2a8ad0e050255510d9a6d664ee5c2068cc2` 合入 master；未新增产品角色、transaction type、runtime schema、Provider adapter、UI 或 subsystem。
+
 ## 5. 不应反复重新设计的架构决定
 
 - Chapter Transaction 是章节生产和提交的正式边界。

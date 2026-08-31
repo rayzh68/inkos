@@ -1,7 +1,7 @@
 # InkOS Current State
 
-**Snapshot date:** 2026-08-30  
-**Task:** `CHAPTER006_SETTLEMENT_FIX_FINAL_LANDING` — externally reviewed settlement parser correction integration closeout
+**Snapshot date:** 2026-08-31
+**Task:** `AUTONOMOUS_CHAPTER_CONVERGENCE_SYSTEM_CLOSURE_FINAL_LANDING` — externally reviewed systemic convergence integration closeout
 **Rule:** 本文件是当前暂停点快照；继续工作前必须重新核验机器事实。
 
 ## 1. Repository
@@ -15,6 +15,7 @@
 | Post-PR14 UI convergence merge commit | `f1a63ed8145c507d00f6bb872a5cc6a6149fcd8a` |
 | Full-book and BookDetail refresh merge commit | `33979787b14f8e8b08d75f118b34852b3e01c374` |
 | Chapter 006 settlement parser correction merge commit | `4012ed1f7e6c033114a1e5d087803a6da70b6d68` |
+| Autonomous chapter convergence merge commit | `d684c2a8ad0e050255510d9a6d664ee5c2068cc2` |
 | Rebased authority commits | `c52dc01bb44679036126426479f03975678c2d40` → `fa35b91a0db7fe7304abbc789c3944bfa7a7735f` → `e950e1e1bb67c7b517e7f61c4595beee4187cd9a` |
 | Closeout HEAD | the commit containing this snapshot; resolve with `git rev-parse HEAD` |
 | Final synchronization | verify `master == origin/master` from Git and the final handoff; this file cannot embed its own commit SHA |
@@ -96,7 +97,96 @@ The exact merged five-file scope is:
 
 The modern settlement envelope is now authoritative. An exact persisted `hookOps.upsert[*].status: "pressured"` compatibility value is normalized to canonical `"progressing"` before schema validation, while the formal runtime schema remains the canonical `open / progressing / deferred / resolved` four-state enum. A declared modern delta that is malformed or schema-invalid now fails closed and cannot fall back to legacy placeholders. Genuine legacy responses without the modern envelope remain compatible. The cached COMPLETE artifact regression proves matching replay adds zero Provider transports; Provider identity, transaction, Chapter Commit, and N+1 algorithms were not modified.
 
-## 6. Latest verification
+## 6. PR #18 — autonomous chapter convergence system closure
+
+| Field | Current fact |
+| --- | --- |
+| PR | `rayzh68/inkos#18` |
+| Title | `fix: close autonomous chapter convergence loop` |
+| Final externally reviewed head | `d74a0a4869894828a679ee194ce62bdefe5fff80` |
+| GPT gate | `GPT_AUTONOMOUS_CONVERGENCE_RE_REVIEW = PASS` |
+| Systemic closure verdict | `PASS` |
+| Merge method | Merge commit; not squash or rebase merge |
+| Merge commit | `d684c2a8ad0e050255510d9a6d664ee5c2068cc2` |
+| GitHub merged at | `2026-08-31T07:31:59Z` |
+| Reviewed scope | Exactly 25 files |
+| Provider adapter modification | `0` |
+| Runtime schema modification | `0` |
+| New product role | `0` |
+| New transaction type | `0` |
+| New UI | `0` |
+| New subsystem | `0` |
+
+The complete externally reviewed file union is:
+
+- `packages/core/src/__tests__/bounded-autonomous-controller.test.ts`;
+- `packages/core/src/__tests__/bounded-review.test.ts`;
+- `packages/core/src/__tests__/chapter-analyzer.test.ts`;
+- `packages/core/src/__tests__/chapter-state-recovery.test.ts`;
+- `packages/core/src/__tests__/chapter-transaction.test.ts`;
+- `packages/core/src/__tests__/chapter-truth-validation.test.ts`;
+- `packages/core/src/__tests__/continuity.test.ts`;
+- `packages/core/src/__tests__/pipeline-runner.test.ts`;
+- `packages/core/src/__tests__/semantic-authority.test.ts`;
+- `packages/core/src/__tests__/state-validator-agent.test.ts`;
+- `packages/core/src/agents/chapter-analyzer.ts`;
+- `packages/core/src/agents/continuity.ts`;
+- `packages/core/src/agents/semantic-authority.ts`;
+- `packages/core/src/agents/state-validator.ts`;
+- `packages/core/src/agents/writer.ts`;
+- `packages/core/src/pipeline/bounded-review.ts`;
+- `packages/core/src/pipeline/chapter-state-recovery.ts`;
+- `packages/core/src/pipeline/chapter-truth-validation.ts`;
+- `packages/core/src/pipeline/runner.ts`;
+- `packages/core/src/production/bounded-autonomous-controller.ts`;
+- `packages/core/src/production/chapter-transaction.ts`;
+- `packages/studio/src/api/autonomous-production.test.ts`;
+- `packages/studio/src/api/autonomous-production.ts`;
+- `packages/studio/src/api/server.test.ts`;
+- `packages/studio/src/api/server.ts`.
+
+The landed systemic contract is:
+
+1. Chapter Commit requires convergence of final prose, fresh final reviews, and validated final state.
+2. State Validator routes findings structurally to `PASS`, `CONTENT_REPAIR_REQUIRED`, `STATE_REPAIR_REQUIRED`, or `NON_REPAIRABLE_OR_BUDGET_EXHAUSTED`.
+3. Automatic content repair requires host-verified structured authority, a primary semantic nomination, and independent existing Logic/Canon adjudication over the same fact.
+4. Ambiguous, unprovable, conflicting, uncertain, or transition evidence fails closed.
+5. Changed prose invalidates prior reviewer and state authority.
+6. State-only failures remain settlement-only.
+7. Mixed failures run content repair first, then rebuild and revalidate state.
+8. The same Chapter Transaction is retained through convergence.
+9. The prose revision ceiling remains `REVISION_1 + REVISION_2`.
+10. Settlement retry remains one per active Chapter Transaction and does not reset during convergence.
+11. Logical calls remain capped at `18`.
+12. Provider transports remain capped at `24`.
+13. Exact-identity `COMPLETE` replay remains exact-once with zero duplicate transport.
+14. Stop gates actual model-call admission; an admitted call may finish truthfully, but no following call starts.
+15. Final Logic/Canon review evidence requires the exact `LOGIC_REVIEW` stage.
+16. Final Reader evidence requires the exact `READER_REVIEW` stage.
+17. Chapter N+1 remains blocked until Chapter N Commit.
+
+Only SHA-verified structured committed `current_state.json` and `hooks.json` records may authorize automatic prose repair. Legacy Markdown remains context only. Focused `SETTLING_STATE` semantic adjudication is route authorization only and cannot satisfy final reviewer authority.
+
+## 7. Latest verification
+
+The PR #18 release checks on reviewed head `d74a0a48` are local Codex results, not independent CI:
+
+- expanded Core convergence matrix: 368/368 PASS;
+- final bounded convergence matrix: 277/277 PASS;
+- Studio affected: 212/212 PASS;
+- Core full single-worker: QUALIFIED PASS — 2158/2160; only the two established Windows symlink fixture `EPERM` baseline failures in `skill-agent-tool.test.ts`;
+- Studio full single-worker: 711/711 PASS;
+- Core typecheck: PASS;
+- Studio typecheck: PASS;
+- Core build: PASS;
+- Studio build: PASS;
+- `git diff --check`: PASS;
+- semantic authority/provenance, content-state routing, Stop/exact-once/budget, scope/mechanism, and legacy compatibility read-only reviews: PASS;
+- external `GPT_AUTONOMOUS_CONVERGENCE_RE_REVIEW`: PASS;
+- real Provider/model calls: 0;
+- real-book mutation: 0;
+- Chapter 006 action: none;
+- Chapter 007 action: none.
 
 These are fresh local release checks on audited head `f0a9febc`; they are not independent CI:
 
@@ -158,21 +248,22 @@ The PR #17 settlement parser correction checks on reviewed head `2e61e146` are l
 - Chapter 006 action: none;
 - Chapter 007 action: none.
 
-## 7. Current system-development state
+## 8. Current system-development state
 
 - PR14 is merged and its audited history is preserved.
 - Post-PR14 UI convergence PR #15 is merged; its two externally reviewed commits remain reachable from master.
 - Full-book and BookDetail refresh PR #16 is merged; reviewed head `04755e11` is reachable from master through merge commit `33979787`.
 - Chapter 006 settlement parser correction PR #17 is merged; externally reviewed head `2e61e146` remains directly reachable from master through merge commit `4012ed1f`.
+- Autonomous chapter convergence PR #18 is merged; reviewed head `d74a0a48` remains directly reachable from master through merge commit `d684c2a8`.
 - The real InkOS production remains user-paused at Chapter 006 `SETTLING_STATE` / `PAUSED_PIPELINE_ERROR`; this landing performed no production action.
-- The system correction landing is complete. The critical next action is `USER_COLD_RESTARTS_LATEST_MASTER_AND_RETURNS_TO_UI`; this is not authorization for Codex to operate that UI or start production.
+- The systemic convergence landing is complete. The critical next action is `GPT_AND_USER_DECIDE_REAL_SYSTEMIC_VALIDATION_PATH`; this is a decision gate and not authorization for Codex to operate the UI, call a Provider/model, or start production.
 - Authority documents, Development Method V1, official alignment, and the worktree lifecycle rules are the current development authority.
-- Development Method V1 has now been exercised through a complex FULL Subagent Path, scoped re-review, FAST documentation path, and release integration. The PR #17 feature worktree is removed only after the final docs commit push/reachability gate; its completion is proved by the final machine handoff rather than claimed early in this embedded snapshot.
+- Development Method V1 has now been exercised through a complex FULL Subagent Path, scoped re-review, FAST documentation path, and release integration. The PR #18 feature worktree is removed only after the final docs commit push/reachability gate; its completion is proved by the final machine handoff rather than claimed early in this embedded snapshot.
 - No further PR14 business development is authorized by this snapshot.
 
-## 8. Current real production pause — read-only revalidated
+## 9. Current real production pause — preserved landing authority
 
-The following machine facts were re-read from existing real-book artifacts without mutation during this closeout:
+The following formally revalidated machine facts are preserved from the latest read-only evidence; this landing did not reread or mutate real-book artifacts:
 
 - latest committed authority: Chapter 005;
 - current target: Chapter 006;
@@ -186,7 +277,7 @@ The following machine facts were re-read from existing real-book artifacts witho
 
 The existing recovery identity must not be migrated to `full-book` during landing. No production authorization is granted to Codex.
 
-## 9. Production authorization
+## 10. Production authorization
 
 | Action | Authorized now? |
 | --- | --- |
@@ -198,12 +289,12 @@ The existing recovery identity must not be migrated to `full-book` during landin
 | Codex operation of the real InkOS UI | No |
 | NovelFactory or AI-Dev-Orchestrator modification | No |
 
-## 10. NEXT
+## 11. NEXT
 
-`USER_COLD_RESTARTS_LATEST_MASTER_AND_RETURNS_TO_UI`
+`GPT_AND_USER_DECIDE_REAL_SYSTEMIC_VALIDATION_PATH`
 
-The user must inspect the UI and decide any later production action outside this Codex closeout. Codex stops here and does not execute NEXT.
+GPT and the user must decide the later real systemic validation path outside this Codex closeout. No production authorization is granted to Codex. Codex stops here and does not execute NEXT.
 
-## 11. Update triggers
+## 12. Update triggers
 
 Update this snapshot after a later merge, real-book test, production-state revalidation, formal stop, or other major development milestone. Machine facts always override stale prose.
