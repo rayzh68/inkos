@@ -3565,8 +3565,10 @@ export class PipelineRunner {
       if (!chapterTransaction || !autonomousReviewResult || !boundedReviewCallbacks) {
         throw new Error("CONTENT_REPAIR_REQUIRES_BOUNDED_TRANSACTION_AUTHORITY");
       }
-      const evidence = truthValidation.validation.proseAuthorityEvidence;
-      if (evidence?.status !== "PROVEN" || evidence.currentProse.length === 0 || evidence.committedAuthority.length === 0) {
+      const contentFindings = (truthValidation.validation.findings ?? [])
+        .filter((finding) => finding.kind === "PROSE_AUTHORITY_CONTRADICTION");
+      if (contentFindings.length === 0
+        || contentFindings.some((finding) => !finding.candidate || !finding.committed)) {
         throw new Error("CONTENT_REPAIR_REQUIRES_PROVEN_STRUCTURED_EVIDENCE");
       }
       const convergedReview = await runBoundedReviewCycle({
@@ -3577,10 +3579,9 @@ export class PipelineRunner {
         requiredContentRepairFinding: {
           findingId: `state-validator-content-${autonomousReviewResult.revisionCount + 1}`,
           severity: "CRITICAL",
-          evidence: `Current prose evidence:\n${evidence.currentProse.map((item) => `- ${item}`).join("\n")}`,
-          impact: `Committed authority evidence:\n${evidence.committedAuthority.map((item) => `- ${item}`).join("\n")}`,
-          requiredOutcome: truthValidation.validation.warnings.map((warning) => `[${warning.category}] ${warning.description}`).join("\n")
-            || "Restore the candidate to convergence with committed authority.",
+          evidence: `Current prose evidence:\n${contentFindings.map((finding) => `- ${finding.candidate!.quote}`).join("\n")}`,
+          impact: `Committed authority evidence:\n${contentFindings.map((finding) => `- ${finding.committed!.quote}`).join("\n")}`,
+          requiredOutcome: contentFindings.map((finding) => `[${finding.findingId}] ${finding.description}`).join("\n"),
         },
       });
       autonomousReviewResult = convergedReview;

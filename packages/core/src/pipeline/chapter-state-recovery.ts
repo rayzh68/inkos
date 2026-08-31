@@ -5,7 +5,7 @@ import type {
   ValidationWarning,
 } from "../agents/state-validator.js";
 import type { StateValidatorAgent } from "../agents/state-validator.js";
-import type { WriteChapterOutput } from "../agents/writer.js";
+import type { CandidateFactEvidence, WriteChapterOutput } from "../agents/writer.js";
 import type { WriterAgent } from "../agents/writer.js";
 import type { Logger } from "../utils/logger.js";
 import type { BookConfig } from "../models/book.js";
@@ -33,6 +33,7 @@ export interface SettlementRetryParams {
   readonly oldLedger: string;
   readonly originalValidation: ValidationResult;
   readonly authorityContext?: StateValidationAuthorityContext;
+  readonly candidateFactEvidence?: CandidateFactEvidence;
   readonly language: LengthLanguage;
   readonly logWarn?: (message: { zh: string; en: string }) => void;
   readonly logger?: Pick<Logger, "warn">;
@@ -97,8 +98,10 @@ export async function retrySettlementAfterValidationFailure(
       params.authorityContext,
       undefined,
       { oldLedger: params.oldLedger, newLedger: retryOutput.updatedLedger },
+      params.candidateFactEvidence,
     );
   } catch (error) {
+    if (error instanceof Error && error.message === "AUTONOMOUS_STAGE_ADMISSION_STOPPED") throw error;
     throw new Error(`State validation retry failed for chapter ${params.chapterNumber}: ${String(error)}`);
   }
 

@@ -2439,4 +2439,138 @@ describe("bounded autonomous production controller", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it("lets an admitted deferred transport finish after concurrent Stop but denies the following call", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-model-call-admission-inflight-"));
+    const jobId = "model-call-inflight-job";
+    let stopped = false;
+    let releaseTransport!: () => void;
+    let markTransportStarted!: () => void;
+    const transportStarted = new Promise<void>((resolve) => { markTransportStarted = resolve; });
+    const transportRelease = new Promise<void>((resolve) => { releaseTransport = resolve; });
+    let adapterInvocations = 0;
+    try {
+      await saveAutonomousProductionState(root, "book", {
+        jobId, status: "RUNNING", mode: "current-volume", volumeId: "volume-001",
+        startChapter: 1, targetChapter: 1, nextChapter: 1, completedThisRun: 0,
+      });
+      const execution = createAutonomousProviderExecution({
+        projectRoot: root, bookId: "book", jobId,
+        getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "openrouter", model: "model" }),
+        assertModelCallAdmission: () => {
+          if (stopped) throw new Error("AUTONOMOUS_STAGE_ADMISSION_STOPPED");
+        },
+      });
+      const admitted = execution.runProviderCall(1, async () => {
+        adapterInvocations += 1;
+        markTransportStarted();
+        await transportRelease;
+        return { content: "truthful admitted response", usage: { promptTokens: 2, completionTokens: 3, totalTokens: 5 } };
+      }, { provider: "openrouter", model: "model", inputFingerprint: "c".repeat(64) });
+      await transportStarted;
+      stopped = true;
+      releaseTransport();
+      await expect(admitted).resolves.toMatchObject({ content: "truthful admitted response" });
+      await expect(execution.runProviderCall(1, async () => {
+        adapterInvocations += 1;
+        return { content: "must not run", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "openrouter", model: "model", inputFingerprint: "d".repeat(64) }))
+        .rejects.toThrow("AUTONOMOUS_STAGE_ADMISSION_STOPPED");
+
+      const persisted = JSON.parse(await readFile(join(
+        root, "books", "book", "story", "runtime", "bounded-autonomous", "production-state.json",
+      ), "utf-8")) as AutonomousRunProgress;
+      expect(adapterInvocations).toBe(1);
+      expect(persisted.providerAttemptHistory).toEqual([
+        expect.objectContaining({ classification: "SUCCESS", transportStarted: true, transportReturned: true }),
+      ]);
+    } finally {
+      releaseTransport?.();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("projects a denied model-call admission as PAUSED_BY_USER with no phantom evidence", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-model-call-admission-paused-"));
+    const jobId = deriveAutonomousJobIdentity({ map, mode: "current-volume", nextChapter: 1 });
+    let adapterInvocations = 0;
+    const persistedStates: AutonomousRunProgress[] = [];
+    try {
+      await saveAutonomousProductionState(root, "book", {
+        jobId, status: "RUNNING", mode: "current-volume", volumeId: "volume-001",
+        startChapter: 1, targetChapter: 3, nextChapter: 1, completedThisRun: 0,
+      });
+      const execution = createAutonomousProviderExecution({
+        projectRoot: root, bookId: "book", jobId,
+        getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "openrouter", model: "model" }),
+        assertModelCallAdmission: () => { throw new Error("AUTONOMOUS_STAGE_ADMISSION_STOPPED"); },
+      });
+      const result = await runBoundedAutonomousScope({
+        map, mode: "current-volume", getNextChapter: async () => 1, shouldStop: () => false,
+        providerRecovery: execution,
+        persistProgress: async (state) => {
+          persistedStates.push(state);
+          await saveAutonomousProductionState(root, "book", state);
+        },
+        runChapter: async () => {
+          await execution.runProviderCall(1, async () => {
+            adapterInvocations += 1;
+            return { content: "must not run", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+          }, { provider: "openrouter", model: "model", inputFingerprint: "e".repeat(64) });
+          return { status: "held-after-two-revisions", autonomousReview: { revisionCount: 2 } };
+        },
+      });
+
+      expect(result).toMatchObject({ status: "PAUSED_BY_USER", nextChapter: 1 });
+      expect(adapterInvocations).toBe(0);
+      expect(result.providerAttemptHistory ?? []).toEqual([]);
+      expect(persistedStates.at(-1)?.status).toBe("PAUSED_BY_USER");
+      await expect(readdir(join(
+        root, "books", "book", "story", "runtime", "bounded-autonomous", "provider-responses",
+      ))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps an admitted Provider failure classification when Stop arrives before catch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-model-call-admission-provider-failure-"));
+    const jobId = deriveAutonomousJobIdentity({ map, mode: "current-volume", nextChapter: 1 });
+    let stopped = false;
+    try {
+      await saveAutonomousProductionState(root, "book", {
+        jobId, status: "RUNNING", mode: "current-volume", volumeId: "volume-001",
+        startChapter: 1, targetChapter: 3, nextChapter: 1, completedThisRun: 0,
+      });
+      const execution = createAutonomousProviderExecution({
+        projectRoot: root, bookId: "book", jobId,
+        getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "openrouter", model: "model" }),
+        assertModelCallAdmission: () => {
+          if (stopped) throw new Error("AUTONOMOUS_STAGE_ADMISSION_STOPPED");
+        },
+      });
+      const result = await runBoundedAutonomousScope({
+        map, mode: "current-volume", getNextChapter: async () => 1, shouldStop: () => stopped,
+        providerRecovery: execution,
+        persistProgress: (state) => saveAutonomousProductionState(root, "book", state),
+        runChapter: async () => {
+          await execution.runProviderCall(1, async () => {
+            stopped = true;
+            throw new Error("synthetic admitted provider failure");
+          }, { provider: "openrouter", model: "model", inputFingerprint: "f".repeat(64) });
+          return { status: "approved" };
+        },
+      });
+
+      expect(result).toMatchObject({
+        status: "PAUSED_DETERMINISTIC_PROVIDER_ERROR",
+        lastErrorClassification: "DETERMINISTIC_PROVIDER_ERROR",
+      });
+      expect(result.providerAttemptHistory).toEqual([
+        expect.objectContaining({ classification: "DETERMINISTIC_PROVIDER_ERROR" }),
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

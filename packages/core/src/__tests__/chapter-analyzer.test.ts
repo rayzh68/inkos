@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { ChapterAnalyzerAgent } from "../agents/chapter-analyzer.js";
 import type { BookConfig } from "../models/book.js";
 import { countChapterLength } from "../utils/length-metrics.js";
@@ -12,7 +13,7 @@ const ZERO_USAGE = {
   totalTokens: 0,
 } as const;
 
-function validAnalyzerResponse(content: string): string {
+function validAnalyzerResponse(content: string, candidateEvidence?: unknown): string {
   return [
     "=== CHAPTER_TITLE ===", "Recovered State", "", "=== CHAPTER_CONTENT ===", content, "",
     "=== PRE_WRITE_CHECK ===", "", "=== POST_SETTLEMENT ===", "done", "",
@@ -20,12 +21,77 @@ function validAnalyzerResponse(content: string): string {
     "=== UPDATED_LEDGER ===", "", "=== UPDATED_HOOKS ===", "# Pending Hooks", "",
     "=== CHAPTER_SUMMARY ===", "| 5 | Recovered State |", "", "=== UPDATED_SUBPLOTS ===", "",
     "=== UPDATED_EMOTIONAL_ARCS ===", "", "=== UPDATED_CHARACTER_MATRIX ===", "",
+    ...(candidateEvidence === undefined
+      ? []
+      : ["=== CANDIDATE_FACT_EVIDENCE ===", JSON.stringify(candidateEvidence), ""]),
   ].join("\n");
 }
 
 describe("ChapterAnalyzerAgent", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it("host-binds analyzer candidate evidence to the exact final-content span and committed record", async () => {
+    const bookDir = await mkdtemp(join(tmpdir(), "inkos-chapter-analyzer-candidate-evidence-"));
+    const storyDir = join(bookDir, "story");
+    const content = "The protagonist remains at Harbor.";
+    const quote = "protagonist remains at Harbor";
+    const startUtf16 = content.indexOf(quote);
+    const agent = new ChapterAnalyzerAgent({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model",
+      projectRoot: process.cwd(),
+    });
+    const book: BookConfig = {
+      id: "book", title: "Book", platform: "other", genre: "other", status: "active",
+      targetChapters: 10, chapterWordCount: 2200, language: "en",
+      createdAt: "2026-08-30T00:00:00.000Z", updatedAt: "2026-08-30T00:00:00.000Z",
+    };
+    vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({
+        content: validAnalyzerResponse(content, [{
+          kind: "CANDIDATE_ASSERTION",
+          recordId: "state:protagonist::current location",
+          value: "Harbor",
+          quote,
+          startUtf16,
+          endUtf16: startUtf16 + quote.length,
+        }]),
+        usage: ZERO_USAGE,
+      });
+    try {
+      await mkdir(storyDir, { recursive: true });
+      await writeFile(
+        join(storyDir, "current_state.md"),
+        "| Field | Value |\n| --- | --- |\n| Current Location | Gate |\n",
+        "utf-8",
+      );
+
+      const output = await agent.analyzeChapter({ book, bookDir, chapterNumber: 4, chapterContent: content });
+
+      expect(output).toMatchObject({
+        candidateFactEvidence: {
+          candidateSha256: createHash("sha256").update(content).digest("hex"),
+          issues: [],
+          assertions: [expect.objectContaining({
+            kind: "CANDIDATE_ASSERTION",
+            assertionId: expect.stringMatching(/^[a-f0-9]{64}$/),
+            factKey: "state:protagonist::current location",
+            recordId: "state:protagonist::current location",
+            value: "Harbor",
+            quote,
+            startUtf16,
+            endUtf16: startUtf16 + quote.length,
+          })],
+        },
+      });
+    } finally {
+      await rm(bookDir, { recursive: true, force: true });
+    }
   });
 
   it("uses one distinct semantic retry for a COMPLETE whitespace final-state extraction", async () => {

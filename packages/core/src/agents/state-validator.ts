@@ -1,5 +1,7 @@
 import { BaseAgent } from "./base.js";
-import type { TokenUsage } from "./writer.js";
+import { createHash } from "node:crypto";
+import type { CandidateFactAssertion, CandidateFactEvidence, TokenUsage } from "./writer.js";
+import { parseCurrentStateFacts, parsePendingHooksMarkdown } from "../utils/story-markdown.js";
 
 export interface ValidationWarning {
   readonly category: string;
@@ -18,8 +20,35 @@ export interface ProseAuthorityEvidence {
   readonly committedAuthority: ReadonlyArray<string>;
 }
 
+export type ValidationFindingKind =
+  | "PROSE_AUTHORITY_CONTRADICTION"
+  | "STATE_PROJECTION_DEFECT"
+  | "AMBIGUOUS"
+  | "NON_REPAIRABLE";
+
+export interface ValidationFinding {
+  readonly kind: ValidationFindingKind;
+  readonly findingId: string;
+  readonly description: string;
+  readonly factKey?: string;
+  readonly relation?: "CONFLICTING_VALUES" | "EXPLICIT_TRANSITION";
+  readonly transitionQuote?: string;
+  readonly candidate?: {
+    readonly subject: string;
+    readonly predicate: string;
+    readonly value: string;
+    readonly quote: string;
+  };
+  readonly committed?: {
+    readonly recordId: string;
+    readonly value: string;
+    readonly quote: string;
+  };
+}
+
 export interface ValidationResult {
   readonly warnings: ReadonlyArray<ValidationWarning>;
+  readonly findings?: ReadonlyArray<ValidationFinding>;
   readonly passed: boolean;
   readonly repairRequired?: boolean;
   readonly disposition?: ValidationDisposition;
@@ -32,6 +61,16 @@ export interface StateValidationAuthorityContext {
   readonly storyFrame?: string;
   readonly bookRules?: string;
   readonly chapterSummaries?: string;
+}
+
+export interface CommittedAuthorityRecord {
+  readonly recordId: string;
+  readonly factKey: string;
+  readonly source: "current_state" | "pending_hooks";
+  readonly tier: "COMMITTED_RUNTIME_CURRENT_STATE" | "COMMITTED_RUNTIME_PENDING_HOOKS";
+  readonly priority: number;
+  readonly value: string;
+  readonly sourceSurface: string;
 }
 
 export interface StateValidationLedgerContext {
@@ -66,6 +105,7 @@ export class StateValidatorAgent extends BaseAgent {
       readonly onSemanticRetry?: () => Promise<void> | void;
     },
     ledgerContext?: StateValidationLedgerContext,
+    candidateFactEvidence?: CandidateFactEvidence,
   ): Promise<ValidationResult> {
     const stateDiff = this.computeDiff(oldState, newState, "State Card");
     const hooksDiff = this.computeDiff(oldHooks, newHooks, "Hooks Pool");
@@ -79,6 +119,7 @@ export class StateValidatorAgent extends BaseAgent {
       ? "Respond in English."
       : "用中文回答。";
 
+    const authorityCatalog = buildCommittedAuthorityCatalog(oldState, oldHooks, chapterNumber);
     const systemPrompt = `You are a continuity validator for a novel writing system. ${langInstruction}
 
 Given the chapter text, committed current truth, and the CHANGES made to truth files (state card + hooks pool + particle ledger), check for contradictions:
@@ -92,24 +133,24 @@ Given the chapter text, committed current truth, and the CHANGES made to truth f
 
 Output exactly one JSON object (legacy exact PASS is accepted only when there are no findings):
 {
-  "disposition": "PASS|CONTENT_REPAIR_REQUIRED|STATE_REPAIR_REQUIRED|NON_REPAIRABLE_OR_BUDGET_EXHAUSTED",
-  "stateRepairRequired": false,
-  "warnings": [{ "category": "typed_category", "description": "specific finding" }],
-  "proseAuthorityEvidence": {
-    "status": "PROVEN|AMBIGUOUS",
-    "currentProse": ["exact evidence from the current candidate"],
-    "committedAuthority": ["exact evidence from committed/current authority"]
-  }
+  "findings": [{
+    "kind": "PROSE_AUTHORITY_CONTRADICTION|STATE_PROJECTION_DEFECT|AMBIGUOUS|NON_REPAIRABLE",
+    "findingId": "stable-id",
+    "description": "specific finding",
+    "candidateAssertionId": "exact host-issued assertion id",
+    "committedRecordId": "exact id from the committed catalog"
+  }]
 }
 
 Routing semantics:
-- PASS: truth projection is complete enough and consistent with the chapter and committed authority.
-- CONTENT_REPAIR_REQUIRED: current prose itself contradicts committed/current authority without an explicitly narrated change. This disposition is valid only with status PROVEN and non-empty evidence on BOTH surfaces.
-- STATE_REPAIR_REQUIRED: prose is valid, but truth settlement is missing, stale, or incomplete. This includes unchanged truth or ledger omissions after the prose explicitly establishes a change.
-- NON_REPAIRABLE_OR_BUDGET_EXHAUSTED: evidence is missing, conflicting, ambiguous, or cannot prove whether prose or settlement is wrong.
-- Mixed content+state findings use CONTENT_REPAIR_REQUIRED with stateRepairRequired=true; content must be repaired first and state rebuilt later.
+- Return an empty findings array only when truth projection is complete enough and consistent with the chapter and committed authority.
+- PROSE_AUTHORITY_CONTRADICTION requires a host-issued CANDIDATE_ASSERTION id and the matching committed catalog record id. You cannot authorize repair with your own subject, predicate, relation, value, or quote fields.
+- STATE_PROJECTION_DEFECT means prose is valid but truth settlement is missing, stale, or incomplete. This includes unchanged truth or ledger omissions after prose establishes a change.
+- A host-issued EXPLICIT_TRANSITION assertion always routes to state repair, even if you label it a prose contradiction.
+- Use AMBIGUOUS or NON_REPAIRABLE whenever evidence is missing, stale, conflicting, lower-authority, or otherwise unprovable.
+- Keep each finding's kind independent in mixed results. Only verified PROSE_AUTHORITY_CONTRADICTION findings may reach prose revision.
 
-A legitimate authority change explicitly narrated in the current prose is not a contradiction merely because it differs from prior state. Never infer a content route from category words alone.`;
+A legitimate authority change explicitly narrated in the current prose is not a contradiction merely because it differs from prior state. Never infer a content route from description/category words. Source and tier come only from the host catalog; do not invent or override them.`;
 
     const authorityBlock = this.buildAuthorityContextBlock(authorityContext);
     const committedTruthBlock = [
@@ -123,20 +164,18 @@ A legitimate authority change explicitly narrated in the current prose is not a 
       "### Current Particle Ledger",
       ledgerContext?.oldLedger || "(empty)",
     ].join("\n");
-    const committedAuthoritySurface = [
-      oldState,
-      oldHooks,
-      ledgerContext?.oldLedger ?? "",
-      authorityContext?.storyFrame ?? "",
-      authorityContext?.bookRules ?? "",
-      authorityContext?.chapterSummaries ?? "",
-    ].join("\n");
+    const authorityCatalogBlock = renderCommittedAuthorityCatalog(authorityCatalog);
+    const candidateFactEvidenceBlock = renderCandidateFactEvidence(candidateFactEvidence);
 
     const userPrompt = `Chapter ${chapterNumber} validation:
 
 ${authorityBlock}
 
 ${committedTruthBlock}
+
+${authorityCatalogBlock}
+
+${candidateFactEvidenceBlock}
 
 ## State Card Changes
 ${stateDiff || "(no changes)"}
@@ -161,7 +200,7 @@ ${chapterContent}`;
 
       try {
         return {
-          ...this.parseResult(response.content, { currentProse: chapterContent, committedAuthority: committedAuthoritySurface }),
+          ...this.parseResult(response.content, { currentProse: chapterContent, authorityCatalog, candidateFactEvidence }),
           tokenUsage: response.usage,
         };
       } catch (semanticError) {
@@ -175,7 +214,7 @@ ${chapterContent}`;
           { temperature: 0.1 },
         );
         return {
-          ...this.parseResult(retryResponse.content, { currentProse: chapterContent, committedAuthority: committedAuthoritySurface }),
+          ...this.parseResult(retryResponse.content, { currentProse: chapterContent, authorityCatalog, candidateFactEvidence }),
           tokenUsage: {
             promptTokens: response.usage.promptTokens + retryResponse.usage.promptTokens,
             completionTokens: response.usage.completionTokens + retryResponse.usage.completionTokens,
@@ -233,7 +272,11 @@ ${chapterContent}`;
 
   private parseResult(
     content: string,
-    evidenceSurfaces: { readonly currentProse: string; readonly committedAuthority: string },
+    evidenceSurfaces: {
+      readonly currentProse: string;
+      readonly authorityCatalog: ReadonlyArray<CommittedAuthorityRecord>;
+      readonly candidateFactEvidence?: CandidateFactEvidence;
+    },
   ): ValidationResult {
     const trimmed = content.trim();
     if (!trimmed) {
@@ -251,19 +294,42 @@ ${chapterContent}`;
     }
 
     const verdictLine = lines[0]!;
-    if (!/^(PASS|REPAIR|FAIL)$/i.test(verdictLine)) {
+    if (verdictLine !== "PASS") {
+      if (verdictLine === "REPAIR" || verdictLine === "FAIL") {
+        throw new Error("State validator non-PASS result requires structured evidence");
+      }
       throw new Error("State validator returned invalid response");
     }
-    if (!/^PASS$/i.test(verdictLine)) {
-      throw new Error("State validator non-PASS result requires structured evidence");
-    }
     if (lines.length !== 1) throw new Error("State validator returned invalid response");
+    const candidateEvidenceIssues = validateCandidateFactEvidence(
+      evidenceSurfaces.currentProse,
+      evidenceSurfaces.authorityCatalog,
+      evidenceSurfaces.candidateFactEvidence,
+    );
+    if (candidateEvidenceIssues.length > 0) {
+      const findings = candidateEvidenceIssues.map((description, index) => ({
+        kind: "AMBIGUOUS" as const,
+        findingId: `candidate-evidence-invalid-${index + 1}`,
+        description,
+      }));
+      return {
+        warnings: findings.map((finding) => ({ category: finding.kind, description: finding.description })),
+        findings,
+        passed: false,
+        repairRequired: false,
+        disposition: "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED",
+      };
+    }
     return { warnings: [], passed: true, repairRequired: false, disposition: "PASS" };
   }
 
   private tryParseJsonResult(
     text: string,
-    evidenceSurfaces: { readonly currentProse: string; readonly committedAuthority: string },
+    evidenceSurfaces: {
+      readonly currentProse: string;
+      readonly authorityCatalog: ReadonlyArray<CommittedAuthorityRecord>;
+      readonly candidateFactEvidence?: CandidateFactEvidence;
+    },
   ): ValidationResult | null {
     const direct = this.tryParseExactJsonResult(text, evidenceSurfaces);
     if (direct) {
@@ -279,11 +345,16 @@ ${chapterContent}`;
 
   private tryParseExactJsonResult(
     text: string,
-    evidenceSurfaces: { readonly currentProse: string; readonly committedAuthority: string },
+    evidenceSurfaces: {
+      readonly currentProse: string;
+      readonly authorityCatalog: ReadonlyArray<CommittedAuthorityRecord>;
+      readonly candidateFactEvidence?: CandidateFactEvidence;
+    },
   ): ValidationResult | null {
     try {
       const parsed = JSON.parse(text) as {
-        warnings?: Array<{ category?: string; description?: string }>;
+        findings?: unknown;
+        warnings?: unknown;
         passed?: boolean;
         repairRequired?: boolean;
         disposition?: unknown;
@@ -294,51 +365,70 @@ ${chapterContent}`;
           committedAuthority?: unknown;
         };
       };
-      const warnings = (parsed.warnings ?? []).map((w) => ({
-        category: w.category ?? "unknown",
-        description: w.description ?? "",
-      }));
-      if (isValidationDisposition(parsed.disposition)) {
-        let disposition = parsed.disposition;
-        const canonicalPassed = disposition === "PASS";
-        const canonicalRepairRequired = disposition === "STATE_REPAIR_REQUIRED";
-        if ((parsed.passed !== undefined && parsed.passed !== canonicalPassed)
-          || (parsed.repairRequired !== undefined && parsed.repairRequired !== canonicalRepairRequired)
-          || (parsed.stateRepairRequired === true
-            && disposition !== "CONTENT_REPAIR_REQUIRED"
-            && disposition !== "STATE_REPAIR_REQUIRED")) {
+      if (Array.isArray(parsed.findings)) {
+        if (parsed.passed !== undefined || parsed.repairRequired !== undefined
+          || parsed.stateRepairRequired !== undefined || parsed.proseAuthorityEvidence !== undefined
+          || (parsed.warnings !== undefined && !Array.isArray(parsed.warnings))) {
           return null;
         }
-        const rawEvidence = parsed.proseAuthorityEvidence;
-        const currentProse = Array.isArray(rawEvidence?.currentProse)
-          ? rawEvidence.currentProse.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
-          : [];
-        const committedAuthority = Array.isArray(rawEvidence?.committedAuthority)
-          ? rawEvidence.committedAuthority.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
-          : [];
-        const proseAuthorityEvidence: ProseAuthorityEvidence | undefined = rawEvidence
-          && (rawEvidence.status === "PROVEN" || rawEvidence.status === "AMBIGUOUS")
-          ? { status: rawEvidence.status, currentProse, committedAuthority }
-          : undefined;
-        const evidenceHostVerified = proseAuthorityEvidence?.status === "PROVEN"
-          && proseAuthorityEvidence.currentProse.length > 0
-          && proseAuthorityEvidence.committedAuthority.length > 0
-          && proseAuthorityEvidence.currentProse.every((quote) => evidenceOccursInSurface(quote, evidenceSurfaces.currentProse))
-          && proseAuthorityEvidence.committedAuthority.every((quote) => evidenceOccursInSurface(quote, evidenceSurfaces.committedAuthority))
-          && !hasConflictingEvidence(proseAuthorityEvidence);
-        if (disposition === "CONTENT_REPAIR_REQUIRED" && !evidenceHostVerified) {
-          disposition = "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED";
-        }
-        const verifiedEvidence = proseAuthorityEvidence && !evidenceHostVerified
-          ? { ...proseAuthorityEvidence, status: "AMBIGUOUS" as const }
-          : proseAuthorityEvidence;
+        const candidateEvidenceIssues = validateCandidateFactEvidence(
+          evidenceSurfaces.currentProse,
+          evidenceSurfaces.authorityCatalog,
+          evidenceSurfaces.candidateFactEvidence,
+        );
+        const verifiedFindings = parsed.findings.map((finding, index) => verifyValidationFinding(
+          finding,
+          index,
+          evidenceSurfaces.authorityCatalog,
+          evidenceSurfaces.candidateFactEvidence,
+          candidateEvidenceIssues.length === 0,
+        ));
+        const compatibilityWarnings = verifiedFindings.map((finding) => ({
+          category: finding.kind,
+          description: finding.description,
+        }));
+        const rawWarnings = (parsed.warnings ?? []) as ReadonlyArray<unknown>;
+        const warningsMismatch = rawWarnings.length > 0
+          && !warningsExactlyMatch(rawWarnings, compatibilityWarnings);
+        const findings = [
+          ...verifiedFindings,
+          ...(parsed.disposition === undefined ? [] : [{
+              kind: "AMBIGUOUS" as const,
+              findingId: "result-wide-routing-not-authoritative",
+              description: "Result-wide disposition cannot replace host-provable per-finding evidence.",
+            }]),
+          ...(warningsMismatch ? [{
+              kind: "AMBIGUOUS" as const,
+              findingId: "warnings-compatibility-mismatch",
+              description: "Raw warnings do not match the host-derived compatibility projection.",
+            }] : []),
+          ...candidateEvidenceIssues.map((issue, index) => ({
+            kind: "AMBIGUOUS" as const,
+            findingId: `candidate-evidence-invalid-${index + 1}`,
+            description: issue,
+          })),
+        ];
+        const disposition = deriveValidationDisposition(findings);
+        const proseFindings = findings.filter((finding) => finding.kind === "PROSE_AUTHORITY_CONTRADICTION");
+        const stateRepairRequired = disposition === "CONTENT_REPAIR_REQUIRED"
+          && findings.some((finding) => finding.kind === "STATE_PROJECTION_DEFECT");
+        const proseAuthorityEvidence: ProseAuthorityEvidence | undefined = proseFindings.length > 0
+          ? {
+              status: "PROVEN",
+              currentProse: proseFindings.map((finding) => finding.candidate!.quote),
+              committedAuthority: proseFindings.map((finding) => finding.committed!.quote),
+            }
+          : findings.some((finding) => finding.kind === "AMBIGUOUS")
+            ? { status: "AMBIGUOUS", currentProse: [], committedAuthority: [] }
+            : undefined;
         return {
-          warnings,
+          findings,
+          warnings: findings.map((finding) => ({ category: finding.kind, description: finding.description })),
           passed: disposition === "PASS",
           repairRequired: disposition === "STATE_REPAIR_REQUIRED",
           disposition,
-          ...(parsed.stateRepairRequired === true ? { stateRepairRequired: true } : {}),
-          ...(verifiedEvidence ? { proseAuthorityEvidence: verifiedEvidence } : {}),
+          ...(stateRepairRequired ? { stateRepairRequired: true } : {}),
+          ...(proseAuthorityEvidence ? { proseAuthorityEvidence } : {}),
         };
       }
       return null;
@@ -346,13 +436,6 @@ ${chapterContent}`;
       return null;
     }
   }
-}
-
-function isValidationDisposition(value: unknown): value is ValidationDisposition {
-  return value === "PASS"
-    || value === "CONTENT_REPAIR_REQUIRED"
-    || value === "STATE_REPAIR_REQUIRED"
-    || value === "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED";
 }
 
 function normalizeEvidenceText(value: string): string {
@@ -365,9 +448,314 @@ function evidenceOccursInSurface(evidence: string, surface: string): boolean {
     && normalizeEvidenceText(surface).includes(normalizedEvidence);
 }
 
-function hasConflictingEvidence(evidence: ProseAuthorityEvidence): boolean {
-  const current = new Set(evidence.currentProse.map(normalizeEvidenceText));
-  return evidence.committedAuthority.some((item) => current.has(normalizeEvidenceText(item)));
+function warningsExactlyMatch(
+  rawWarnings: ReadonlyArray<unknown>,
+  expectedWarnings: ReadonlyArray<ValidationWarning>,
+): boolean {
+  return rawWarnings.length === expectedWarnings.length
+    && rawWarnings.every((raw, index) => {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+      const warning = raw as Record<string, unknown>;
+      const keys = Object.keys(warning).sort();
+      return keys.length === 2
+        && keys[0] === "category"
+        && keys[1] === "description"
+        && warning.category === expectedWarnings[index]?.category
+        && warning.description === expectedWarnings[index]?.description;
+    });
+}
+
+function stateFactKey(subject: string, predicate: string): string {
+  return `state:${normalizeEvidenceText(subject)}::${normalizeEvidenceText(predicate)}`;
+}
+
+function hookFactKey(hookId: string, field: string): string {
+  return `hook:${normalizeEvidenceText(hookId)}::${normalizeEvidenceText(field)}`;
+}
+
+export function buildCommittedAuthorityCatalog(
+  oldState: string,
+  oldHooks: string,
+  chapterNumber: number,
+): ReadonlyArray<CommittedAuthorityRecord> {
+  const draft: CommittedAuthorityRecord[] = [];
+  for (const fact of parseCurrentStateFacts(oldState, Math.max(0, chapterNumber - 1))) {
+    const factKey = stateFactKey(fact.subject, fact.predicate);
+    draft.push({
+      recordId: factKey,
+      factKey,
+      source: "current_state",
+      tier: "COMMITTED_RUNTIME_CURRENT_STATE",
+      priority: 200,
+      value: String(fact.object),
+      sourceSurface: oldState,
+    });
+  }
+  for (const hook of parsePendingHooksMarkdown(oldHooks)) {
+    for (const [field, rawValue] of Object.entries(hook)) {
+      if (rawValue === undefined || rawValue === null || typeof rawValue === "object") continue;
+      const value = String(rawValue);
+      if (!value.trim()) continue;
+      const factKey = hookFactKey(hook.hookId, field);
+      draft.push({
+        recordId: factKey,
+        factKey,
+        source: "pending_hooks",
+        tier: "COMMITTED_RUNTIME_PENDING_HOOKS",
+        priority: 200,
+        value,
+        sourceSurface: oldHooks,
+      });
+    }
+  }
+  const occurrences = new Map<string, number>();
+  const totals = new Map<string, number>();
+  for (const record of draft) totals.set(record.factKey, (totals.get(record.factKey) ?? 0) + 1);
+  return draft.map((record) => {
+    if ((totals.get(record.factKey) ?? 0) === 1) return record;
+    const occurrence = (occurrences.get(record.factKey) ?? 0) + 1;
+    occurrences.set(record.factKey, occurrence);
+    return { ...record, recordId: `${record.factKey}#${occurrence}` };
+  });
+}
+
+export function renderCommittedAuthorityCatalog(catalog: ReadonlyArray<CommittedAuthorityRecord>): string {
+  return [
+    "## Host Committed Runtime Authority Catalog",
+    "Only these structured records may authorize prose repair. Context prose outside this catalog is non-authorizing.",
+    JSON.stringify(catalog.map(({ recordId, factKey, source, tier, value }) => ({
+      recordId, factKey, source, tier, value,
+    })), null, 2),
+  ].join("\n");
+}
+
+export function renderCandidateFactEvidence(evidence?: CandidateFactEvidence): string {
+  return [
+    "## Host-Bound Candidate Fact Evidence",
+    "Only these host-issued assertion ids may authorize prose repair. Validator-supplied fact fields are non-authorizing.",
+    JSON.stringify(evidence ?? { candidateSha256: null, assertions: [], issues: [] }, null, 2),
+  ].join("\n");
+}
+
+function candidateAssertionIdentity(assertion: Omit<CandidateFactAssertion, "assertionId">): string {
+  return [
+    assertion.kind,
+    assertion.candidateSha256,
+    assertion.recordId,
+    assertion.factKey,
+    String(assertion.startUtf16),
+    String(assertion.endUtf16),
+    normalizeEvidenceText(assertion.value),
+    normalizeEvidenceText(assertion.fromValue ?? ""),
+  ].join("\0");
+}
+
+function deriveCandidateAssertionId(assertion: Omit<CandidateFactAssertion, "assertionId">): string {
+  return createHash("sha256").update(candidateAssertionIdentity(assertion)).digest("hex");
+}
+
+function uniqueHighestRecord(
+  catalog: ReadonlyArray<CommittedAuthorityRecord>,
+  record: CommittedAuthorityRecord,
+): boolean {
+  const recordsForKey = catalog.filter((item) => item.factKey === record.factKey);
+  const highestPriority = Math.max(-1, ...recordsForKey.map((item) => item.priority));
+  const highestRecords = recordsForKey.filter((item) => item.priority === highestPriority);
+  return highestRecords.length === 1 && highestRecords[0]?.recordId === record.recordId;
+}
+
+export function bindCandidateFactEvidence(
+  candidateContent: string,
+  catalog: ReadonlyArray<CommittedAuthorityRecord>,
+  rawEvidence: unknown,
+): CandidateFactEvidence {
+  const candidateSha256 = createHash("sha256").update(candidateContent).digest("hex");
+  if (rawEvidence === undefined) return { candidateSha256, assertions: [], issues: [] };
+  if (!Array.isArray(rawEvidence)) {
+    return { candidateSha256, assertions: [], issues: ["Candidate fact evidence section must be a JSON array."] };
+  }
+
+  const assertions: CandidateFactAssertion[] = [];
+  const issues: string[] = [];
+  for (const [index, raw] of rawEvidence.entries()) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      issues.push(`Candidate evidence ${index + 1} is not an object.`);
+      continue;
+    }
+    const value = raw as Record<string, unknown>;
+    const kind = value.kind;
+    const recordId = nonEmptyString(value.recordId);
+    const candidateValue = nonEmptyString(value.value);
+    const quote = nonEmptyString(value.quote);
+    const fromValue = nonEmptyString(value.fromValue);
+    const startUtf16 = value.startUtf16;
+    const endUtf16 = value.endUtf16;
+    const record = recordId ? catalog.find((item) => item.recordId === recordId) : undefined;
+    if ((kind !== "CANDIDATE_ASSERTION" && kind !== "EXPLICIT_TRANSITION")
+      || !record || !uniqueHighestRecord(catalog, record) || !candidateValue || !quote
+      || !Number.isInteger(startUtf16) || !Number.isInteger(endUtf16)
+      || (startUtf16 as number) < 0 || (endUtf16 as number) > candidateContent.length
+      || (startUtf16 as number) >= (endUtf16 as number)
+      || candidateContent.slice(startUtf16 as number, endUtf16 as number) !== quote
+      || !evidenceOccursInSurface(candidateValue, quote)
+      || normalizeEvidenceText(candidateValue) === normalizeEvidenceText(record.value)
+      || (kind === "EXPLICIT_TRANSITION"
+        && (!fromValue
+          || normalizeEvidenceText(fromValue) !== normalizeEvidenceText(record.value)
+          || !evidenceOccursInSurface(fromValue, quote)))) {
+      issues.push(`Candidate evidence ${index + 1} is not host-bindable.`);
+      continue;
+    }
+    const assertionWithoutId: Omit<CandidateFactAssertion, "assertionId"> = {
+      kind,
+      candidateSha256,
+      recordId: record.recordId,
+      factKey: record.factKey,
+      value: candidateValue,
+      quote,
+      startUtf16: startUtf16 as number,
+      endUtf16: endUtf16 as number,
+      ...(kind === "EXPLICIT_TRANSITION" ? { fromValue } : {}),
+    };
+    assertions.push({
+      ...assertionWithoutId,
+      assertionId: deriveCandidateAssertionId(assertionWithoutId),
+    });
+  }
+  const bound = { candidateSha256, assertions, issues };
+  return {
+    ...bound,
+    issues: validateCandidateFactEvidence(candidateContent, catalog, bound),
+  };
+}
+
+function validateCandidateFactEvidence(
+  candidateContent: string,
+  catalog: ReadonlyArray<CommittedAuthorityRecord>,
+  evidence?: CandidateFactEvidence,
+): ReadonlyArray<string> {
+  if (!evidence) return [];
+  const expectedSha = createHash("sha256").update(candidateContent).digest("hex");
+  const issues = [...evidence.issues];
+  if (evidence.candidateSha256 !== expectedSha) issues.push("Candidate evidence SHA does not match final content.");
+  const seenIds = new Set<string>();
+  const seenRecords = new Set<string>();
+  for (const assertion of evidence.assertions) {
+    const record = catalog.find((item) => item.recordId === assertion.recordId);
+    const assertionWithoutId: Omit<CandidateFactAssertion, "assertionId"> = {
+      kind: assertion.kind,
+      candidateSha256: assertion.candidateSha256,
+      recordId: assertion.recordId,
+      factKey: assertion.factKey,
+      value: assertion.value,
+      quote: assertion.quote,
+      startUtf16: assertion.startUtf16,
+      endUtf16: assertion.endUtf16,
+      ...(assertion.fromValue !== undefined ? { fromValue: assertion.fromValue } : {}),
+    };
+    const valid = record !== undefined
+      && uniqueHighestRecord(catalog, record)
+      && assertion.candidateSha256 === expectedSha
+      && assertion.factKey === record.factKey
+      && assertion.assertionId === deriveCandidateAssertionId(assertionWithoutId)
+      && Number.isInteger(assertion.startUtf16)
+      && Number.isInteger(assertion.endUtf16)
+      && assertion.startUtf16 >= 0
+      && assertion.endUtf16 <= candidateContent.length
+      && assertion.startUtf16 < assertion.endUtf16
+      && candidateContent.slice(assertion.startUtf16, assertion.endUtf16) === assertion.quote
+      && evidenceOccursInSurface(assertion.value, assertion.quote)
+      && normalizeEvidenceText(assertion.value) !== normalizeEvidenceText(record.value)
+      && (assertion.kind !== "EXPLICIT_TRANSITION"
+        || (assertion.fromValue !== undefined
+          && normalizeEvidenceText(assertion.fromValue) === normalizeEvidenceText(record.value)
+          && evidenceOccursInSurface(assertion.fromValue, assertion.quote)));
+    if (!valid) issues.push(`Candidate assertion ${assertion.assertionId} failed host verification.`);
+    if (seenIds.has(assertion.assertionId)) issues.push(`Duplicate candidate assertion id ${assertion.assertionId}.`);
+    if (seenRecords.has(assertion.recordId)) issues.push(`Duplicate or conflicting candidate assertions for ${assertion.recordId}.`);
+    seenIds.add(assertion.assertionId);
+    seenRecords.add(assertion.recordId);
+  }
+  return [...new Set(issues)];
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function ambiguousFinding(raw: unknown, index: number): ValidationFinding {
+  const candidate = raw && typeof raw === "object" ? raw as Record<string, unknown> : undefined;
+  const findingId = nonEmptyString(candidate?.findingId) ?? `unprovable-finding-${index + 1}`;
+  const description = nonEmptyString(candidate?.description) ?? `Validation finding ${findingId} is not host-provable.`;
+  return { kind: "AMBIGUOUS", findingId, description };
+}
+
+function verifyValidationFinding(
+  raw: unknown,
+  index: number,
+  catalog: ReadonlyArray<CommittedAuthorityRecord>,
+  candidateFactEvidence: CandidateFactEvidence | undefined,
+  candidateEvidenceValid: boolean,
+): ValidationFinding {
+  if (!raw || typeof raw !== "object") return ambiguousFinding(raw, index);
+  const value = raw as Record<string, unknown>;
+  const kind = value.kind;
+  const findingId = nonEmptyString(value.findingId);
+  const description = nonEmptyString(value.description);
+  if (!findingId || !description) return ambiguousFinding(raw, index);
+  if (kind === "STATE_PROJECTION_DEFECT" || kind === "AMBIGUOUS" || kind === "NON_REPAIRABLE") {
+    return { kind, findingId, description };
+  }
+  if (kind !== "PROSE_AUTHORITY_CONTRADICTION") return ambiguousFinding(raw, index);
+  const candidateAssertionId = nonEmptyString(value.candidateAssertionId);
+  const committedRecordId = nonEmptyString(value.committedRecordId);
+  if (!candidateAssertionId || !committedRecordId || !candidateEvidenceValid) return ambiguousFinding(raw, index);
+  const assertion = candidateFactEvidence?.assertions.find((item) => item.assertionId === candidateAssertionId);
+  const record = catalog.find((item) => item.recordId === committedRecordId);
+  if (!assertion || !record
+    || assertion.recordId !== record.recordId
+    || assertion.factKey !== record.factKey
+    || !uniqueHighestRecord(catalog, record)
+    || normalizeEvidenceText(assertion.value) === normalizeEvidenceText(record.value)) {
+    return ambiguousFinding(raw, index);
+  }
+  if (assertion.kind === "EXPLICIT_TRANSITION") {
+    return { kind: "STATE_PROJECTION_DEFECT", findingId, description };
+  }
+  const factParts = record.factKey.split("::");
+  const subject = factParts[0]?.replace(/^(state|hook):/u, "") ?? record.factKey;
+  const predicate = factParts.slice(1).join("::") || record.factKey;
+  return {
+    kind: "PROSE_AUTHORITY_CONTRADICTION",
+    findingId,
+    description,
+    factKey: record.factKey,
+    relation: "CONFLICTING_VALUES",
+    candidate: {
+      subject,
+      predicate,
+      value: assertion.value,
+      quote: assertion.quote,
+    },
+    committed: {
+      recordId: record.recordId,
+      value: record.value,
+      quote: record.value,
+    },
+  };
+}
+
+function deriveValidationDisposition(findings: ReadonlyArray<ValidationFinding>): ValidationDisposition {
+  if (findings.some((finding) => finding.kind === "AMBIGUOUS" || finding.kind === "NON_REPAIRABLE")) {
+    return "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED";
+  }
+  if (findings.some((finding) => finding.kind === "PROSE_AUTHORITY_CONTRADICTION")) {
+    return "CONTENT_REPAIR_REQUIRED";
+  }
+  if (findings.some((finding) => finding.kind === "STATE_PROJECTION_DEFECT")) {
+    return "STATE_REPAIR_REQUIRED";
+  }
+  return "PASS";
 }
 
 function extractBalancedJsonObject(text: string): string | null {

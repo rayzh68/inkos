@@ -1,6 +1,6 @@
 import { BaseAgent } from "./base.js";
 import type { BookConfig } from "../models/book.js";
-import type { TokenUsage } from "./writer.js";
+import type { CandidateFactEvidence, TokenUsage } from "./writer.js";
 import type { GenreProfile } from "../models/genre-profile.js";
 import type { ContextPackage, RuleStack } from "../models/input-governance.js";
 import { readGenreProfile, readBookRules } from "./rules-reader.js";
@@ -21,6 +21,11 @@ import {
   readCharacterContext,
   readCurrentStateWithFallback,
 } from "../utils/outline-paths.js";
+import {
+  bindCandidateFactEvidence,
+  buildCommittedAuthorityCatalog,
+  renderCommittedAuthorityCatalog,
+} from "./state-validator.js";
 
 export interface AnalyzeChapterInput {
   readonly book: BookConfig;
@@ -37,7 +42,9 @@ export interface AnalyzeChapterInput {
   };
 }
 
-export type AnalyzeChapterOutput = ParsedWriterOutput;
+export type AnalyzeChapterOutput = ParsedWriterOutput & {
+  readonly candidateFactEvidence: CandidateFactEvidence;
+};
 
 export class ChapterAnalyzerAgent extends BaseAgent {
   get name(): string {
@@ -113,15 +120,20 @@ export class ChapterAnalyzerAgent extends BaseAgent {
       ? this.buildReducedControlBlock(input.chapterIntent, input.contextPackage, input.ruleStack, resolvedLanguage)
       : "";
 
-    const systemPrompt = this.buildSystemPrompt(
+    const authorityCatalog = buildCommittedAuthorityCatalog(currentState, hooksWorkingSet, chapterNumber);
+    const systemPrompt = `${this.buildSystemPrompt(
       book,
       genreProfile,
       genreBody,
       bookRulesBody,
       resolvedLanguage,
-    );
+    )}
 
-    const userPrompt = this.buildUserPrompt({
+## Candidate Fact Evidence
+
+After all normal output sections, emit exactly one optional section named === CANDIDATE_FACT_EVIDENCE === containing a JSON array. Each item may reference only a recordId from the host catalog and must contain kind (CANDIDATE_ASSERTION or EXPLICIT_TRANSITION), recordId, value, exact quote, startUtf16, endUtf16, and fromValue for transitions. UTF-16 offsets are zero-based [start,end) offsets into the exact supplied chapter content. Use [] when there are no relevant assertions. Do not emit factKey or assertionId; the host derives them.`;
+
+    const userPrompt = `${this.buildUserPrompt({
       language: resolvedLanguage,
       chapterNumber,
       chapterContent,
@@ -177,7 +189,9 @@ export class ChapterAnalyzerAgent extends BaseAgent {
           ? `\n## Current Character Matrix\n${matrixWorkingSet}\n`
           : `\n## 当前角色交互矩阵\n${matrixWorkingSet}\n`
         : "",
-    });
+    })}
+
+${renderCommittedAuthorityCatalog(authorityCatalog)}`;
 
     const messages = [
       { role: "system" as const, content: systemPrompt },
@@ -207,6 +221,7 @@ export class ChapterAnalyzerAgent extends BaseAgent {
     });
     let output: ParsedWriterOutput;
     let tokenUsage = response.usage;
+    let semanticContent = response.content;
     try {
       output = parseSemanticOutput(response.content);
     } catch (semanticError) {
@@ -220,10 +235,16 @@ export class ChapterAnalyzerAgent extends BaseAgent {
         { temperature: 0.3 },
       );
       tokenUsage = addUsage(tokenUsage, retryResponse.usage);
+      semanticContent = retryResponse.content;
       output = parseSemanticOutput(retryResponse.content);
     }
     const canonicalContent = chapterContent;
     const canonicalWordCount = countChapterLength(canonicalContent, countingMode);
+    const candidateFactEvidence = bindCandidateFactEvidence(
+      canonicalContent,
+      authorityCatalog,
+      extractCandidateFactEvidenceSection(semanticContent),
+    );
 
     // If LLM didn't return a title, use the one from input or derive from chapter number
     if (
@@ -238,6 +259,7 @@ export class ChapterAnalyzerAgent extends BaseAgent {
         title: chapterTitle,
         content: canonicalContent,
         wordCount: canonicalWordCount,
+        candidateFactEvidence,
         tokenUsage,
       };
     }
@@ -246,6 +268,7 @@ export class ChapterAnalyzerAgent extends BaseAgent {
       ...output,
       content: canonicalContent,
       wordCount: canonicalWordCount,
+      candidateFactEvidence,
       tokenUsage,
     };
   }
@@ -670,5 +693,20 @@ ${overrides}\n`;
 
   private defaultChapterTitle(chapterNumber: number, language: "zh" | "en"): string {
     return language === "en" ? `Chapter ${chapterNumber}` : `第${chapterNumber}章`;
+  }
+}
+
+function extractCandidateFactEvidenceSection(content: string): unknown {
+  const marker = "=== CANDIDATE_FACT_EVIDENCE ===";
+  const markerIndex = content.indexOf(marker);
+  if (markerIndex < 0) return undefined;
+  const afterMarker = content.slice(markerIndex + marker.length);
+  const nextSection = afterMarker.search(/\n=== [A-Z_]+ ===/u);
+  const body = (nextSection >= 0 ? afterMarker.slice(0, nextSection) : afterMarker).trim();
+  if (!body) return [];
+  try {
+    return JSON.parse(body) as unknown;
+  } catch {
+    return body;
   }
 }

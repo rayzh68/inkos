@@ -68,6 +68,11 @@ const BOOK: BookConfig = {
 
 describe("validateChapterTruthPersistence", () => {
   it("preserves verified actual cost for one extractor and one validator call", async () => {
+    const candidateFactEvidence = {
+      candidateSha256: "a".repeat(64),
+      assertions: [],
+      issues: [],
+    };
     const validate = vi.fn().mockResolvedValue(createValidationResult({
       tokenUsage: { promptTokens: 3, completionTokens: 4, totalTokens: 7, actualCostUsd: 0.02 },
     }));
@@ -77,6 +82,7 @@ describe("validateChapterTruthPersistence", () => {
       book: BOOK, bookDir: "/tmp/book", chapterNumber: 2, title: "Known costs", content: "Body.",
       persistenceOutput: createWriterOutput({
         tokenUsage: { promptTokens: 1, completionTokens: 2, totalTokens: 3, actualCostUsd: 0.01 },
+        candidateFactEvidence,
       }),
       auditResult: createAuditResult(),
       previousTruth: { oldState: "old", oldHooks: "old hooks", oldLedger: "old ledger" },
@@ -89,6 +95,7 @@ describe("validateChapterTruthPersistence", () => {
     expect(validate).toHaveBeenCalledWith(
       "Body.", 2, "old", "writer state", "old hooks", "writer hooks", "en", undefined, undefined,
       { oldLedger: "old ledger", newLedger: "writer ledger" },
+      candidateFactEvidence,
     );
   });
 

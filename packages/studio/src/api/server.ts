@@ -3096,6 +3096,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         bookId,
         jobId,
         getActiveStage: () => activeStage,
+        assertModelCallAdmission: () => autonomousJobs.assertStageAdmission(bookId),
       });
       if (!recoveringProviderWait) {
         await saveAutonomousRuntime(root, bookId, {

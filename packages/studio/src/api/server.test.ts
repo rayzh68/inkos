@@ -40,6 +40,7 @@ const chatCompletionMock = vi.fn();
 const runWorkerAgentMock = vi.fn();
 const loadProjectConfigMock = vi.fn();
 const pipelineConfigs: unknown[] = [];
+const providerExecutionConfigs: unknown[] = [];
 const pipelineAbortSignals: Array<AbortSignal | undefined> = [];
 const processProjectInteractionRequestMock = vi.fn();
 const createInteractionToolsFromDepsMock = vi.fn(() => ({}));
@@ -354,7 +355,10 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
     inspectChapterAuthority: actual.inspectChapterAuthority,
     isChapterTransactionEnabled: actual.isChapterTransactionEnabled,
     reconcileChapterProjections: actual.reconcileChapterProjections,
-    createAutonomousProviderExecution: actual.createAutonomousProviderExecution,
+    createAutonomousProviderExecution: (params: Parameters<typeof actual.createAutonomousProviderExecution>[0]) => {
+      providerExecutionConfigs.push(params);
+      return actual.createAutonomousProviderExecution(params);
+    },
     createChapterGenesis: actual.createChapterGenesis,
     beginChapterTransaction: actual.beginChapterTransaction,
     abandonChapterTransactionAttempt: actual.abandonChapterTransactionAttempt,
@@ -747,6 +751,7 @@ describe("createStudioServer daemon lifecycle", () => {
       discarded: [3],
     });
     pipelineConfigs.length = 0;
+    providerExecutionConfigs.length = 0;
     pipelineAbortSignals.length = 0;
     runAgentSessionMock.mockReset();
     abortAgentSessionMock.mockReset();
@@ -6755,7 +6760,7 @@ describe("createStudioServer daemon lifecycle", () => {
     expect(chapters.find((chapter) => chapter.number === 4)?.status).toBe("approved");
   });
 
-  it("allows provider-less APPROVED finalization after Stop and pauses at the committed next cursor", async () => {
+  it("routes an active-job Stop through the real model-call admission gate with no phantom transport or evidence", async () => {
     const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
     raw.llm = { ...raw.llm, service: "openrouter", defaultModel: "openai/gpt", model: "openai/gpt", services: [{ service: "openrouter" }] };
     raw.productionRoles = { production: "openai/gpt", review: "deepseek/chat", reader: "google/gemini" };
@@ -6779,6 +6784,12 @@ describe("createStudioServer daemon lifecycle", () => {
     loadChapterIndexMock.mockImplementation(async () => chapters);
     saveChapterIndexMock.mockImplementation(async (_bookId, updated) => { chapters = [...updated]; });
     let requestStop!: () => Promise<void>;
+    const actualCore = await vi.importActual<typeof import("@actalk/inkos-core")>("@actalk/inkos-core");
+    const transport = vi.fn(async () => new Response(JSON.stringify({
+      choices: [{ message: { content: "must not run" } }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    vi.stubGlobal("fetch", transport);
     writeNextChapterMock.mockImplementationOnce(async () => {
       const onAutonomousStage = (pipelineConfigs.at(-1) as {
         onAutonomousStage: (event: {
@@ -6788,15 +6799,14 @@ describe("createStudioServer daemon lifecycle", () => {
       await onAutonomousStage({
         stage: "WRITING", role: "writer", provider: "openrouter", model: "openai/gpt", transactionId: "txn-5",
       });
-      chapters = [...chapters, {
-        number: 5, title: "Chapter 5", status: "ready-for-review", wordCount: 1, auditIssues: [], lengthWarnings: [],
-      }];
-      nextChapter = 6;
       await requestStop();
-      await onAutonomousStage({
-        stage: "APPROVED", role: "state-manager", provider: null, model: null, transactionId: "txn-5",
-      });
-      return { chapterNumber: 5, status: "ready-for-review" };
+      const deniedClient = {
+        provider: "openai", service: "custom", configSource: "studio", apiFormat: "chat", stream: false,
+        _apiKey: "test-only", _piModel: { id: "openai/gpt", name: "openai/gpt", api: "openai-completions", provider: "openai", baseUrl: "https://transport.invalid/v1" },
+        defaults: { temperature: 0.7, maxTokens: 256, thinkingBudget: 0, extra: {} },
+      } as unknown as Parameters<typeof actualCore.chatCompletion>[0];
+      await actualCore.chatCompletion(deniedClient, "openai/gpt", [{ role: "user", content: "denied after stop" }]);
+      throw new Error("UNREACHABLE_AFTER_STOP_DENIAL");
     });
 
     const { createStudioServer } = await import("./server.js");
@@ -6813,9 +6823,17 @@ describe("createStudioServer daemon lifecycle", () => {
     const runtimePath = join(root, "books", "demo-book", "story", "runtime", "bounded-autonomous", "production-state.json");
     await vi.waitFor(async () => {
       const runtime = JSON.parse(await readFile(runtimePath, "utf-8"));
-      expect(runtime).toMatchObject({ status: "PAUSED_BY_USER", nextChapter: 6 });
+      expect(runtime).toMatchObject({ status: "PAUSED_BY_USER", nextChapter: 5 });
+      expect(runtime.providerAttemptHistory ?? []).toEqual([]);
+    });
+    expect(transport).not.toHaveBeenCalled();
+    const runtimeDir = join(root, "books", "demo-book", "story", "runtime", "bounded-autonomous");
+    await vi.waitFor(async () => {
+      await expect(access(join(runtimeDir, "active-job.json"))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(access(join(runtimeDir, "provider-responses"))).rejects.toMatchObject({ code: "ENOENT" });
     });
     expect(writeNextChapterMock).toHaveBeenCalledTimes(1);
+    vi.unstubAllGlobals();
   });
 
   it("preserves rebaseline ownership and blocks a third attempt after double state validation failure", async () => {

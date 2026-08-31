@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
 import { StateValidatorAgent } from "../agents/state-validator.js";
 
 const ZERO_USAGE = {
@@ -6,6 +7,44 @@ const ZERO_USAGE = {
   completionTokens: 0,
   totalTokens: 0,
 } as const;
+
+function candidateEvidence(
+  content: string,
+  assertions: ReadonlyArray<{
+    kind: "CANDIDATE_ASSERTION" | "EXPLICIT_TRANSITION";
+    recordId: string;
+    factKey: string;
+    value: string;
+    quote: string;
+    startUtf16?: number;
+    endUtf16?: number;
+    fromValue?: string;
+  }>,
+) {
+  const candidateSha256 = createHash("sha256").update(content).digest("hex");
+  const bound = assertions.map((assertion) => {
+    const startUtf16 = assertion.startUtf16 ?? content.indexOf(assertion.quote);
+    const endUtf16 = assertion.endUtf16 ?? startUtf16 + assertion.quote.length;
+    const identity = [
+      assertion.kind,
+      candidateSha256,
+      assertion.recordId,
+      assertion.factKey,
+      String(startUtf16),
+      String(endUtf16),
+      assertion.value.trim().replace(/\s+/gu, " ").toLocaleLowerCase(),
+      (assertion.fromValue ?? "").trim().replace(/\s+/gu, " ").toLocaleLowerCase(),
+    ].join("\0");
+    return {
+      ...assertion,
+      startUtf16,
+      endUtf16,
+      candidateSha256,
+      assertionId: createHash("sha256").update(identity).digest("hex"),
+    };
+  });
+  return { candidateSha256, assertions: bound, issues: [] as string[] };
+}
 
 describe("StateValidatorAgent", () => {
   afterEach(() => {
@@ -77,7 +116,7 @@ describe("StateValidatorAgent", () => {
     vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
       .mockResolvedValue({
         content: [
-          "{\"disposition\":\"PASS\",\"warnings\":[]}",
+          "{\"findings\":[]}",
           "",
           "## Notes",
           "Trailing markdown can still mention braces like } without changing the verdict.",
@@ -94,6 +133,7 @@ describe("StateValidatorAgent", () => {
       "new hooks",
       "en",
     )).resolves.toEqual({
+      findings: [],
       warnings: [],
       passed: true,
       repairRequired: false,
@@ -116,8 +156,11 @@ describe("StateValidatorAgent", () => {
     vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
       .mockResolvedValue({
         content: JSON.stringify({
-          disposition: "STATE_REPAIR_REQUIRED",
-          warnings: [{ category: "missing_state_update", description: "角色已到码头，但状态卡仍在车站" }],
+          findings: [{
+            kind: "STATE_PROJECTION_DEFECT",
+            findingId: "missing-location-update",
+            description: "角色已到码头，但状态卡仍在车站",
+          }],
         }),
         usage: ZERO_USAGE,
       });
@@ -134,8 +177,13 @@ describe("StateValidatorAgent", () => {
       repairRequired: true,
       disposition: "STATE_REPAIR_REQUIRED",
       tokenUsage: ZERO_USAGE,
+      findings: [{
+        kind: "STATE_PROJECTION_DEFECT",
+        findingId: "missing-location-update",
+        description: "角色已到码头，但状态卡仍在车站",
+      }],
       warnings: [{
-        category: "missing_state_update",
+        category: "STATE_PROJECTION_DEFECT",
         description: "角色已到码头，但状态卡仍在车站",
       }],
     });
@@ -153,8 +201,11 @@ describe("StateValidatorAgent", () => {
     const chat = vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
       .mockResolvedValue({
         content: JSON.stringify({
-          disposition: "STATE_REPAIR_REQUIRED",
-          warnings: [{ category: "missing_state_update", description: "The chapter advances H1, but every truth surface is unchanged." }],
+          findings: [{
+            kind: "STATE_PROJECTION_DEFECT",
+            findingId: "missing-hook-update",
+            description: "The chapter advances H1, but every truth surface is unchanged.",
+          }],
         }),
         usage: ZERO_USAGE,
       });
@@ -183,7 +234,7 @@ describe("StateValidatorAgent", () => {
       projectRoot: process.cwd(),
     });
     const chat = vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
-      .mockResolvedValue({ content: JSON.stringify({ disposition: "PASS", warnings: [] }), usage: ZERO_USAGE });
+      .mockResolvedValue({ content: JSON.stringify({ findings: [] }), usage: ZERO_USAGE });
 
     await agent.validate(
       "The chapter advances H1.", 10,
@@ -199,6 +250,12 @@ describe("StateValidatorAgent", () => {
   });
 
   it("accepts a proven prose-authority contradiction only with both structured evidence surfaces", async () => {
+    const content = "The current candidate keeps the new condition.";
+    const evidence = candidateEvidence(content, [{
+      kind: "CANDIDATE_ASSERTION", recordId: "state:protagonist::protagonist state",
+      factKey: "state:protagonist::protagonist state", value: "new condition", quote: content,
+    }]);
+    const assertion = evidence.assertions[0]!;
     const agent = new StateValidatorAgent({
       client: {
         provider: "openai", apiFormat: "chat", stream: false,
@@ -210,21 +267,24 @@ describe("StateValidatorAgent", () => {
     vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
       .mockResolvedValue({
         content: JSON.stringify({
-          disposition: "CONTENT_REPAIR_REQUIRED",
-          warnings: [{ category: "ongoing_authority_contradiction", description: "The candidate contradicts committed continuity." }],
-          proseAuthorityEvidence: {
-            status: "PROVEN",
-            currentProse: ["The current candidate keeps the new condition."],
-            committedAuthority: ["The committed summary keeps the prior condition."],
-          },
+          findings: [{
+            kind: "PROSE_AUTHORITY_CONTRADICTION",
+            findingId: "condition-conflict",
+            description: "The candidate contradicts committed continuity.",
+            candidateAssertionId: assertion.assertionId,
+            committedRecordId: assertion.recordId,
+          }],
         }),
         usage: ZERO_USAGE,
       });
 
     await expect(agent.validate(
-      "The current candidate keeps the new condition.", 12,
-      "prior condition", "new condition", "old hooks", "new hooks", "en",
+      content, 12,
+      "| Field | Value |\n| --- | --- |\n| Protagonist State | prior condition |",
+      "| Field | Value |\n| --- | --- |\n| Protagonist State | new condition |",
+      "old hooks", "new hooks", "en",
       { chapterSummaries: "The committed summary keeps the prior condition." },
+      undefined, undefined, evidence,
     )).resolves.toMatchObject({
       passed: false,
       repairRequired: false,
@@ -232,12 +292,16 @@ describe("StateValidatorAgent", () => {
       proseAuthorityEvidence: {
         status: "PROVEN",
         currentProse: ["The current candidate keeps the new condition."],
-        committedAuthority: ["The committed summary keeps the prior condition."],
+        committedAuthority: ["prior condition"],
       },
+      findings: [expect.objectContaining({
+        kind: "PROSE_AUTHORITY_CONTRADICTION",
+        findingId: "condition-conflict",
+      })],
     });
   });
 
-  it("classifies the Chapter006-equivalent regression fixture through the generic structured contract", async () => {
+  it("fails closed when two unrelated real quotes are presented as one content contradiction", async () => {
     const agent = new StateValidatorAgent({
       client: {
         provider: "openai", apiFormat: "chat", stream: false,
@@ -249,26 +313,414 @@ describe("StateValidatorAgent", () => {
     vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
       .mockResolvedValue({
         content: JSON.stringify({
-          disposition: "CONTENT_REPAIR_REQUIRED",
-          warnings: [{ category: "ongoing_authority_contradiction", description: "The continuing injury side conflicts without a narrated change." }],
-          proseAuthorityEvidence: {
-            status: "PROVEN",
-            currentProse: ["continues the injury on the LEFT"],
-            committedAuthority: ["committed chapter keeps the injury on the RIGHT"],
-          },
+          findings: [{
+            kind: "PROSE_AUTHORITY_CONTRADICTION",
+            findingId: "unrelated-quotes",
+            description: "Claimed location conflict.",
+            factKey: "state:protagonist::current location",
+            relation: "CONFLICTING_VALUES",
+            candidate: {
+              subject: "protagonist", predicate: "Current Location", value: "Harbor",
+              quote: "Mara carries a lantern.",
+            },
+            committed: {
+              recordId: "state:protagonist::current location", value: "Gate", quote: "Gate",
+            },
+          }],
         }),
         usage: ZERO_USAGE,
       });
 
     await expect(agent.validate(
-      "The candidate continues the injury on the LEFT without a side-change event.",
+      "Mara carries a lantern. A sailor points toward Harbor. The gate remains closed.", 4,
+      "| Field | Value |\n| --- | --- |\n| Current Location | Gate |",
+      "| Field | Value |\n| --- | --- |\n| Current Location | Harbor |",
+      "# Pending Hooks", "# Pending Hooks", "en",
+    )).resolves.toMatchObject({
+      disposition: "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED",
+      findings: [expect.objectContaining({ kind: "AMBIGUOUS", findingId: "unrelated-quotes" })],
+    });
+  });
+
+  it("does not let a map titled Harbor become a protagonist-location fact without analyzer evidence", async () => {
+    const content = "The map titled Harbor hung beside the protagonist at dawn.";
+    const agent = new StateValidatorAgent({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model", projectRoot: process.cwd(),
+    });
+    vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({
+        content: JSON.stringify({ findings: [{
+          kind: "PROSE_AUTHORITY_CONTRADICTION",
+          findingId: "invented-location",
+          description: "Claims Harbor is the protagonist location.",
+          candidateAssertionId: "invented-assertion",
+          committedRecordId: "state:protagonist::current location",
+          factKey: "state:protagonist::current location",
+          relation: "CONFLICTING_VALUES",
+          candidate: {
+            subject: "protagonist", predicate: "Current Location", value: "Harbor", quote: "map titled Harbor",
+          },
+          committed: {
+            recordId: "state:protagonist::current location", value: "Gate", quote: "Gate",
+          },
+        }] }),
+        usage: ZERO_USAGE,
+      });
+
+    await expect(agent.validate(
+      content, 4,
+      "| Field | Value |\n| --- | --- |\n| Current Location | Gate |",
+      "| Field | Value |\n| --- | --- |\n| Current Location | Harbor |",
+      "# Pending Hooks", "# Pending Hooks", "en", undefined, undefined, undefined,
+      candidateEvidence(content, []),
+    )).resolves.toMatchObject({
+      disposition: "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED",
+      findings: [expect.objectContaining({ kind: "AMBIGUOUS", findingId: "invented-location" })],
+    });
+  });
+
+  it("lets a host-bound explicit transition dominate a validator contradiction label", async () => {
+    const content = "After crossing the bridge, the protagonist moved from Gate to Harbor.";
+    const quote = content;
+    const evidence = candidateEvidence(content, [{
+      kind: "EXPLICIT_TRANSITION",
+      recordId: "state:protagonist::current location",
+      factKey: "state:protagonist::current location",
+      value: "Harbor",
+      fromValue: "Gate",
+      quote,
+    }]);
+    const assertion = evidence.assertions[0]!;
+    const agent = new StateValidatorAgent({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model", projectRoot: process.cwd(),
+    });
+    vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({
+        content: JSON.stringify({ findings: [{
+          kind: "PROSE_AUTHORITY_CONTRADICTION",
+          findingId: "mislabelled-transition",
+          description: "Validator incorrectly labels the narrated move as a contradiction.",
+          candidateAssertionId: assertion.assertionId,
+          committedRecordId: assertion.recordId,
+          factKey: assertion.factKey,
+          relation: "CONFLICTING_VALUES",
+          candidate: { subject: "protagonist", predicate: "Current Location", value: "Harbor", quote },
+          committed: { recordId: assertion.recordId, value: "Gate", quote: "Gate" },
+        }] }),
+        usage: ZERO_USAGE,
+      });
+
+    await expect(agent.validate(
+      content, 4,
+      "| Field | Value |\n| --- | --- |\n| Current Location | Gate |",
+      "| Field | Value |\n| --- | --- |\n| Current Location | Gate |",
+      "# Pending Hooks", "# Pending Hooks", "en", undefined, undefined, undefined, evidence,
+    )).resolves.toMatchObject({
+      disposition: "STATE_REPAIR_REQUIRED",
+      findings: [expect.objectContaining({ kind: "STATE_PROJECTION_DEFECT", findingId: "mislabelled-transition" })],
+    });
+  });
+
+  it.each([
+    ["duplicate assertion", (content: string) => {
+      const evidence = candidateEvidence(content, [{
+        kind: "CANDIDATE_ASSERTION", recordId: "state:protagonist::current location",
+        factKey: "state:protagonist::current location", value: "Harbor", quote: content,
+      }]);
+      return { ...evidence, assertions: [evidence.assertions[0]!, evidence.assertions[0]!] };
+    }],
+    ["conflicting assertions", (content: string) => {
+      const evidence = candidateEvidence(content, [
+        { kind: "CANDIDATE_ASSERTION", recordId: "state:protagonist::current location", factKey: "state:protagonist::current location", value: "Harbor", quote: content },
+        { kind: "CANDIDATE_ASSERTION", recordId: "state:protagonist::current location", factKey: "state:protagonist::current location", value: "Dock", quote: content },
+      ]);
+      return evidence;
+    }],
+    ["wrong fact key", (content: string) => candidateEvidence(content, [{
+      kind: "CANDIDATE_ASSERTION", recordId: "state:protagonist::current location",
+      factKey: "state:protagonist::current goal", value: "Harbor", quote: content,
+    }])],
+    ["wrong record", (content: string) => candidateEvidence(content, [{
+      kind: "CANDIDATE_ASSERTION", recordId: "state:protagonist::current goal",
+      factKey: "state:protagonist::current goal", value: "Harbor", quote: content,
+    }])],
+    ["wrong span", (content: string) => candidateEvidence(content, [{
+      kind: "CANDIDATE_ASSERTION", recordId: "state:protagonist::current location",
+      factKey: "state:protagonist::current location", value: "Harbor", quote: content,
+      startUtf16: 1, endUtf16: content.length,
+    }])],
+    ["wrong candidate SHA", (content: string) => {
+      const evidence = candidateEvidence(content, [{
+        kind: "CANDIDATE_ASSERTION", recordId: "state:protagonist::current location",
+        factKey: "state:protagonist::current location", value: "Harbor", quote: content,
+      }]);
+      return {
+        ...evidence,
+        candidateSha256: "0".repeat(64),
+        assertions: evidence.assertions.map((assertion) => ({ ...assertion, candidateSha256: "0".repeat(64) })),
+      };
+    }],
+  ])("fails closed for host-unprovable analyzer evidence: %s", async (_label, buildEvidence) => {
+    const content = "The protagonist remains at Harbor while Dock appears on a map.";
+    const evidence = buildEvidence(content);
+    const referenced = evidence.assertions[0]!;
+    const agent = new StateValidatorAgent({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model", projectRoot: process.cwd(),
+    });
+    vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({
+        content: JSON.stringify({ findings: [{
+          kind: "PROSE_AUTHORITY_CONTRADICTION",
+          findingId: `invalid-${_label}`,
+          description: "Invalid candidate evidence must not authorize repair.",
+          candidateAssertionId: referenced.assertionId,
+          committedRecordId: "state:protagonist::current location",
+          factKey: "state:protagonist::current location",
+          relation: "CONFLICTING_VALUES",
+          candidate: { subject: "protagonist", predicate: "Current Location", value: "Harbor", quote: content },
+          committed: { recordId: "state:protagonist::current location", value: "Gate", quote: "Gate" },
+        }] }),
+        usage: ZERO_USAGE,
+      });
+
+    await expect(agent.validate(
+      content, 4,
+      "| Field | Value |\n| --- | --- |\n| Current Location | Gate |",
+      "| Field | Value |\n| --- | --- |\n| Current Location | Harbor |",
+      "# Pending Hooks", "# Pending Hooks", "en", undefined, undefined, undefined, evidence,
+    )).resolves.toMatchObject({
+      disposition: "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED",
+      findings: expect.arrayContaining([expect.objectContaining({ kind: "AMBIGUOUS" })]),
+    });
+  });
+
+  it("authorizes content repair from a host-bound assertion even when validator relation fields disagree", async () => {
+    const content = "The protagonist remains at Harbor.";
+    const evidence = candidateEvidence(content, [{
+      kind: "CANDIDATE_ASSERTION", recordId: "state:protagonist::current location",
+      factKey: "state:protagonist::current location", value: "Harbor", quote: content,
+    }]);
+    const assertion = evidence.assertions[0]!;
+    const agent = new StateValidatorAgent({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model", projectRoot: process.cwd(),
+    });
+    vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({
+        content: JSON.stringify({ findings: [{
+          kind: "PROSE_AUTHORITY_CONTRADICTION",
+          findingId: "bound-location-conflict",
+          description: "Restore the committed location.",
+          candidateAssertionId: assertion.assertionId,
+          committedRecordId: assertion.recordId,
+          factKey: "state:invented::wrong",
+          relation: "EXPLICIT_TRANSITION",
+          transitionQuote: content,
+          candidate: { subject: "invented", predicate: "wrong", value: "ignored", quote: "ignored" },
+          committed: { recordId: assertion.recordId, value: "ignored", quote: "ignored" },
+        }] }),
+        usage: ZERO_USAGE,
+      });
+
+    await expect(agent.validate(
+      content, 4,
+      "| Field | Value |\n| --- | --- |\n| Current Location | Gate |",
+      "| Field | Value |\n| --- | --- |\n| Current Location | Harbor |",
+      "# Pending Hooks", "# Pending Hooks", "en", undefined, undefined, undefined, evidence,
+    )).resolves.toMatchObject({
+      disposition: "CONTENT_REPAIR_REQUIRED",
+      findings: [expect.objectContaining({
+        kind: "PROSE_AUTHORITY_CONTRADICTION",
+        findingId: "bound-location-conflict",
+        factKey: "state:protagonist::current location",
+        candidate: expect.objectContaining({ value: "Harbor", quote: content }),
+      })],
+    });
+  });
+
+  it("does not let a raw stale summary override the current structured runtime record", async () => {
+    const agent = new StateValidatorAgent({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model",
+      projectRoot: process.cwd(),
+    });
+    vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({
+        content: JSON.stringify({
+          findings: [{
+            kind: "PROSE_AUTHORITY_CONTRADICTION",
+            findingId: "stale-summary",
+            description: "The summary appears to support Harbor.",
+            factKey: "state:protagonist::current location",
+            relation: "CONFLICTING_VALUES",
+            candidate: {
+              subject: "protagonist", predicate: "Current Location", value: "Harbor",
+              quote: "The protagonist remains at Harbor.",
+            },
+            committed: {
+              recordId: "summary:chapter-2:location", value: "Harbor", quote: "Harbor",
+            },
+          }],
+        }),
+        usage: ZERO_USAGE,
+      });
+
+    await expect(agent.validate(
+      "The protagonist remains at Harbor.", 4,
+      "| Field | Value |\n| --- | --- |\n| Current Location | Gate |",
+      "| Field | Value |\n| --- | --- |\n| Current Location | Harbor |",
+      "# Pending Hooks", "# Pending Hooks", "en",
+      { chapterSummaries: "Chapter 2 once placed the protagonist at Harbor." },
+    )).resolves.toMatchObject({
+      disposition: "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED",
+      findings: [expect.objectContaining({ kind: "AMBIGUOUS", findingId: "stale-summary" })],
+    });
+  });
+
+  it("authorizes content repair from a same-key conflicting current runtime record", async () => {
+    const content = "The protagonist remains at Harbor.";
+    const evidence = candidateEvidence(content, [{
+      kind: "CANDIDATE_ASSERTION", recordId: "state:protagonist::current location",
+      factKey: "state:protagonist::current location", value: "Harbor", quote: content,
+    }]);
+    const assertion = evidence.assertions[0]!;
+    const agent = new StateValidatorAgent({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model",
+      projectRoot: process.cwd(),
+    });
+    vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({
+        content: JSON.stringify({
+          findings: [{
+            kind: "PROSE_AUTHORITY_CONTRADICTION",
+            findingId: "current-location-conflict",
+            description: "Restore the continuing location.",
+            candidateAssertionId: assertion.assertionId,
+            committedRecordId: assertion.recordId,
+          }],
+        }),
+        usage: ZERO_USAGE,
+      });
+
+    await expect(agent.validate(
+      content, 4,
+      "| Field | Value |\n| --- | --- |\n| Current Location | Gate |",
+      "| Field | Value |\n| --- | --- |\n| Current Location | Harbor |",
+      "# Pending Hooks", "# Pending Hooks", "en", undefined, undefined, undefined, evidence,
+    )).resolves.toMatchObject({
+      disposition: "CONTENT_REPAIR_REQUIRED",
+      findings: [expect.objectContaining({
+        kind: "PROSE_AUTHORITY_CONTRADICTION",
+        findingId: "current-location-conflict",
+      })],
+    });
+  });
+
+  it("routes an explicitly narrated same-key transition to state repair", async () => {
+    const content = "After crossing the bridge, the protagonist moved from Gate to Harbor.";
+    const evidence = candidateEvidence(content, [{
+      kind: "EXPLICIT_TRANSITION", recordId: "state:protagonist::current location",
+      factKey: "state:protagonist::current location", value: "Harbor", fromValue: "Gate", quote: content,
+    }]);
+    const assertion = evidence.assertions[0]!;
+    const agent = new StateValidatorAgent({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model",
+      projectRoot: process.cwd(),
+    });
+    vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({
+        content: JSON.stringify({
+          findings: [{
+            kind: "PROSE_AUTHORITY_CONTRADICTION",
+            findingId: "narrated-location-transition",
+            description: "The settlement must project the narrated move.",
+            candidateAssertionId: assertion.assertionId,
+            committedRecordId: assertion.recordId,
+          }],
+        }),
+        usage: ZERO_USAGE,
+      });
+
+    await expect(agent.validate(
+      content, 4,
+      "| Field | Value |\n| --- | --- |\n| Current Location | Gate |",
+      "| Field | Value |\n| --- | --- |\n| Current Location | Gate |",
+      "# Pending Hooks", "# Pending Hooks", "en", undefined, undefined, undefined, evidence,
+    )).resolves.toMatchObject({
+      disposition: "STATE_REPAIR_REQUIRED",
+      findings: [expect.objectContaining({
+        kind: "STATE_PROJECTION_DEFECT",
+        findingId: "narrated-location-transition",
+      })],
+    });
+  });
+
+  it("classifies the Chapter006-equivalent regression fixture through the generic structured contract", async () => {
+    const content = "The candidate continues the injury on the LEFT without a side-change event.";
+    const quote = "continues the injury on the LEFT";
+    const evidence = candidateEvidence(content, [{
+      kind: "CANDIDATE_ASSERTION", recordId: "state:current_state::current injury",
+      factKey: "state:current_state::current injury", value: "LEFT", quote,
+    }]);
+    const assertion = evidence.assertions[0]!;
+    const agent = new StateValidatorAgent({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model",
+      projectRoot: process.cwd(),
+    });
+    vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({
+        content: JSON.stringify({
+          findings: [{
+            kind: "PROSE_AUTHORITY_CONTRADICTION",
+            findingId: "continuing-injury-conflict",
+            description: "The continuing injury side conflicts without a narrated change.",
+            candidateAssertionId: assertion.assertionId,
+            committedRecordId: assertion.recordId,
+          }],
+        }),
+        usage: ZERO_USAGE,
+      });
+
+    await expect(agent.validate(
+      content,
       6,
-      "The committed chapter keeps the injury on the RIGHT.",
-      "The settlement projects LEFT.",
+      "| Field | Value |\n| --- | --- |\n| Current Injury | RIGHT |",
+      "| Field | Value |\n| --- | --- |\n| Current Injury | LEFT |",
       "old hooks",
       "new hooks",
       "en",
       { chapterSummaries: "The committed chapter keeps the injury on the RIGHT." },
+      undefined, undefined, evidence,
     )).resolves.toMatchObject({ disposition: "CONTENT_REPAIR_REQUIRED" });
   });
 
@@ -288,14 +740,34 @@ describe("StateValidatorAgent", () => {
     vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
       .mockResolvedValue({
         content: JSON.stringify({
-          disposition: "CONTENT_REPAIR_REQUIRED",
-          warnings: [{ category: "authority", description: "unprovable" }],
-          proseAuthorityEvidence,
+          findings: [{
+            kind: "PROSE_AUTHORITY_CONTRADICTION",
+            findingId: "unprovable-authority",
+            description: "unprovable",
+            factKey: "state:current_state::note_1",
+            relation: "CONFLICTING_VALUES",
+            candidate: {
+              subject: "current_state", predicate: "note_1", value: proseAuthorityEvidence.currentProse[0] ?? "",
+              quote: proseAuthorityEvidence.currentProse[0] ?? "",
+            },
+            committed: {
+              recordId: proseAuthorityEvidence.status === "AMBIGUOUS"
+                ? "unprovable:record"
+                : "state:current_state::note_1",
+              value: proseAuthorityEvidence.committedAuthority[0] ?? "",
+              quote: proseAuthorityEvidence.committedAuthority[0] ?? "",
+            },
+          }],
         }),
         usage: ZERO_USAGE,
       });
 
-    await expect(agent.validate("candidate", 9, "old", "new", "old hooks", "new hooks", "en"))
+    await expect(agent.validate(
+      "candidate", 9,
+      "| Field | Value |\n| --- | --- |\n| note_1 | old |",
+      "| Field | Value |\n| --- | --- |\n| note_1 | candidate |",
+      "old hooks", "new hooks", "en",
+    ))
       .resolves.toMatchObject({
         passed: false,
         repairRequired: false,
@@ -319,9 +791,21 @@ describe("StateValidatorAgent", () => {
     vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
       .mockResolvedValue({
         content: JSON.stringify({
-          disposition: "CONTENT_REPAIR_REQUIRED",
-          warnings: [{ category: "authority", description: "claimed contradiction" }],
-          proseAuthorityEvidence: { status: "PROVEN", currentProse, committedAuthority },
+          findings: [{
+            kind: "PROSE_AUTHORITY_CONTRADICTION",
+            findingId: "unprovable-quote",
+            description: "claimed contradiction",
+            factKey: "state:current_state::note_1",
+            relation: "CONFLICTING_VALUES",
+            candidate: {
+              subject: "current_state", predicate: "note_1", value: currentProse[0] ?? "",
+              quote: currentProse[0] ?? "",
+            },
+            committed: {
+              recordId: "state:current_state::note_1", value: committedAuthority[0] ?? "",
+              quote: committedAuthority[0] ?? "",
+            },
+          }],
         }),
         usage: ZERO_USAGE,
       });
@@ -332,11 +816,17 @@ describe("StateValidatorAgent", () => {
       passed: false,
       repairRequired: false,
       disposition: "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED",
-      proseAuthorityEvidence: { status: "AMBIGUOUS" },
+      findings: [expect.objectContaining({ kind: "AMBIGUOUS" })],
     });
   });
 
   it("keeps mixed content and state findings on the content-first route", async () => {
+    const content = "candidate";
+    const evidence = candidateEvidence(content, [{
+      kind: "CANDIDATE_ASSERTION", recordId: "state:current_state::note_1",
+      factKey: "state:current_state::note_1", value: "candidate", quote: content,
+    }]);
+    const assertion = evidence.assertions[0]!;
     const agent = new StateValidatorAgent({
       client: {
         provider: "openai", apiFormat: "chat", stream: false,
@@ -348,29 +838,33 @@ describe("StateValidatorAgent", () => {
     vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
       .mockResolvedValue({
         content: JSON.stringify({
-          disposition: "CONTENT_REPAIR_REQUIRED",
-          stateRepairRequired: true,
-          warnings: [
-            { category: "ongoing_authority_contradiction", description: "candidate conflicts with committed state" },
-            { category: "missing_state_update", description: "ledger omission" },
+          findings: [
+            {
+              kind: "PROSE_AUTHORITY_CONTRADICTION",
+              findingId: "content-conflict",
+              description: "candidate conflicts with committed state",
+              candidateAssertionId: assertion.assertionId,
+              committedRecordId: assertion.recordId,
+            },
+            { kind: "STATE_PROJECTION_DEFECT", findingId: "ledger-omission", description: "ledger omission" },
           ],
-          proseAuthorityEvidence: {
-            status: "PROVEN",
-            currentProse: ["candidate"],
-            committedAuthority: ["old"],
-          },
         }),
         usage: ZERO_USAGE,
       });
 
-    await expect(agent.validate("candidate", 9, "old", "new", "old hooks", "new hooks", "en"))
+    await expect(agent.validate(
+      content, 9,
+      "| Field | Value |\n| --- | --- |\n| note_1 | old |",
+      "| Field | Value |\n| --- | --- |\n| note_1 | candidate |",
+      "old hooks", "new hooks", "en", undefined, undefined, undefined, evidence,
+    ))
       .resolves.toMatchObject({
         disposition: "CONTENT_REPAIR_REQUIRED",
         stateRepairRequired: true,
       });
   });
 
-  it("does not classify an explicitly narrated authority change as a prose contradiction", async () => {
+  it("accepts only the exact raw legacy PASS token", async () => {
     const agent = new StateValidatorAgent({
       client: {
         provider: "openai", apiFormat: "chat", stream: false,
@@ -381,7 +875,7 @@ describe("StateValidatorAgent", () => {
     });
     vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
       .mockResolvedValue({
-        content: JSON.stringify({ disposition: "PASS", warnings: [] }),
+        content: "PASS",
         usage: ZERO_USAGE,
       });
 
@@ -389,6 +883,174 @@ describe("StateValidatorAgent", () => {
       "The chapter explicitly narrates the controlled change.", 9,
       "prior state", "changed state", "old hooks", "new hooks", "en",
     )).resolves.toMatchObject({ passed: true, disposition: "PASS" });
+  });
+
+  it.each(["pass", "Pass", "pAsS"])("rejects non-exact legacy PASS casing: %s", async (rawVerdict) => {
+    const agent = new StateValidatorAgent({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model",
+      projectRoot: process.cwd(),
+    });
+    vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({ content: rawVerdict, usage: ZERO_USAGE });
+
+    await expect(agent.validate("candidate", 9, "old", "new", "old hooks", "new hooks", "en"))
+      .rejects.toThrow("invalid response");
+  });
+
+  it("fails closed when raw exact PASS accompanies malformed host-bound candidate evidence", async () => {
+    const agent = new StateValidatorAgent({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model",
+      projectRoot: process.cwd(),
+    });
+    vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({ content: "PASS", usage: ZERO_USAGE });
+
+    await expect(agent.validate(
+      "The candidate stays at Gate.", 9,
+      "| Field | Value |\n| --- | --- |\n| Current Location | Gate |",
+      "| Field | Value |\n| --- | --- |\n| Current Location | Gate |",
+      "old hooks", "old hooks", "en", undefined, undefined, undefined,
+      { candidateSha256: "0".repeat(64), assertions: [], issues: ["duplicate candidate evidence"] },
+    )).resolves.toMatchObject({
+      passed: false,
+      disposition: "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED",
+      findings: expect.arrayContaining([expect.objectContaining({ kind: "AMBIGUOUS" })]),
+    });
+  });
+
+  it("rejects JSON PASS compatibility because findings-mode requires an array", async () => {
+    const agent = new StateValidatorAgent({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model",
+      projectRoot: process.cwd(),
+    });
+    vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({ content: JSON.stringify({ disposition: "PASS", warnings: [] }), usage: ZERO_USAGE });
+
+    await expect(agent.validate("candidate", 9, "old", "new", "old hooks", "new hooks", "en"))
+      .rejects.toThrow("invalid response");
+  });
+
+  it("rejects malformed non-array findings instead of falling through to JSON PASS", async () => {
+    const agent = new StateValidatorAgent({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model",
+      projectRoot: process.cwd(),
+    });
+    vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({
+        content: JSON.stringify({
+          disposition: "PASS",
+          findings: { kind: "NON_REPAIRABLE", findingId: "hidden", description: "must not be discarded" },
+          warnings: [],
+        }),
+        usage: ZERO_USAGE,
+      });
+
+    await expect(agent.validate("candidate", 9, "old", "new", "old hooks", "new hooks", "en"))
+      .rejects.toThrow("invalid response");
+  });
+
+  it("fails closed when warnings-only JSON has no matching host-derived findings", async () => {
+    const agent = new StateValidatorAgent({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model",
+      projectRoot: process.cwd(),
+    });
+    vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({
+        content: JSON.stringify({
+          findings: [],
+          warnings: [{ category: "legacy", description: "candidate contradicts committed truth" }],
+        }),
+        usage: ZERO_USAGE,
+      });
+
+    await expect(agent.validate("candidate", 9, "old", "new", "old hooks", "new hooks", "en"))
+      .resolves.toMatchObject({
+        passed: false,
+        disposition: "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED",
+        findings: [expect.objectContaining({ kind: "AMBIGUOUS", findingId: "warnings-compatibility-mismatch" })],
+      });
+  });
+
+  it("fails closed when raw warnings do not exactly match the host-derived compatibility projection", async () => {
+    const agent = new StateValidatorAgent({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model",
+      projectRoot: process.cwd(),
+    });
+    vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({
+        content: JSON.stringify({
+          findings: [{
+            kind: "STATE_PROJECTION_DEFECT",
+            findingId: "state-omission",
+            description: "state projection is incomplete",
+          }],
+          warnings: [{ category: "STATE_PROJECTION_DEFECT", description: "different warning text" }],
+        }),
+        usage: ZERO_USAGE,
+      });
+
+    await expect(agent.validate("candidate", 9, "old", "new", "old hooks", "new hooks", "en"))
+      .resolves.toMatchObject({
+        passed: false,
+        disposition: "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED",
+        findings: [
+          expect.objectContaining({ kind: "STATE_PROJECTION_DEFECT", findingId: "state-omission" }),
+          expect.objectContaining({ kind: "AMBIGUOUS", findingId: "warnings-compatibility-mismatch" }),
+        ],
+      });
+  });
+
+  it("accepts raw warnings only when they exactly match the host-derived compatibility projection", async () => {
+    const agent = new StateValidatorAgent({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model",
+      projectRoot: process.cwd(),
+    });
+    vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({
+        content: JSON.stringify({
+          findings: [{
+            kind: "STATE_PROJECTION_DEFECT",
+            findingId: "state-omission",
+            description: "state projection is incomplete",
+          }],
+          warnings: [{ category: "STATE_PROJECTION_DEFECT", description: "state projection is incomplete" }],
+        }),
+        usage: ZERO_USAGE,
+      });
+
+    await expect(agent.validate("candidate", 9, "old", "new", "old hooks", "new hooks", "en"))
+      .resolves.toMatchObject({
+        disposition: "STATE_REPAIR_REQUIRED",
+        findings: [expect.objectContaining({ kind: "STATE_PROJECTION_DEFECT", findingId: "state-omission" })],
+      });
   });
 
   it("rejects legacy unstructured non-PASS verdicts", async () => {
@@ -405,6 +1067,29 @@ describe("StateValidatorAgent", () => {
 
     await expect(agent.validate("candidate", 9, "old", "new", "old hooks", "new hooks", "en"))
       .rejects.toThrow("structured evidence");
+  });
+
+  it("fails closed when result-wide routing claims content repair without per-finding evidence", async () => {
+    const agent = new StateValidatorAgent({
+      client: {
+        provider: "openai", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model",
+      projectRoot: process.cwd(),
+    });
+    vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({
+        content: JSON.stringify({ disposition: "CONTENT_REPAIR_REQUIRED", findings: [] }),
+        usage: ZERO_USAGE,
+      });
+
+    await expect(agent.validate("candidate", 9, "old", "new", "old hooks", "new hooks", "en"))
+      .resolves.toMatchObject({
+        passed: false,
+        disposition: "NON_REPAIRABLE_OR_BUDGET_EXHAUSTED",
+        findings: [expect.objectContaining({ kind: "AMBIGUOUS" })],
+      });
   });
 
   it("rejects legacy structured JSON non-PASS without an explicit disposition", async () => {

@@ -10,6 +10,10 @@ import {
   retrySettlementAfterValidationFailure,
 } from "./chapter-state-recovery.js";
 
+function isAutonomousStageAdmissionDenial(error: unknown): boolean {
+  return error instanceof Error && error.message === "AUTONOMOUS_STAGE_ADMISSION_STOPPED";
+}
+
 export async function validateChapterTruthPersistence(params: {
   readonly writer: Pick<WriterAgent, "settleChapterState">;
   readonly validator: Pick<StateValidatorAgent, "validate">;
@@ -89,9 +93,11 @@ export async function validateChapterTruthPersistence(params: {
         oldLedger: params.previousTruth.oldLedger,
         newLedger: persistenceOutput.updatedLedger,
       },
+      persistenceOutput.candidateFactEvidence,
     );
     validatorUsage = addUsage(validatorUsage, validation.tokenUsage);
   } catch (error) {
+    if (isAutonomousStageAdmissionDenial(error)) throw error;
     params.logger?.warn(`State validation error for chapter ${params.chapterNumber}: ${String(error)}`);
     const errorDescription = params.language === "en"
       ? `State validation unavailable: ${String(error)}`
@@ -164,6 +170,7 @@ export async function validateChapterTruthPersistence(params: {
       oldLedger: params.previousTruth.oldLedger,
       originalValidation: validation,
       authorityContext: params.authorityContext,
+      candidateFactEvidence: persistenceOutput.candidateFactEvidence,
       language: params.language,
       logWarn: params.logWarn,
       logger: params.logger,

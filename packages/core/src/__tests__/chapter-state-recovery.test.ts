@@ -147,6 +147,11 @@ describe("chapter-state-recovery", () => {
       chapterSummaries: "committed summary authority",
     };
     const validate = vi.fn(async () => createValidationResult({ passed: true, warnings: [] }));
+    const candidateFactEvidence = {
+      candidateSha256: "b".repeat(64),
+      assertions: [],
+      issues: [],
+    };
 
     await retrySettlementAfterValidationFailure({
       writer: { settleChapterState: vi.fn(async () => createWriteChapterOutput()) } as never,
@@ -161,6 +166,7 @@ describe("chapter-state-recovery", () => {
       oldLedger: "old ledger",
       originalValidation: createValidationResult(),
       authorityContext,
+      candidateFactEvidence,
       language: "zh",
     });
 
@@ -175,6 +181,7 @@ describe("chapter-state-recovery", () => {
       authorityContext,
       undefined,
       { oldLedger: "old ledger", newLedger: "new ledger" },
+      candidateFactEvidence,
     );
   });
 

@@ -1852,6 +1852,7 @@ export function createAutonomousProviderExecution(params: {
   readonly bookId: string;
   readonly jobId: string;
   readonly getActiveStage: () => AutonomousStageMetadata;
+  readonly assertModelCallAdmission?: () => void;
   readonly now?: () => number;
   readonly sleep?: (delayMs: number) => Promise<void>;
 }): AutonomousProviderRecovery & {
@@ -2088,6 +2089,7 @@ export function createAutonomousProviderExecution(params: {
     await markResponseArtifactComplete(identity);
   };
   const markTransportStarted = async (identity: LLMCallExecutionIdentity): Promise<void> => {
+    params.assertModelCallAdmission?.();
     const progress = await loadAutonomousProductionState<AutonomousRunProgress>(params.projectRoot, params.bookId);
     if (progress?.jobId !== params.jobId) return;
     const history = [...(progress.providerAttemptHistory ?? [])];
