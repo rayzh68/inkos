@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createRequire } from "node:module";
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -88,6 +88,299 @@ describe("ComposerAgent", () => {
 
   afterEach(async () => {
     await rm(root, { recursive: true, force: true });
+  });
+
+  async function writeFormalOutlineFixture(): Promise<void> {
+    book = { ...book, title: "The House She Built" };
+    await mkdir(join(storyDir, "outline"), { recursive: true });
+    await Promise.all([
+      writeFile(join(storyDir, "outline", "story_frame.md"), [
+        "# Story Frame — Final Locked Projection",
+        "Locked projection authority.",
+        "# The House She Built — Master Story Architecture v3",
+        "## Product promise",
+        "A woman turns departure into durable authority.",
+        "## Two-level dramatic question",
+        "The visible house fight and hidden inheritance machine remain causally joined.",
+        "## World anchor",
+        "Wet stone, legal ledgers, and the rule that witnessed debts cannot be erased.",
+        "## Four-volume design",
+        "### Volume I — The Price of Leaving (Chapters 1–38 center)",
+        "Leave the old house without surrendering the archive.",
+        "### Volume II — The Price of Returning (Chapters 39–78 center)",
+        "Return with public evidence.",
+      ].join("\n"), "utf-8"),
+      writeFile(join(storyDir, "outline", "volume_map.md"), [
+        "# Volume Map and Complete Chapter Blueprint Authority",
+        "# PROJECTED VOLUME 1",
+        "Status: locked for Chapters 1-38.",
+        "# The House She Built — Volume I Chapter Blueprint Set v1.1",
+        "Closure: the archive leaves the house.",
+        "## Chapter 005 — The Locked Drawer",
+        "Find the drawer key.",
+        "## Chapter 006 — The Witness Ledger",
+        "Bind the witness to the ledger.",
+        "## Chapter 007 — The Street Door",
+        "Carry the ledger outside.",
+        "## Chapter 038 — The Departure",
+        "Close the first-volume authority.",
+        "# PROJECTED VOLUME 2",
+        "Status: locked for Chapters 39-78.",
+        "# The House She Built — Volume II Chapter Blueprint Set v1.1",
+        "Closure: the evidence returns home.",
+        "## Chapter 039 — The Return",
+        "Open the second-volume authority.",
+        "## Chapter 040 — The Public Copy",
+        "Duplicate the evidence in public.",
+      ].join("\n"), "utf-8"),
+      writeFile(join(storyDir, "outline", "book-production-map.json"), JSON.stringify({
+        schema_version: "1.0",
+        book_id: book.id,
+        authority_book_id: "authority-book",
+        title: book.title,
+        total_chapters: 78,
+        volumes: [
+          { volume_id: "volume-001", volume_number: 1, title: "The Price of Leaving", start_chapter: 1, end_chapter: 38, chapter_count: 38 },
+          { volume_id: "volume-002", volume_number: 2, title: "The Price of Returning", start_chapter: 39, end_chapter: 78, chapter_count: 40 },
+        ],
+      }), "utf-8"),
+    ]);
+  }
+
+  it("selects the formal Story Frame anchors and active-volume Chapter neighborhood in canonical order", async () => {
+    await writeFormalOutlineFixture();
+    const semanticSelector = vi.fn(async () => ["unexpected-semantic-source"]);
+
+    const result = await composeGovernedChapter({
+      book,
+      bookDir,
+      chapterNumber: 6,
+      plan: {
+        ...plan,
+        intent: { ...plan.intent, chapter: 6 },
+        memo: { ...plan.memo, chapter: 6 },
+      },
+      strictStructuralOutlineSelection: true,
+      outlineSectionSelector: semanticSelector,
+    });
+
+    expect(result.contextPackage.selectedContext
+      .filter((entry) => entry.source.startsWith("story/outline/"))
+      .map((entry) => entry.source)).toEqual([
+      "story/outline/story_frame.md#story-frame-final-locked-projection",
+      "story/outline/story_frame.md#product-promise",
+      "story/outline/story_frame.md#two-level-dramatic-question",
+      "story/outline/story_frame.md#world-anchor",
+      "story/outline/story_frame.md#volume-i-the-price-of-leaving-chapters-1-38-center",
+      "story/outline/volume_map.md#projected-volume-1",
+      "story/outline/volume_map.md#the-house-she-built-volume-i-chapter-blueprint-set-v1-1",
+      "story/outline/volume_map.md#chapter-005-the-locked-drawer",
+      "story/outline/volume_map.md#chapter-006-the-witness-ledger",
+      "story/outline/volume_map.md#chapter-007-the-street-door",
+    ]);
+    expect(semanticSelector).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: "backtick fence", ignored: "```markdown\n## Product Promise\nFake fenced promise.\n```" },
+    { name: "tilde fence", ignored: "~~~markdown\n## Product Promise\nFake fenced promise.\n~~~" },
+    { name: "multiline HTML comment", ignored: "<!--\n## Product Promise\nFake commented promise.\n-->" },
+  ])("ignores formal-looking headings inside a $name", async ({ ignored }) => {
+    await writeFormalOutlineFixture();
+    const storyFramePath = join(storyDir, "outline", "story_frame.md");
+    await writeFile(
+      storyFramePath,
+      (await readFile(storyFramePath, "utf-8")).replace(
+        "## Product promise",
+        `${ignored}\n## Product promise`,
+      ),
+      "utf-8",
+    );
+
+    const result = await composeGovernedChapter({
+      book,
+      bookDir,
+      chapterNumber: 6,
+      plan: {
+        ...plan,
+        intent: { ...plan.intent, chapter: 6 },
+        memo: { ...plan.memo, chapter: 6 },
+      },
+      strictStructuralOutlineSelection: true,
+    });
+
+    expect(result.contextPackage.selectedContext
+      .filter((entry) => entry.source === "story/outline/story_frame.md#product-promise"))
+      .toHaveLength(1);
+  });
+
+  it("rejects a malformed Roman volume ordinal even when its arithmetic value matches the active volume", async () => {
+    await writeFormalOutlineFixture();
+    const productionMapPath = join(storyDir, "outline", "book-production-map.json");
+    await Promise.all([
+      writeFile(join(storyDir, "outline", "story_frame.md"), [
+        "# Story Frame — Final Locked Projection",
+        "## Product promise", "Keep the authority intact.",
+        "## Two-level dramatic question", "The visible and hidden conflicts remain joined.",
+        "## World anchor", "Witnessed rules cannot be erased.",
+        "### Volume IIX — Ten (Chapters 10–10 center)", "Malformed ordinal must not bind Volume 10.",
+      ].join("\n"), "utf-8"),
+      writeFile(join(storyDir, "outline", "volume_map.md"), [
+        "# Volume Map and Complete Chapter Blueprint Authority",
+        "# PROJECTED VOLUME 10", "Status: structurally valid.",
+        "# The House She Built — Volume 10 Chapter Blueprint Set v1.1", "Closure: valid map structure.",
+        "## Chapter 010 — Invalid Roman", "This must never be selected.",
+      ].join("\n"), "utf-8"),
+      writeFile(productionMapPath, JSON.stringify({
+        schema_version: "1.0",
+        book_id: book.id,
+        authority_book_id: "authority-book",
+        title: book.title,
+        total_chapters: 10,
+        volumes: Array.from({ length: 10 }, (_, index) => ({
+          volume_id: `volume-${String(index + 1).padStart(3, "0")}`,
+          volume_number: index + 1,
+          title: index === 9 ? "Ten" : `Volume ${index + 1}`,
+          start_chapter: index + 1,
+          end_chapter: index + 1,
+          chapter_count: 1,
+        })),
+      }), "utf-8"),
+    ]);
+
+    await expect(composeGovernedChapter({
+      book,
+      bookDir,
+      chapterNumber: 10,
+      plan: {
+        ...plan,
+        intent: { ...plan.intent, chapter: 10 },
+        memo: { ...plan.memo, chapter: 10 },
+      },
+      strictStructuralOutlineSelection: true,
+    })).rejects.toThrow(/FORMAL_(?:STORY_FRAME|VOLUME_MAP)_STRUCTURE_INVALID/u);
+  });
+
+  it.each([5, 7])("fails closed when required same-volume neighbor Chapter %i is missing", async (missingChapter) => {
+    await writeFormalOutlineFixture();
+    const volumeMapPath = join(storyDir, "outline", "volume_map.md");
+    const title = missingChapter === 5 ? "The Locked Drawer" : "The Street Door";
+    const body = missingChapter === 5 ? "Find the drawer key." : "Carry the ledger outside.";
+    await writeFile(
+      volumeMapPath,
+      (await readFile(volumeMapPath, "utf-8")).replace(
+        `## Chapter 00${missingChapter} — ${title}\n${body}\n`,
+        "",
+      ),
+      "utf-8",
+    );
+
+    await expect(composeGovernedChapter({
+      book,
+      bookDir,
+      chapterNumber: 6,
+      plan: {
+        ...plan,
+        intent: { ...plan.intent, chapter: 6 },
+        memo: { ...plan.memo, chapter: 6 },
+      },
+      strictStructuralOutlineSelection: true,
+    })).rejects.toThrow("FORMAL_VOLUME_MAP_STRUCTURE_INVALID");
+  });
+
+  it.each([
+    {
+      name: "Story Frame center title",
+      mutateStory: (value: string) => value.replace("The Price of Leaving (Chapters", "Wrong Center (Chapters"),
+    },
+    {
+      name: "Volume Map blueprint book title",
+      mutateVolume: (value: string) => value.replace("# The House She Built — Volume I", "# Wrong Book — Volume I"),
+    },
+    {
+      name: "production-map book title",
+      mutateMap: (value: Record<string, unknown>) => ({ ...value, title: "Wrong Book" }),
+    },
+  ])("fails closed on mismatched $name", async ({ mutateStory, mutateVolume, mutateMap }) => {
+    await writeFormalOutlineFixture();
+    const storyFramePath = join(storyDir, "outline", "story_frame.md");
+    const volumeMapPath = join(storyDir, "outline", "volume_map.md");
+    const productionMapPath = join(storyDir, "outline", "book-production-map.json");
+    if (mutateStory) await writeFile(storyFramePath, mutateStory(await readFile(storyFramePath, "utf-8")), "utf-8");
+    if (mutateVolume) await writeFile(volumeMapPath, mutateVolume(await readFile(volumeMapPath, "utf-8")), "utf-8");
+    if (mutateMap) {
+      const map = JSON.parse(await readFile(productionMapPath, "utf-8")) as Record<string, unknown>;
+      await writeFile(productionMapPath, JSON.stringify(mutateMap(map)), "utf-8");
+    }
+
+    await expect(composeGovernedChapter({
+      book,
+      bookDir,
+      chapterNumber: 6,
+      plan: {
+        ...plan,
+        intent: { ...plan.intent, chapter: 6 },
+        memo: { ...plan.memo, chapter: 6 },
+      },
+      strictStructuralOutlineSelection: true,
+    })).rejects.toThrow(/FORMAL_(?:STORY_FRAME|VOLUME_MAP|OUTLINE)_STRUCTURE_INVALID/u);
+  });
+
+  it.each([
+    {
+      name: "duplicate Product Promise",
+      mutate: (value: string) => value.replace("## Two-level dramatic question", "## Product Promise\nDuplicate promise.\n## Two-level dramatic question"),
+      expected: "FORMAL_STORY_FRAME_STRUCTURE_INVALID",
+    },
+    {
+      name: "missing World anchor",
+      mutate: (value: string) => value.replace("## World anchor\nWet stone, legal ledgers, and the rule that witnessed debts cannot be erased.\n", ""),
+      expected: "FORMAL_STORY_FRAME_STRUCTURE_INVALID",
+    },
+  ])("fails closed on $name", async ({ mutate, expected }) => {
+    await writeFormalOutlineFixture();
+    const storyFramePath = join(storyDir, "outline", "story_frame.md");
+    await writeFile(storyFramePath, mutate(await readFile(storyFramePath, "utf-8")), "utf-8");
+
+    await expect(composeGovernedChapter({
+      book,
+      bookDir,
+      chapterNumber: 6,
+      plan: {
+        ...plan,
+        intent: { ...plan.intent, chapter: 6 },
+        memo: { ...plan.memo, chapter: 6 },
+      },
+      strictStructuralOutlineSelection: true,
+    })).rejects.toThrow(expected);
+  });
+
+  it("fails closed when the production map overlaps the active volume range", async () => {
+    await writeFormalOutlineFixture();
+    const productionMapPath = join(storyDir, "outline", "book-production-map.json");
+    const productionMap = JSON.parse(await readFile(productionMapPath, "utf-8")) as { volumes: Array<Record<string, unknown>> };
+    productionMap.volumes[1] = {
+      ...productionMap.volumes[1],
+      start_chapter: 38,
+      chapter_count: 41,
+    };
+    await writeFile(
+      productionMapPath,
+      JSON.stringify(productionMap),
+      "utf-8",
+    );
+
+    await expect(composeGovernedChapter({
+      book,
+      bookDir,
+      chapterNumber: 6,
+      plan: {
+        ...plan,
+        intent: { ...plan.intent, chapter: 6 },
+        memo: { ...plan.memo, chapter: 6 },
+      },
+      strictStructuralOutlineSelection: true,
+    })).rejects.toThrow("BOOK_PRODUCTION_MAP_INVALID");
   });
 
   it("selects only the relevant context and writes a context package", async () => {

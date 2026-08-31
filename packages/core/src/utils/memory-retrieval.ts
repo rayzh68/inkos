@@ -120,26 +120,27 @@ export async function retrieveMemorySelection(params: {
     readStructuredState(join(stateDir, "hooks.json"), HooksStateSchema),
     readStructuredState(join(stateDir, "chapter_summaries.json"), ChapterSummariesStateSchema),
   ]);
-  const facts = structuredCurrentState?.facts ?? parseCurrentStateFacts(
+  const facts = [...(structuredCurrentState?.facts ?? parseCurrentStateFacts(
     currentStateMarkdown,
     fallbackChapter,
-  );
+  ))].sort(compareFacts);
   const narrativeQuery = [params.goal, params.outlineNode ?? ""].filter(Boolean).join("\n");
   const retrievalQuery = [narrativeQuery, ...(params.mustKeep ?? [])].filter(Boolean).join("\n");
   const parsedVolumeSummaries = parseVolumeSummariesMarkdown(volumeSummariesMarkdown);
   // Hooks stay on the authority path instead of the SQLite acceleration path:
   // the DB table intentionally stores only a small subset and cannot preserve
   // promoted/core/dependency metadata, which is load-bearing for hook debt.
-  const hooks = structuredHooks?.hooks ?? parsePendingHooksMarkdown(hooksMarkdown);
+  const hooks = [...(structuredHooks?.hooks ?? parsePendingHooksMarkdown(hooksMarkdown))]
+    .sort(compareHooks);
   const activeHooks = filterActiveHooks(hooks);
   // Dormant architect seeds are not active debt, but they remain searchable
   // canon. A chapter can explicitly activate one of them; excluding deferred
   // rows from retrieval makes the planner invent a duplicate hook instead.
   const searchableHooks = hooks.filter((hook) => normalizeStoredHookStatus(hook.status) !== "resolved");
 
-  const summaries = structuredSummaries?.rows ?? parseChapterSummariesMarkdown(
+  const summaries = [...(structuredSummaries?.rows ?? parseChapterSummariesMarkdown(
     await readFile(join(storyDir, "chapter_summaries.md"), "utf-8").catch(() => ""),
-  );
+  ))].sort((left, right) => left.chapter - right.chapter || compareOrdinal(left.title, right.title));
   const memoryDb = new MemoryDB(params.bookDir);
   try {
     memoryDb.replaceSummaries(summaries);
@@ -256,7 +257,9 @@ export function computeRecyclableHooks(
     .filter((hook) => !isFuturePlannedHook(hook, chapterNumber))
     .map((hook) => ({ hook, silence: hookSilence(hook, chapterNumber) }))
     .filter(({ hook, silence }) => silence >= recycleThreshold(hook))
-    .sort((a, b) => b.silence - a.silence || a.hook.startChapter - b.hook.startChapter)
+    .sort((a, b) => b.silence - a.silence
+      || a.hook.startChapter - b.hook.startChapter
+      || compareOrdinal(a.hook.hookId, b.hook.hookId))
     .map(({ hook }) => hook);
 }
 
@@ -443,7 +446,9 @@ function selectRelevantHooks(
       entry.retrieved
       || (activeHookIds.has(entry.hook.hookId) && isHookWithinChapterWindow(entry.hook, chapterNumber, 5)),
     )
-    .sort((left, right) => right.score - left.score || right.hook.lastAdvancedChapter - left.hook.lastAdvancedChapter)
+    .sort((left, right) => right.score - left.score
+      || right.hook.lastAdvancedChapter - left.hook.lastAdvancedChapter
+      || compareOrdinal(left.hook.hookId, right.hook.hookId))
     .slice(0, 6);
 
   const selectedIds = new Set(primary.map((entry) => entry.hook.hookId));
@@ -454,7 +459,9 @@ function selectRelevantHooks(
       && !isFuturePlannedHook(entry.hook, chapterNumber)
       && isUnresolvedHook(entry.hook.status),
     )
-    .sort((left, right) => left.hook.lastAdvancedChapter - right.hook.lastAdvancedChapter || right.score - left.score)
+    .sort((left, right) => left.hook.lastAdvancedChapter - right.hook.lastAdvancedChapter
+      || right.score - left.score
+      || compareOrdinal(left.hook.hookId, right.hook.hookId))
     .slice(0, 2);
 
   return [...primary, ...stale].map((entry) => entry.hook);
@@ -487,7 +494,7 @@ function selectRelevantFacts(
       };
     })
     .filter((entry) => entry.retrieved || entry.score >= 14)
-    .sort((left, right) => right.score - left.score)
+    .sort((left, right) => right.score - left.score || compareFacts(left.fact, right.fact))
     .slice(0, 4)
     .map((entry) => entry.fact);
 }
@@ -524,4 +531,20 @@ function slugifyAnchor(value: string): string {
     .replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-")
     .replace(/^-+|-+$/g, "")
     || "volume-summary";
+}
+
+function compareHooks(left: StoredHook, right: StoredHook): number {
+  return compareOrdinal(left.hookId, right.hookId);
+}
+
+function compareFacts(left: Fact, right: Fact): number {
+  return compareOrdinal(left.predicate, right.predicate)
+    || compareOrdinal(left.subject, right.subject)
+    || compareOrdinal(left.object, right.object)
+    || left.validFromChapter - right.validFromChapter
+    || left.sourceChapter - right.sourceChapter;
+}
+
+function compareOrdinal(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
