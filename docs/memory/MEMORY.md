@@ -113,6 +113,15 @@
 - Focused semantic adjudication 只授权或拒绝 content-repair route，不能成为 final reviewer authority；最终 Logic/Canon 与 Reader evidence 分别要求 `LOGIC_REVIEW` 与 `READER_REVIEW` stage。
 - 该系统性闭环已通过 `GPT_AUTONOMOUS_CONVERGENCE_RE_REVIEW`，reviewed head `d74a0a4869894828a679ee194ce62bdefe5fff80` 经 PR `rayzh68/inkos#18` 以 merge commit `d684c2a8ad0e050255510d9a6d664ee5c2068cc2` 合入 master；未新增产品角色、transaction type、runtime schema、Provider adapter、UI 或 subsystem。
 
+### Autonomous production cost convergence
+
+- 三个 PREPARING semantic model selectors 已从正式 Chapter Transaction path 移除并以 deterministic structure 取代；这不是新的 retrieval、cache、Provider 或 runtime subsystem。
+- Writer 输入继续保留 current chapter intent、current Volume authority、N-1 continuity、Chapter N blueprint/memo、正式需要的 N+1 planning context、Story Frame global anchors 以及 active memory/facts/hooks。成本降低的长期边界是减少噪声，不能削弱 authority。
+- 结构上的 logical-call 数量从 clean chapter `9 → 6`、one revision `12 → 9`、PREPARING `4 → 1`；已观察到的 Chapter 006 volume-map selector `62012` prompt tokens 因该 model selector 不再运行而从路径中消除。
+- Quality、authority、convergence、Chapter Transaction、exact-once、N+1、Stop、recovery、revision、settlement-retry、logical-call 与 Provider-transport gates 均保持不变。
+- 该 bounded convergence 已通过 `GPT_AUTONOMOUS_PRODUCTION_COST_SOURCE_REVIEW`，reviewed head `4e732b98f5f7ab9af9ee9136b66717fc55afe401` 经 PR `rayzh68/inkos#19` 以 merge commit `a2fc4f6e02fcc3283924579bde22d08f4d840d4d` 合入 master；开发、审核和落地期间真实 Provider/model calls 与 real-book mutation 均为 0。
+- Cost optimization 到此关闭。在真实连续生产工作之前，不再启动 Logic/Reviser prompt 优化、Planner removal、Provider caching、state/convergence simplification 或额外 selector work；下一优先级回到一键完成 Volume I 的 P0 production continuity closure。
+
 ## 5. 不应反复重新设计的架构决定
 
 - Chapter Transaction 是章节生产和提交的正式边界。

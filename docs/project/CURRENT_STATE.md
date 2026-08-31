@@ -1,7 +1,7 @@
 # InkOS Current State
 
 **Snapshot date:** 2026-08-31
-**Task:** `AUTONOMOUS_CHAPTER_CONVERGENCE_SYSTEM_CLOSURE_FINAL_LANDING` — externally reviewed systemic convergence integration closeout
+**Task:** `AUTONOMOUS_PRODUCTION_COST_CONVERGENCE_FINAL_LANDING` — externally reviewed bounded cost-convergence integration closeout
 **Rule:** 本文件是当前暂停点快照；继续工作前必须重新核验机器事实。
 
 ## 1. Repository
@@ -16,6 +16,7 @@
 | Full-book and BookDetail refresh merge commit | `33979787b14f8e8b08d75f118b34852b3e01c374` |
 | Chapter 006 settlement parser correction merge commit | `4012ed1f7e6c033114a1e5d087803a6da70b6d68` |
 | Autonomous chapter convergence merge commit | `d684c2a8ad0e050255510d9a6d664ee5c2068cc2` |
+| Autonomous production cost convergence merge commit | `a2fc4f6e02fcc3283924579bde22d08f4d840d4d` |
 | Rebased authority commits | `c52dc01bb44679036126426479f03975678c2d40` → `fa35b91a0db7fe7304abbc789c3944bfa7a7735f` → `e950e1e1bb67c7b517e7f61c4595beee4187cd9a` |
 | Closeout HEAD | the commit containing this snapshot; resolve with `git rev-parse HEAD` |
 | Final synchronization | verify `master == origin/master` from Git and the final handoff; this file cannot embed its own commit SHA |
@@ -167,7 +168,44 @@ The landed systemic contract is:
 
 Only SHA-verified structured committed `current_state.json` and `hooks.json` records may authorize automatic prose repair. Legacy Markdown remains context only. Focused `SETTLING_STATE` semantic adjudication is route authorization only and cannot satisfy final reviewer authority.
 
-## 7. Latest verification
+## 7. PR #19 — autonomous production cost convergence
+
+| Field | Current fact |
+| --- | --- |
+| PR | `rayzh68/inkos#19` |
+| Title | `perf: converge autonomous production preparation cost` |
+| Final externally reviewed head | `4e732b98f5f7ab9af9ee9136b66717fc55afe401` |
+| GPT gate | `GPT_AUTONOMOUS_PRODUCTION_COST_SOURCE_REVIEW = PASS` |
+| System cost convergence verdict | `PASS` |
+| Merge method | Merge commit; not squash or rebase merge |
+| Merge commit | `a2fc4f6e02fcc3283924579bde22d08f4d840d4d` |
+| GitHub merged at | `2026-08-31T12:24:32Z` |
+| Reviewed scope | Exactly three Core production files and three focused Core tests |
+| Provider adapter modification | `0` |
+| Runtime schema modification | `0` |
+| Studio modification | `0` |
+
+The bounded cost convergence removed three PREPARING semantic model selectors from the formal Chapter Transaction path and replaced them with deterministic structure while preserving the required Writer authority signal. The resulting architectural logical-call counts are clean chapter `9 → 6`, one revision `12 → 9`, and PREPARING `4 → 1`. The observed Chapter 006 volume-map selector cost of `62012` prompt tokens is eliminated from the path because that model selector no longer runs.
+
+Quality, authority, convergence, Chapter Transaction, exact-once, N+1, Stop, recovery, revision, settlement-retry, logical-call, and Provider-transport gates remain unchanged. No real Provider/model call or real-book mutation occurred during development, review, or landing. This is the final cost-optimization phase until real continuous production works.
+
+## 8. Latest verification
+
+The PR #19 release checks on reviewed head `4e732b98` are local Codex results, not independent CI:
+
+- fresh independent focused review: 59/59 and 134/134 PASS;
+- Core full single-worker: QUALIFIED PASS — 2173/2175; only the two established Windows symlink fixture `EPERM` baseline failures in `skill-agent-tool.test.ts`;
+- Studio full single-worker: 711/711 PASS;
+- Core typecheck: PASS;
+- Studio typecheck: PASS;
+- Core build: PASS;
+- Studio build: PASS;
+- `git diff --check`: PASS;
+- external `GPT_AUTONOMOUS_PRODUCTION_COST_SOURCE_REVIEW`: PASS;
+- real Provider/model calls: 0;
+- real-book mutation: 0;
+- Chapter 006 action: none;
+- Chapter 007 action: none.
 
 The PR #18 release checks on reviewed head `d74a0a48` are local Codex results, not independent CI:
 
@@ -248,20 +286,22 @@ The PR #17 settlement parser correction checks on reviewed head `2e61e146` are l
 - Chapter 006 action: none;
 - Chapter 007 action: none.
 
-## 8. Current system-development state
+## 9. Current system-development state
 
 - PR14 is merged and its audited history is preserved.
 - Post-PR14 UI convergence PR #15 is merged; its two externally reviewed commits remain reachable from master.
 - Full-book and BookDetail refresh PR #16 is merged; reviewed head `04755e11` is reachable from master through merge commit `33979787`.
 - Chapter 006 settlement parser correction PR #17 is merged; externally reviewed head `2e61e146` remains directly reachable from master through merge commit `4012ed1f`.
 - Autonomous chapter convergence PR #18 is merged; reviewed head `d74a0a48` remains directly reachable from master through merge commit `d684c2a8`.
+- Autonomous production cost convergence PR #19 is merged; reviewed head `4e732b98` remains directly reachable from master through merge commit `a2fc4f6e`.
 - The real InkOS production remains user-paused at Chapter 006 `SETTLING_STATE` / `PAUSED_PIPELINE_ERROR`; this landing performed no production action.
-- The systemic convergence landing is complete. The critical next action is `GPT_AND_USER_DECIDE_REAL_SYSTEMIC_VALIDATION_PATH`; this is a decision gate and not authorization for Codex to operate the UI, call a Provider/model, or start production.
+- Real Chapter 006 remains uncommitted, and Chapter 007 has not started. The cost-convergence landing performed no production action.
+- Cost optimization is closed. The critical next engineering priority is `P0_FULL_VOLUME_AUTONOMOUS_PRODUCTION_CLOSURE`, not a second cost-optimization phase; this NEXT label is not authorization for Codex to operate the UI, call a Provider/model, or start production.
 - Authority documents, Development Method V1, official alignment, and the worktree lifecycle rules are the current development authority.
 - Development Method V1 has now been exercised through a complex FULL Subagent Path, scoped re-review, FAST documentation path, and release integration. The PR #18 feature worktree is removed only after the final docs commit push/reachability gate; its completion is proved by the final machine handoff rather than claimed early in this embedded snapshot.
 - No further PR14 business development is authorized by this snapshot.
 
-## 9. Current real production pause — preserved landing authority
+## 10. Current real production pause — preserved landing authority
 
 The following formally revalidated machine facts are preserved from the latest read-only evidence; this landing did not reread or mutate real-book artifacts:
 
@@ -277,7 +317,7 @@ The following formally revalidated machine facts are preserved from the latest r
 
 The existing recovery identity must not be migrated to `full-book` during landing. No production authorization is granted to Codex.
 
-## 10. Production authorization
+## 11. Production authorization
 
 | Action | Authorized now? |
 | --- | --- |
@@ -289,12 +329,12 @@ The existing recovery identity must not be migrated to `full-book` during landin
 | Codex operation of the real InkOS UI | No |
 | NovelFactory or AI-Dev-Orchestrator modification | No |
 
-## 11. NEXT
+## 12. NEXT
 
-`GPT_AND_USER_DECIDE_REAL_SYSTEMIC_VALIDATION_PATH`
+`P0_FULL_VOLUME_AUTONOMOUS_PRODUCTION_CLOSURE`
 
-GPT and the user must decide the later real systemic validation path outside this Codex closeout. No production authorization is granted to Codex. Codex stops here and does not execute NEXT.
+The next engineering task returns to one-start, full-volume autonomous production continuity. It must address the proven premature `REVISION_1 → BLOCKED_CRITICAL_FINDINGS` termination boundary through a separately authorized task. No production authorization is granted to Codex. Codex stops here and does not execute NEXT.
 
-## 12. Update triggers
+## 13. Update triggers
 
 Update this snapshot after a later merge, real-book test, production-state revalidation, formal stop, or other major development milestone. Machine facts always override stale prose.
