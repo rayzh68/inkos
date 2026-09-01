@@ -829,8 +829,18 @@ describe("PipelineRunner", () => {
     };
     const initialBody = (chapter: number) => englishWords(40, `chapter${chapter}initial`);
     const revisedBody = (chapter: number, round: number) => englishWords(40, `chapter${chapter}revision${round}`);
-    const requiredRevisions = (chapter: number): 0 | 1 | 2 => chapter % 3 as 0 | 1 | 2;
+    type ReviewScenario = "clean" | "logic-r1" | "logic-r2" | "reader-r1" | "reader-r2";
+    const reviewScenario = (chapter: number): ReviewScenario => (
+      ["clean", "logic-r1", "logic-r2", "reader-r1", "reader-r2"] as const
+    )[chapter % 5]!;
+    const requiredRevisions = (chapter: number): 0 | 1 | 2 => {
+      const scenario = reviewScenario(chapter);
+      if (scenario === "logic-r2" || scenario === "reader-r2") return 2;
+      if (scenario === "logic-r1" || scenario === "reader-r1") return 1;
+      return 0;
+    };
     const revisionCalls = new Map<number, number>();
+    const readerHeldCounts = new Map<number, number>();
     const chapterResults = new Map<number, number>();
     const stageCounts = new Map<number, number>();
     const sequence: string[] = [];
@@ -908,8 +918,10 @@ describe("PipelineRunner", () => {
         });
       });
       vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockImplementation(async (_bookDir, content, chapterNumber) => {
+        const scenario = reviewScenario(chapterNumber);
         const required = requiredRevisions(chapterNumber);
-        const repaired = required === 0 || content.includes(`revision${required}`);
+        const logicDriven = scenario === "logic-r1" || scenario === "logic-r2";
+        const repaired = !logicDriven || content.includes(`revision${required}`);
         return repaired
           ? createAuditResult({ passed: true, overallScore: 92, dimensionScores: dimensions })
           : createAuditResult({
@@ -921,20 +933,48 @@ describe("PipelineRunner", () => {
               }],
             });
       });
-      vi.spyOn(CommercialReaderAgent.prototype, "reviewChapter").mockImplementation(async (input) => ({
-        reviewerRole: "commercial-reader", provider: "openai", model: "test-model", totalScore: 90,
-        dimensionScores: { commercial_appeal: 90 }, decision: "APPROVED", findings: [],
-        reviewedCandidateSha: input.candidateSha, reviewedAt: "2026-09-01T00:00:00.000Z", tokenUsage: ZERO_USAGE,
-      }));
+      vi.spyOn(CommercialReaderAgent.prototype, "reviewChapter").mockImplementation(async (input) => {
+        const scenario = reviewScenario(input.chapterNumber);
+        const required = requiredRevisions(input.chapterNumber);
+        const readerDriven = scenario === "reader-r1" || scenario === "reader-r2";
+        const repaired = !readerDriven || input.content.includes(`revision${required}`);
+        if (repaired) {
+          return {
+            reviewerRole: "commercial-reader", provider: "openai", model: "test-model", totalScore: 90,
+            dimensionScores: { commercial_appeal: 90 }, decision: "APPROVED", findings: [],
+            reviewedCandidateSha: input.candidateSha, reviewedAt: "2026-09-01T00:00:00.000Z", tokenUsage: ZERO_USAGE,
+          };
+        }
+        readerHeldCounts.set(input.chapterNumber, (readerHeldCounts.get(input.chapterNumber) ?? 0) + 1);
+        return {
+          reviewerRole: "commercial-reader", provider: "openai", model: "test-model", totalScore: 40,
+          dimensionScores: { commercial_appeal: 40 }, decision: "HELD", findings: [{
+            findingId: `reader-chapter-${input.chapterNumber}`, severity: "MAJOR",
+            evidence: `Chapter ${input.chapterNumber} stalls after its commercial turn.`, impact: "pacing",
+            requiredOutcome: `Make Chapter ${input.chapterNumber} trigger an irreversible choice.`,
+          }],
+          reviewedCandidateSha: input.candidateSha, reviewedAt: "2026-09-01T00:00:00.000Z", tokenUsage: ZERO_USAGE,
+        };
+      });
       const reviser = vi.spyOn(ReviserAgent.prototype, "reviseChapter").mockImplementation(async (
         _bookDir, _content, chapterNumber, issues,
       ) => {
         const round = (revisionCalls.get(chapterNumber) ?? 0) + 1;
         revisionCalls.set(chapterNumber, round);
-        expect(issues).toEqual([expect.objectContaining({
-          repairScope: round === 1 ? "local" : "structural",
-          description: expect.stringContaining(`Chapter ${chapterNumber}`),
-        })]);
+        const scenario = reviewScenario(chapterNumber);
+        if (scenario === "logic-r1" || scenario === "logic-r2") {
+          expect(issues).toEqual([expect.objectContaining({
+            repairScope: round === 1 ? "local" : "structural",
+            description: expect.stringContaining(`Chapter ${chapterNumber}`),
+          })]);
+        } else {
+          expect(issues).toEqual([expect.objectContaining({
+            category: "pacing",
+            description: expect.stringContaining(`Chapter ${chapterNumber}`),
+            suggestion: expect.stringContaining(`Chapter ${chapterNumber}`),
+            repairScope: "unknown",
+          })]);
+        }
         return createReviseOutput({ revisedContent: revisedBody(chapterNumber, round), wordCount: 40 });
       });
       const analyzer = vi.spyOn(ChapterAnalyzerAgent.prototype, "analyzeChapter").mockImplementation(async (input) => createAnalyzedOutput({
@@ -995,6 +1035,18 @@ describe("PipelineRunner", () => {
       expect(progressEvents.at(-1)).toMatchObject({ status: "BOOK_COMPLETE", nextChapter: 40, completedThisRun: 34 });
       expect(sequence.indexOf("commit:38")).toBeLessThan(sequence.indexOf("writer:39"));
       expect(provider).not.toHaveBeenCalled();
+      expect(Array.from({ length: 34 }, (_, index) => reviewScenario(index + 6))).toEqual(expect.arrayContaining([
+        "clean", "logic-r1", "logic-r2", "reader-r1", "reader-r2",
+      ]));
+      expect([
+        revisionCalls.get(6) ?? 0,
+        revisionCalls.get(7) ?? 0,
+        revisionCalls.get(8) ?? 0,
+        revisionCalls.get(9) ?? 0,
+        revisionCalls.get(10) ?? 0,
+      ]).toEqual([1, 2, 1, 2, 0]);
+      expect(readerHeldCounts.get(8)).toBe(1);
+      expect(readerHeldCounts.get(9)).toBe(2);
       expect(reviser).toHaveBeenCalledTimes([...Array.from({ length: 34 }, (_, index) => index + 6)]
         .reduce((sum, chapter) => sum + requiredRevisions(chapter), 0));
 

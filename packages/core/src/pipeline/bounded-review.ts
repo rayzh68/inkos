@@ -185,7 +185,11 @@ function logicReviewNeedsFailClosed(review: ScoredReview): boolean {
 }
 
 function commercialReviewNeedsFailClosed(review: ScoredReview): boolean {
-  return review.authorityBlocker === true || review.decision === "HELD";
+  if (review.authorityBlocker === true) return true;
+  if (review.decision !== "HELD") return false;
+  const blocking = review.findings.filter((finding) => finding.severity === "CRITICAL" || finding.severity === "MAJOR");
+  return blocking.length === 0 || blocking.some((finding) =>
+    finding.evidence.trim().length === 0 || finding.requiredOutcome.trim().length === 0);
 }
 
 function minimumDimension(review: ScoredReview): number {

@@ -63,6 +63,28 @@ function repairableLogicHold(
   };
 }
 
+function groundedReaderHold(
+  severity: "CRITICAL" | "MAJOR" = "MAJOR",
+  overrides: {
+    readonly evidence?: string;
+    readonly requiredOutcome?: string;
+    readonly authorityBlocker?: boolean;
+  } = {},
+): ScoredReview {
+  return {
+    ...review("commercial-reader", 40),
+    decision: "HELD",
+    findings: [{
+      findingId: "reader-grounded-1",
+      severity,
+      evidence: overrides.evidence ?? "The midpoint stalls after the reveal.",
+      impact: "pacing and emotional investment",
+      requiredOutcome: overrides.requiredOutcome ?? "Make the reveal trigger an immediate irreversible choice.",
+    }],
+    ...(overrides.authorityBlocker ? { authorityBlocker: true } : {}),
+  };
+}
+
 describe("bounded autonomous chapter review", () => {
   it("requires all seven logic dimensions without promoting a structural warning to MAJOR", () => {
     const valid = scoredLogicReviewFromAudit({
@@ -619,24 +641,120 @@ describe("bounded autonomous chapter review", () => {
     expect(revise).not.toHaveBeenCalled();
   });
 
-  it("keeps a commercial Reader HELD fail-closed even when its untrusted finding claims repairability", async () => {
+  it("uses REVISION_1 for an INITIAL grounded Commercial Reader HELD and freshly reviews the new SHA", async () => {
+    const logic = vi.fn().mockResolvedValue(review("logic-canon-auditor", 92));
+    const commercial = vi.fn()
+      .mockResolvedValueOnce(groundedReaderHold("CRITICAL"))
+      .mockResolvedValueOnce(review("commercial-reader", 90));
+    const revise = vi.fn().mockResolvedValue({ content: "reader revision one" });
+
+    const result = await runBoundedReviewCycle({
+      initialContent: "initial candidate",
+      lengthSpec: TEST_LENGTH_SPEC,
+      reviewLogic: logic,
+      reviewCommercial: commercial,
+      revise,
+    });
+
+    expect(result).toMatchObject({ status: "APPROVED", revisionCount: 1 });
+    expect(revise).toHaveBeenCalledWith("initial candidate", [expect.objectContaining({
+      findingId: "reader-grounded-1",
+      severity: "CRITICAL",
+      evidence: expect.stringContaining("midpoint stalls"),
+      requiredOutcome: expect.stringContaining("irreversible choice"),
+    })], 1);
+    expect(logic).toHaveBeenCalledTimes(2);
+    expect(commercial).toHaveBeenCalledTimes(2);
+    expect(result.candidates.map((candidate) => candidate.label)).toEqual(["INITIAL", "REVISION_1"]);
+    expect(new Set(result.candidates.map((candidate) => candidate.sha256)).size).toBe(2);
+    for (const candidate of result.candidates) {
+      expect(candidate.reviews).toHaveLength(2);
+      expect(candidate.reviews.every((item) => item.reviewedCandidateSha === candidate.sha256)).toBe(true);
+    }
+  });
+
+  it("uses REVISION_2 for a second grounded Reader HELD and freshly reviews the rescue SHA", async () => {
+    const logic = vi.fn().mockResolvedValue(review("logic-canon-auditor", 92));
+    const commercial = vi.fn()
+      .mockResolvedValueOnce(groundedReaderHold("MAJOR"))
+      .mockResolvedValueOnce(groundedReaderHold("CRITICAL"))
+      .mockResolvedValueOnce(review("commercial-reader", 90));
+    const revise = vi.fn()
+      .mockResolvedValueOnce({ content: "reader revision one" })
+      .mockResolvedValueOnce({ content: "reader revision two" });
+
+    const result = await runBoundedReviewCycle({
+      initialContent: "initial candidate",
+      lengthSpec: TEST_LENGTH_SPEC,
+      reviewLogic: logic,
+      reviewCommercial: commercial,
+      revise,
+    });
+
+    expect(result).toMatchObject({ status: "APPROVED", revisionCount: 2 });
+    expect(revise).toHaveBeenCalledTimes(2);
+    expect(revise.mock.calls.map((call) => call[2])).toEqual([1, 2]);
+    expect(logic).toHaveBeenCalledTimes(3);
+    expect(commercial).toHaveBeenCalledTimes(3);
+    expect(result.candidates.map((candidate) => candidate.label)).toEqual(["INITIAL", "REVISION_1", "REVISION_2"]);
+    expect(new Set(result.candidates.map((candidate) => candidate.sha256)).size).toBe(3);
+    for (const candidate of result.candidates) {
+      expect(candidate.reviews.every((item) => item.reviewedCandidateSha === candidate.sha256)).toBe(true);
+    }
+  });
+
+  it("fails closed after REVISION_2 remains grounded Reader HELD without admitting REVISION_3", async () => {
+    const logic = vi.fn().mockResolvedValue(review("logic-canon-auditor", 92));
+    const commercial = vi.fn().mockResolvedValue(groundedReaderHold("MAJOR"));
+    const revise = vi.fn()
+      .mockResolvedValueOnce({ content: "reader revision one" })
+      .mockResolvedValueOnce({ content: "reader revision two" });
+
+    const result = await runBoundedReviewCycle({
+      initialContent: "initial candidate",
+      lengthSpec: TEST_LENGTH_SPEC,
+      reviewLogic: logic,
+      reviewCommercial: commercial,
+      revise,
+    });
+
+    expect(result).toMatchObject({
+      status: "HELD_AFTER_TWO_REVISIONS",
+      revisionCount: 2,
+      holdReason: "REVISION_LIMIT_REACHED",
+    });
+    expect(revise).toHaveBeenCalledTimes(2);
+    expect(logic).toHaveBeenCalledTimes(3);
+    expect(commercial).toHaveBeenCalledTimes(3);
+    expect(result.candidates.map((candidate) => candidate.label)).toEqual(["INITIAL", "REVISION_1", "REVISION_2"]);
+  });
+
+  it.each([
+    ["empty evidence", groundedReaderHold("CRITICAL", { evidence: "   " })],
+    ["empty required outcome", groundedReaderHold("MAJOR", { requiredOutcome: "\t" })],
+    ["no CRITICAL or MAJOR blocker", {
+      ...groundedReaderHold(),
+      findings: [{
+        findingId: "reader-note-1", severity: "MINOR" as const, evidence: "A sentence repeats.",
+        impact: "flow", requiredOutcome: "Remove the repetition.",
+      }],
+    }],
+    ["authority blocker", groundedReaderHold("CRITICAL", { authorityBlocker: true })],
+  ])("fails closed for Reader HELD with %s without invoking Reviser", async (_case, heldReview) => {
     const revise = vi.fn();
     const result = await runBoundedReviewCycle({
       initialContent: "candidate",
       lengthSpec: TEST_LENGTH_SPEC,
       reviewLogic: vi.fn().mockResolvedValue(review("logic-canon-auditor", 92)),
-      reviewCommercial: vi.fn().mockResolvedValue({
-        ...review("commercial-reader", 40),
-        decision: "HELD",
-        findings: [{
-          findingId: "reader-1", severity: "CRITICAL", evidence: "reader evidence", impact: "reader",
-          requiredOutcome: "rewrite", repairScope: "structural",
-        }],
-      }),
+      reviewCommercial: vi.fn().mockResolvedValue(heldReview),
       revise,
     });
 
-    expect(result).toMatchObject({ status: "BLOCKED_CRITICAL_FINDINGS", revisionCount: 0 });
+    expect(result).toMatchObject({
+      status: "BLOCKED_CRITICAL_FINDINGS",
+      revisionCount: 0,
+      holdReason: "AUTHORITY_BLOCKER",
+    });
     expect(revise).not.toHaveBeenCalled();
   });
 
