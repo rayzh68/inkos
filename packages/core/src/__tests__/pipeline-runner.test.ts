@@ -34,7 +34,7 @@ import {
 } from "../state/chapter-workspace.js";
 import { correctLegacyPendingChapterArtifactBindings, createAutonomousProviderExecution, deriveAutonomousJobIdentity, resolveFormalPendingChapterRecoveryPlan, runBoundedAutonomousScope, saveAutonomousProductionState, type FormalPreservedBoundedReviewResumePlan } from "../production/bounded-autonomous-controller.js";
 import type { BoundedReviewResult } from "../pipeline/bounded-review.js";
-import { createChapterGenesis, verifyChapterCommit } from "../production/chapter-transaction.js";
+import { createChapterGenesis, verifyChapterCommit, verifyChapterCommitChain } from "../production/chapter-transaction.js";
 import { rewriteStructuredStateFromMarkdown } from "../state/state-bootstrap.js";
 
 const require = createRequire(import.meta.url);
@@ -692,6 +692,369 @@ describe("PipelineRunner", () => {
     }
   }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
 
+  it("preserves typed Logic repair scope through PipelineRunner and consumes the rescue revision before Commit", async () => {
+    let artifactBookDir = "";
+    let artifactOccurrence = 0;
+    const { root, runner, state, bookId } = await createRunnerFixture({
+      boundedAutonomousReview: true,
+      onAutonomousStage: async (event) => {
+        if (!event.transactionId || !event.provider || !event.model || event.stage === "APPROVED") return;
+        artifactOccurrence += 1;
+        const logicalOperationId = `provider-step-${createHash("sha256").update(`${event.transactionId}:${event.stage}:${event.role}:${artifactOccurrence}`).digest("hex")}`;
+        const content = `${event.stage}:${event.role}:${artifactOccurrence}:mocked-response`;
+        const artifact = {
+          schema_version: "1.0", job_id: "scoped-repair-mocked-job", logical_step_id: logicalOperationId,
+          usage_identity: logicalOperationId, transaction_id: event.transactionId, chapter_number: 1,
+          role: event.role, stage: event.stage, provider: event.provider, requested_model: event.model,
+          input_fingerprint: createHash("sha256").update(`${logicalOperationId}:input`).digest("hex"),
+          response_artifact_status: "COMPLETE", content_sha256: createHash("sha256").update(content).digest("hex"),
+          response: { content }, completed_at: "2026-09-01T00:00:00.000Z",
+        };
+        const dir = join(artifactBookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, `${logicalOperationId}.json`), `${JSON.stringify(artifact, null, 2)}\n`);
+      },
+    });
+    const provider = vi.spyOn(llmProvider, "chatCompletion");
+    const dimensions = {
+      blueprint_transition: 92, causal_logic: 92, canon_continuity: 92, character_motivation: 92,
+      state_inheritance: 92, hooks_disclosure: 92, narrative_clarity: 92,
+    };
+    const initialBody = englishWords(2200, "initial");
+    const revisionOne = englishWords(2200, "revisionone");
+    const revisionTwo = englishWords(2200, "revisiontwo");
+    try {
+      const { bookDir } = await seedTransactionPipeline(state, bookId);
+      artifactBookDir = bookDir;
+      vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(createWriterOutput({
+        chapterNumber: 1, title: "Scoped Repair", content: initialBody, wordCount: 2200,
+      }));
+      const logic = vi.spyOn(ContinuityAuditor.prototype, "auditChapter")
+        .mockResolvedValueOnce(createAuditResult({
+          passed: false, overallScore: 40, dimensionScores: dimensions,
+          issues: [{
+            severity: "critical", category: "canon source", description: "Current prose conflicts with the committed authority.",
+            suggestion: "Repair the narrow sentence against the committed authority.", repairScope: "local",
+          }],
+        }))
+        .mockResolvedValueOnce(createAuditResult({
+          passed: false, overallScore: 40, dimensionScores: dimensions,
+          issues: [{
+            severity: "critical", category: "canon source", description: "The scene still conflicts with the committed authority.",
+            suggestion: "Rebuild the scene against the committed authority.", repairScope: "structural",
+          }],
+        }))
+        .mockResolvedValue(createAuditResult({ passed: true, overallScore: 92, dimensionScores: dimensions }));
+      vi.spyOn(CommercialReaderAgent.prototype, "reviewChapter").mockImplementation(async (input) => ({
+        reviewerRole: "commercial-reader", provider: "openai", model: "test-model", totalScore: 90,
+        dimensionScores: { commercial_appeal: 90 }, decision: "APPROVED", findings: [],
+        reviewedCandidateSha: input.candidateSha, reviewedAt: "2026-09-01T00:00:00.000Z", tokenUsage: ZERO_USAGE,
+      }));
+      const reviser = vi.spyOn(ReviserAgent.prototype, "reviseChapter")
+        .mockResolvedValueOnce(createReviseOutput({ revisedContent: revisionOne, wordCount: 2200 }))
+        .mockResolvedValueOnce(createReviseOutput({ revisedContent: revisionTwo, wordCount: 2200 }));
+      vi.spyOn(ChapterAnalyzerAgent.prototype, "analyzeChapter").mockImplementation(async (input) => createAnalyzedOutput({
+        chapterNumber: input.chapterNumber, title: "Scoped Repair", content: input.chapterContent, wordCount: 2200,
+        updatedState: createStateCard({ chapter: 1, location: "Gate", protagonistState: "Repaired", goal: "Proceed", conflict: "Clock" }),
+      }));
+
+      const result = await runner.writeNextChapter(bookId, 2200);
+
+      expect(result).toMatchObject({
+        status: "ready-for-review",
+        autonomousReview: { status: "APPROVED", revisionCount: 2 },
+      });
+      expect(reviser).toHaveBeenCalledTimes(2);
+      expect(reviser.mock.calls[0]?.[3]).toEqual([expect.objectContaining({
+        repairScope: "local",
+        description: expect.stringContaining("Current prose"),
+      })]);
+      expect(reviser.mock.calls[1]?.[3]).toEqual([expect.objectContaining({
+        repairScope: "structural",
+        description: expect.stringContaining("scene still"),
+      })]);
+      expect(logic).toHaveBeenCalledTimes(3);
+      const commit = await verifyChapterCommit({ bookDir, chapterNumber: 1 });
+      expect(commit).toMatchObject({ revisionCount: 2, boundedReviewStatus: "APPROVED" });
+      expect(provider).not.toHaveBeenCalled();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
+
+  it("completes one mocked full-book admission from Chapter 006 through 039 with exact-once transaction commits and N+1 authority", async () => {
+    const stageEvents: Array<{ readonly stage: string; readonly role: string }> = [];
+    const progressEvents: Array<{ readonly status: string; readonly nextChapter: number; readonly completedThisRun: number }> = [];
+    let artifactBookDir = "";
+    const artifactOccurrences = new Map<string, number>();
+    const { root, runner, state, bookId } = await createRunnerFixture({
+      boundedAutonomousReview: true,
+      onAutonomousStage: async (event) => {
+        stageEvents.push({ stage: event.stage, role: event.role });
+        if (!event.transactionId || !event.provider || !event.model || event.stage === "APPROVED") return;
+        const occurrenceKey = `${event.transactionId}:${event.stage}:${event.role}`;
+        const occurrence = (artifactOccurrences.get(occurrenceKey) ?? 0) + 1;
+        artifactOccurrences.set(occurrenceKey, occurrence);
+        const logicalOperationId = `provider-step-${createHash("sha256").update(`${occurrenceKey}:${occurrence}`).digest("hex")}`;
+        const content = `${event.stage}:${event.role}:${occurrence}:mocked-response`;
+        const artifactChapterNumber = await state.getNextChapterNumber(bookId);
+        const artifact = {
+          schema_version: "1.0", job_id: "full-volume-mocked-job", logical_step_id: logicalOperationId,
+          usage_identity: logicalOperationId, transaction_id: event.transactionId, chapter_number: artifactChapterNumber,
+          role: event.role, stage: event.stage, provider: event.provider, requested_model: event.model,
+          input_fingerprint: createHash("sha256").update(`${logicalOperationId}:input`).digest("hex"),
+          response_artifact_status: "COMPLETE", content_sha256: createHash("sha256").update(content).digest("hex"),
+          response: { content }, completed_at: "2026-09-01T00:00:00.000Z",
+        };
+        const dir = join(artifactBookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, `${logicalOperationId}.json`), `${JSON.stringify(artifact, null, 2)}\n`);
+      },
+    });
+    const provider = vi.spyOn(llmProvider, "chatCompletion");
+    const bookDir = state.bookDir(bookId);
+    artifactBookDir = bookDir;
+    const storyDir = join(bookDir, "story");
+    const chaptersDir = join(bookDir, "chapters");
+    const map = {
+      schemaVersion: "1.0" as const,
+      bookId,
+      authorityBookId: "authority",
+      title: "Test Book",
+      totalChapters: 39,
+      volumes: [
+        { volumeId: "volume-001", volumeNumber: 1, title: "One", startChapter: 1, endChapter: 38, chapterCount: 38 },
+        { volumeId: "volume-002", volumeNumber: 2, title: "Two", startChapter: 39, endChapter: 39, chapterCount: 1 },
+      ],
+    };
+    const initialBody = (chapter: number) => englishWords(40, `chapter${chapter}initial`);
+    const revisedBody = (chapter: number, round: number) => englishWords(40, `chapter${chapter}revision${round}`);
+    const requiredRevisions = (chapter: number): 0 | 1 | 2 => chapter % 3 as 0 | 1 | 2;
+    const revisionCalls = new Map<number, number>();
+    const chapterResults = new Map<number, number>();
+    const stageCounts = new Map<number, number>();
+    const sequence: string[] = [];
+    const verifiedCommits: Awaited<ReturnType<typeof verifyChapterCommit>>[] = [];
+    const dimensions = {
+      blueprint_transition: 92, causal_logic: 92, canon_continuity: 92, character_motivation: 92,
+      state_inheritance: 92, hooks_disclosure: 92, narrative_clarity: 92,
+    };
+    try {
+      await state.saveBookConfig(bookId, {
+        ...(await state.loadBookConfig(bookId)), language: "en", chapterWordCount: 40, targetChapters: 39,
+      });
+      await Promise.all([
+        writeFile(join(storyDir, "current_state.md"), createStateCard({
+          chapter: 5, location: "Volume I gate", protagonistState: "Five chapters are committed.",
+          goal: "Continue without human intervention.", conflict: "Each next chapter requires committed authority.",
+        })),
+        writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n"),
+        writeFile(join(storyDir, "chapter_summaries.md"), "# Chapter Summaries\n"),
+        writeFile(join(storyDir, "outline", "story_frame.md"), [
+          "# Story Frame — Final Locked Projection", "Locked projection authority.",
+          "## Product promise", "Complete Volume I continuously.",
+          "## Two-level dramatic question", "Can the chain reach the Volume boundary?",
+          "## World anchor", "Only committed chapters authorize N+1.",
+          "### Volume I — One (Chapters 1–38 center)", "Close Volume I at Chapter 38.",
+          "### Volume II — Two (Chapters 39–39 center)", "Open Volume II at Chapter 39.",
+        ].join("\n")),
+        writeFile(join(storyDir, "outline", "volume_map.md"), [
+          "# Volume Map and Complete Chapter Blueprint Authority", "# PROJECTED VOLUME 1", "Status: locked.",
+          "# Test Book — Volume I Chapter Blueprint Set v1.1", "Closure: Chapter 38 closes Volume I.",
+          ...Array.from({ length: 38 }, (_, index) => [
+            `## Chapter ${String(index + 1).padStart(3, "0")} — Fixture ${index + 1}`,
+            `Advance fixture chapter ${index + 1}.`,
+          ]).flat(),
+          "# PROJECTED VOLUME 2", "Status: locked.",
+          "# Test Book — Volume II Chapter Blueprint Set v1.1", "Opening: Chapter 39 opens Volume II.",
+          "## Chapter 039 — Fixture 39", "Advance fixture chapter 39.",
+        ].join("\n")),
+        writeFile(join(storyDir, "outline", "book-production-map.json"), JSON.stringify({
+          schema_version: "1.0", book_id: bookId, authority_book_id: "authority", title: "Test Book", total_chapters: 39,
+          volumes: [
+            { volume_id: "volume-001", volume_number: 1, title: "One", start_chapter: 1, end_chapter: 38, chapter_count: 38 },
+            { volume_id: "volume-002", volume_number: 2, title: "Two", start_chapter: 39, end_chapter: 39, chapter_count: 1 },
+          ],
+        })),
+        ...Array.from({ length: 5 }, (_, index) => writeFile(
+          join(chaptersDir, `${String(index + 1).padStart(4, "0")}_Chapter_${index + 1}.md`),
+          `# Chapter ${index + 1}\n\nCommitted fixture ${index + 1}.`,
+        )),
+      ]);
+      await state.saveChapterIndex(bookId, Array.from({ length: 5 }, (_, index) => ({
+        number: index + 1, title: `Chapter ${index + 1}`, status: "approved" as const, wordCount: 3,
+        createdAt: "2026-09-01T00:00:00.000Z", updatedAt: "2026-09-01T00:00:00.000Z",
+        auditIssues: [], lengthWarnings: [],
+      })));
+      await rewriteStructuredStateFromMarkdown({ bookDir, fallbackChapter: 5 });
+      await state.snapshotState(bookId, 5);
+      await createChapterGenesis({
+        bookDir, bookId, lastTrustedChapter: 5, trustedSnapshotDir: join(storyDir, "snapshots", "5"),
+        createdAt: "2026-09-01T00:00:00.000Z",
+      });
+
+      vi.spyOn(WriterAgent.prototype, "writeChapter").mockImplementation(async (input) => {
+        if (input.chapterNumber > 6) {
+          const priorState = input.contextPackage.selectedContext.find((entry) => entry.source === "story/current_state.md");
+          expect(priorState?.excerpt).toContain(`Chapter ${input.chapterNumber - 1} committed state.`);
+        }
+        if (input.chapterNumber === 39) {
+          expect(verifiedCommits.at(-1)).toMatchObject({ chapterNumber: 38 });
+        }
+        sequence.push(`writer:${input.chapterNumber}`);
+        return createWriterOutput({
+          chapterNumber: input.chapterNumber, title: `Chapter ${input.chapterNumber}`,
+          content: initialBody(input.chapterNumber), wordCount: 40,
+        });
+      });
+      vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockImplementation(async (_bookDir, content, chapterNumber) => {
+        const required = requiredRevisions(chapterNumber);
+        const repaired = required === 0 || content.includes(`revision${required}`);
+        return repaired
+          ? createAuditResult({ passed: true, overallScore: 92, dimensionScores: dimensions })
+          : createAuditResult({
+              passed: false, overallScore: 40, dimensionScores: dimensions,
+              issues: [{
+                severity: "critical", category: "canon source", repairScope: content.includes("revision1") ? "structural" : "local",
+                description: `Chapter ${chapterNumber} prose conflicts with known committed authority.`,
+                suggestion: `Repair Chapter ${chapterNumber} against that committed authority.`,
+              }],
+            });
+      });
+      vi.spyOn(CommercialReaderAgent.prototype, "reviewChapter").mockImplementation(async (input) => ({
+        reviewerRole: "commercial-reader", provider: "openai", model: "test-model", totalScore: 90,
+        dimensionScores: { commercial_appeal: 90 }, decision: "APPROVED", findings: [],
+        reviewedCandidateSha: input.candidateSha, reviewedAt: "2026-09-01T00:00:00.000Z", tokenUsage: ZERO_USAGE,
+      }));
+      const reviser = vi.spyOn(ReviserAgent.prototype, "reviseChapter").mockImplementation(async (
+        _bookDir, _content, chapterNumber, issues,
+      ) => {
+        const round = (revisionCalls.get(chapterNumber) ?? 0) + 1;
+        revisionCalls.set(chapterNumber, round);
+        expect(issues).toEqual([expect.objectContaining({
+          repairScope: round === 1 ? "local" : "structural",
+          description: expect.stringContaining(`Chapter ${chapterNumber}`),
+        })]);
+        return createReviseOutput({ revisedContent: revisedBody(chapterNumber, round), wordCount: 40 });
+      });
+      const analyzer = vi.spyOn(ChapterAnalyzerAgent.prototype, "analyzeChapter").mockImplementation(async (input) => createAnalyzedOutput({
+        chapterNumber: input.chapterNumber,
+        title: `Chapter ${input.chapterNumber}`, content: input.chapterContent, wordCount: 40,
+        updatedState: createStateCard({
+          chapter: input.chapterNumber, location: `Chapter ${input.chapterNumber} location`,
+          protagonistState: `Chapter ${input.chapterNumber} committed state.`,
+          goal: `Advance to Chapter ${input.chapterNumber + 1}.`, conflict: "Continuity remains bounded.",
+        }),
+        chapterSummary: `| ${input.chapterNumber} | Chapter ${input.chapterNumber} | Hero | Advanced | State ${input.chapterNumber} | hook | tense | mainline |`,
+      }));
+
+      let controllerStarts = 0;
+      let runChapterCalls = 0;
+      controllerStarts += 1;
+      const result = await runBoundedAutonomousScope({
+        map,
+        mode: "full-book",
+        getNextChapter: () => state.getNextChapterNumber(bookId),
+        shouldStop: () => false,
+        persistProgress: async (progress) => {
+          progressEvents.push({
+            status: progress.status,
+            nextChapter: progress.nextChapter,
+            completedThisRun: progress.completedThisRun,
+          });
+        },
+        verifyChapterStartAuthority: async (chapterNumber) => {
+          if (chapterNumber > 6) {
+            expect(verifiedCommits.at(-1)).toMatchObject({ chapterNumber: chapterNumber - 1 });
+          }
+        },
+        runChapter: async () => {
+          runChapterCalls += 1;
+          if (runChapterCalls > 34) throw new Error("FULL_VOLUME_TEST_DUPLICATE_CHAPTER_ADMISSION");
+          const chapterNumber = await state.getNextChapterNumber(bookId);
+          const beforeStages = stageEvents.length;
+          const chapterResult = await runner.writeNextChapter(bookId, 40);
+          chapterResults.set(chapterNumber, chapterResult.autonomousReview?.revisionCount ?? -1);
+          stageCounts.set(chapterNumber, stageEvents.length - beforeStages);
+          if (chapterResult.status === "ready-for-review" || chapterResult.status === "accepted-with-findings") {
+            const commit = JSON.parse(await readFile(join(
+              storyDir, "commits", `chapter-${String(chapterNumber).padStart(4, "0")}`, "commit.json",
+            ), "utf-8")) as Awaited<ReturnType<typeof verifyChapterCommit>>;
+            verifiedCommits.push(commit);
+            sequence.push(`commit:${commit.chapterNumber}`);
+          }
+          return chapterResult;
+        },
+      });
+
+      expect(controllerStarts).toBe(1);
+      expect(runChapterCalls).toBe(34);
+      expect(analyzer).toHaveBeenCalledTimes(34);
+      expect(result).toMatchObject({ status: "BOOK_COMPLETE", nextChapter: 40, completedThisRun: 34 });
+      expect(progressEvents[0]).toMatchObject({ status: "RUNNING", nextChapter: 6, completedThisRun: 0 });
+      expect(progressEvents.at(-1)).toMatchObject({ status: "BOOK_COMPLETE", nextChapter: 40, completedThisRun: 34 });
+      expect(sequence.indexOf("commit:38")).toBeLessThan(sequence.indexOf("writer:39"));
+      expect(provider).not.toHaveBeenCalled();
+      expect(reviser).toHaveBeenCalledTimes([...Array.from({ length: 34 }, (_, index) => index + 6)]
+        .reduce((sum, chapter) => sum + requiredRevisions(chapter), 0));
+
+      const index = await state.loadChapterIndex(bookId);
+      expect(index.map((chapter) => chapter.number)).toEqual(Array.from({ length: 39 }, (_, index) => index + 1));
+      const commits = verifiedCommits;
+      expect(commits.map((commit) => commit.chapterNumber)).toEqual(Array.from({ length: 34 }, (_, index) => index + 6));
+      expect(new Set(commits.map((commit) => commit.transactionId)).size).toBe(34);
+      expect(commits.map((commit) => commit.revisionCount)).toEqual(
+        Array.from({ length: 34 }, (_, index) => requiredRevisions(index + 6)),
+      );
+      for (let index = 1; index < commits.length; index += 1) {
+        expect(commits[index]!.previousAuthoritySha256).toBe(commits[index - 1]!.commitSha256);
+      }
+      const expectedChapterDirs = Array.from({ length: 34 }, (_, index) => `chapter-${String(index + 6).padStart(4, "0")}`);
+      const transactionRoot = join(storyDir, "runtime", "chapter-transactions");
+      const commitRoot = join(storyDir, "commits");
+      expect((await readdir(transactionRoot, { withFileTypes: true }))
+        .filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort()).toEqual(expectedChapterDirs);
+      expect((await readdir(commitRoot, { withFileTypes: true }))
+        .filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort()).toEqual(expectedChapterDirs);
+      for (const commit of commits) {
+        const chapterDir = `chapter-${String(commit.chapterNumber).padStart(4, "0")}`;
+        const transactionDir = join(transactionRoot, chapterDir);
+        const transaction = JSON.parse(await readFile(join(transactionDir, "transaction.json"), "utf-8")) as {
+          readonly transactionId: string;
+          readonly chapterNumber: number;
+          readonly attemptNumber?: number;
+        };
+        expect(transaction).toMatchObject({
+          transactionId: commit.transactionId,
+          chapterNumber: commit.chapterNumber,
+        });
+        expect(transaction.attemptNumber ?? 1).toBe(1);
+        const siblingAttempts = await readdir(join(transactionDir, "attempts"), { withFileTypes: true })
+          .catch((error: NodeJS.ErrnoException) => {
+            if (error.code === "ENOENT") return [];
+            throw error;
+          });
+        expect(siblingAttempts.filter((entry) => entry.isDirectory())).toEqual([]);
+        await expect(stat(join(transactionDir, "abandonment.json"))).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(readFile(join(commitRoot, chapterDir, "state", "current_state.md"), "utf-8"))
+          .resolves.toContain(`Chapter ${commit.chapterNumber} committed state.`);
+      }
+      const verifiedChain = await verifyChapterCommitChain({ bookDir });
+      expect(verifiedChain).toMatchObject({
+        latestChapter: 39,
+        genesis: { lastTrustedChapter: 5 },
+      });
+      expect(verifiedChain.commits.map((commit) => commit.transactionId)).toEqual(commits.map((commit) => commit.transactionId));
+      for (const chapter of Array.from({ length: 34 }, (_, index) => index + 6)) {
+        expect(chapterResults.get(chapter)).toBe(requiredRevisions(chapter));
+        expect(stageCounts.get(chapter)).toBeLessThanOrEqual(18);
+        expect(revisionCalls.get(chapter) ?? 0).toBe(requiredRevisions(chapter));
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 900_000);
+
   it("stops an invalid formal outline after Planner without admitting Writer or semantic selectors", async () => {
     const stages: Array<{ readonly stage: string; readonly role: string }> = [];
     const { root, runner, state, bookId } = await createRunnerFixture({
@@ -757,8 +1120,8 @@ describe("PipelineRunner", () => {
               character_motivation: 92, state_inheritance: 92, hooks_disclosure: 92, narrative_clarity: 92,
             },
             issues: requireRevision ? [{
-              severity: "warning", explicit_severity: "MAJOR", category: "causal_logic",
-              description: "Repair the causal bridge.", suggestion: "Add the missing action.",
+              severity: "warning", explicit_severity: "MAJOR", blocking: true, category: "causal_logic",
+              description: "Repair the causal bridge.", suggestion: "Add the missing action.", repair_scope: "local",
             }] : [],
             summary: requireRevision ? "revision required" : "clean",
           })
@@ -1536,7 +1899,7 @@ describe("PipelineRunner", () => {
           tokenUsage: { promptTokens: 2, completionTokens: 3, totalTokens: 5 },
         }) : createAuditResult({
           passed: false, overallScore: 60, dimensionScores: { ...dimensions, canon_continuity: 40 },
-          issues: [{ severity: "critical", category: "canon_continuity", description: "still conflicts", suggestion: "hold" }],
+          issues: [{ severity: "critical", category: "canon_continuity", description: "still conflicts", suggestion: "hold", repairScope: "structural" }],
           tokenUsage: { promptTokens: 7, completionTokens: 11, totalTokens: 18 },
         }));
       let commercialReviewCount = 0;
@@ -1664,7 +2027,7 @@ describe("PipelineRunner", () => {
         vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockImplementation(async (_dir, content) => boundary === "REVISION" && content === initialBody
           ? createAuditResult({
               passed: false, overallScore: 70, dimensionScores: { ...dimensions, causal_logic: 70 },
-              issues: [{ severity: "warning", explicitSeverity: "MAJOR", category: "causal_logic", description: "Revise.", suggestion: "Repair." }],
+              issues: [{ severity: "warning", explicitSeverity: "MAJOR", category: "causal_logic", description: "Revise.", suggestion: "Repair.", repairScope: "structural" }],
             })
           : createAuditResult({ passed: true, overallScore: 92, dimensionScores: dimensions }));
         vi.spyOn(CommercialReaderAgent.prototype, "reviewChapter").mockImplementation(async (input) => ({
@@ -1783,7 +2146,7 @@ describe("PipelineRunner", () => {
         "logic-canon-auditor": {
           reviewerRole: "logic-canon-auditor", provider: "test", model: "logic", totalScore: 81,
           dimensionScores: logicDimensions, decision: "REVISION_REQUIRED",
-          findings: [{ findingId: "logic-1", severity: "MAJOR", evidence: "repair", impact: "causal_logic", requiredOutcome: "fix" }],
+          findings: [{ findingId: "logic-1", severity: "MAJOR", evidence: "repair", impact: "causal_logic", requiredOutcome: "fix", repairScope: "structural" }],
           reviewedCandidateSha: candidateSha, reviewedAt: "2026-08-27T00:00:00.000Z", tokenUsage: ZERO_USAGE,
         },
       },

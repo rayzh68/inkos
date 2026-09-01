@@ -58,6 +58,8 @@ export interface ReviewFinding {
   readonly evidence: string;
   readonly impact: string;
   readonly requiredOutcome: string;
+  /** Typed prose-repair routing evidence from the Logic/canon audit contract. */
+  readonly repairScope?: "local" | "structural" | "unknown";
 }
 
 export interface ScoredReview {
@@ -111,7 +113,7 @@ export function scoredLogicReviewFromAudit(
     ));
   const findings: ReviewFinding[] = audit.issues.map((issue, index) => ({
     findingId: `logic-${index + 1}`,
-    severity: issue.severity === "critical"
+    severity: issue.severity === "critical" || issue.blocking === true || issue.explicitSeverity === "CRITICAL"
       ? "CRITICAL"
       : issue.explicitSeverity === "MAJOR"
         ? "MAJOR"
@@ -119,17 +121,29 @@ export function scoredLogicReviewFromAudit(
     evidence: issue.description,
     impact: issue.category,
     requiredOutcome: issue.suggestion,
+    ...(issue.repairScope ? { repairScope: issue.repairScope } : {}),
   }));
-  const authorityBlocker = audit.issues.some((issue) => issue.severity === "critical"
+  const authorityBlocker = audit.issues.some((issue, index) =>
+    (findings[index]?.severity === "CRITICAL" || findings[index]?.severity === "MAJOR")
     && /authority|global lock|blueprint|canon source/i.test(`${issue.category} ${issue.description}`));
   const hasBlocking = findings.some((finding) => finding.severity === "CRITICAL" || finding.severity === "MAJOR");
+  const unexplainedFailure = audit.passed !== true && !hasBlocking;
+  const repairableBlocking = hasBlocking && findings
+    .filter((finding) => finding.severity === "CRITICAL" || finding.severity === "MAJOR")
+    .every((finding) => (finding.repairScope === "local" || finding.repairScope === "structural")
+      && finding.evidence.trim().length > 0
+      && finding.requiredOutcome.trim().length > 0);
   return {
     reviewerRole: "logic-canon-auditor",
     provider: meta.provider,
     model: meta.model,
     totalScore: Math.round(Math.max(0, Math.min(100, score))),
     dimensionScores,
-    decision: invalid ? "INVALID_OUTPUT" : authorityBlocker ? "HELD" : hasBlocking || score < 85 ? "REVISION_REQUIRED" : findings.length > 0 ? "APPROVED_WITH_NOTES" : "APPROVED",
+    decision: invalid
+      ? "INVALID_OUTPUT"
+      : unexplainedFailure || authorityBlocker && !repairableBlocking
+        ? "HELD"
+        : hasBlocking || score < 85 ? "REVISION_REQUIRED" : findings.length > 0 ? "APPROVED_WITH_NOTES" : "APPROVED",
     findings,
     reviewedCandidateSha: meta.candidateSha,
     reviewedAt: new Date().toISOString(),
@@ -150,6 +164,28 @@ function bindReview(review: ScoredReview, candidateSha: string): ScoredReview {
 
 function has(review: ScoredReview, ...severities: ReviewSeverity[]): boolean {
   return review.findings.some((finding) => severities.includes(finding.severity));
+}
+
+function hasBlockingFindings(review: ScoredReview): boolean {
+  return has(review, "CRITICAL", "MAJOR");
+}
+
+function hasRepairableLogicBlockers(review: ScoredReview): boolean {
+  const blocking = review.findings.filter((finding) => finding.severity === "CRITICAL" || finding.severity === "MAJOR");
+  return blocking.length > 0 && blocking.every((finding) =>
+    (finding.repairScope === "local" || finding.repairScope === "structural")
+    && finding.evidence.trim().length > 0
+    && finding.requiredOutcome.trim().length > 0);
+}
+
+function logicReviewNeedsFailClosed(review: ScoredReview): boolean {
+  const heldOrAuthority = review.authorityBlocker === true || review.decision === "HELD";
+  const blocking = hasBlockingFindings(review);
+  return (heldOrAuthority || blocking) && !hasRepairableLogicBlockers(review);
+}
+
+function commercialReviewNeedsFailClosed(review: ScoredReview): boolean {
+  return review.authorityBlocker === true || review.decision === "HELD";
 }
 
 function minimumDimension(review: ScoredReview): number {
@@ -306,11 +342,8 @@ export async function runBoundedReviewCycle(params: {
       candidates, bestCandidate: current, holdReason: "INVALID_OUTPUT", invalidReviewerRole: initialInvalidRole, usageByRole,
     };
   }
-  if (logic.authorityBlocker || commercial.authorityBlocker) {
+  if (logicReviewNeedsFailClosed(logic) || commercialReviewNeedsFailClosed(commercial)) {
     return { status: "BLOCKED_CRITICAL_FINDINGS", grade: "D", finalContent: content, revisionCount: 0, candidates, bestCandidate: current, holdReason: "AUTHORITY_BLOCKER", usageByRole };
-  }
-  if (logic.decision === "HELD" || commercial.decision === "HELD") {
-    return { status: "BLOCKED_CRITICAL_FINDINGS", grade: "D", finalContent: content, revisionCount: 0, candidates, bestCandidate: current, usageByRole };
   }
   if (isApprovedCandidate(current, currentGrade)) {
     return { status: "APPROVED", grade: currentGrade, finalContent: content, revisionCount: 0, candidates, bestCandidate: current, usageByRole };
@@ -340,16 +373,10 @@ export async function runBoundedReviewCycle(params: {
         candidates, bestCandidate: current, holdReason: "INVALID_OUTPUT", invalidReviewerRole: invalidRole, usageByRole,
       };
     }
-    if (logic.authorityBlocker || commercial.authorityBlocker) {
+    if (logicReviewNeedsFailClosed(logic) || commercialReviewNeedsFailClosed(commercial)) {
       return {
         status: "BLOCKED_CRITICAL_FINDINGS", grade: "D", finalContent: content, revisionCount: round,
         candidates, bestCandidate: current, holdReason: "AUTHORITY_BLOCKER", usageByRole,
-      };
-    }
-    if (logic.decision === "HELD" || commercial.decision === "HELD") {
-      return {
-        status: "BLOCKED_CRITICAL_FINDINGS", grade: "D", finalContent: content, revisionCount: round,
-        candidates, bestCandidate: current, usageByRole,
       };
     }
     if (isApprovedCandidate(current, currentGrade)) {
@@ -472,16 +499,10 @@ async function continueBoundedReviewAfterTruthFinding(params: {
         usageByRole,
       };
     }
-    if (logic.authorityBlocker || commercial.authorityBlocker) {
+    if (logicReviewNeedsFailClosed(logic) || commercialReviewNeedsFailClosed(commercial)) {
       return {
         status: "BLOCKED_CRITICAL_FINDINGS", grade: "D", finalContent: content, revisionCount: boundedRound,
         candidates, bestCandidate: current, holdReason: "AUTHORITY_BLOCKER", usageByRole,
-      };
-    }
-    if (logic.decision === "HELD" || commercial.decision === "HELD") {
-      return {
-        status: "BLOCKED_CRITICAL_FINDINGS", grade: "D", finalContent: content, revisionCount: boundedRound,
-        candidates, bestCandidate: current, usageByRole,
       };
     }
     if (isApprovedCandidate(current, currentGrade)) {

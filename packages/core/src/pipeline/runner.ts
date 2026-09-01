@@ -4884,7 +4884,8 @@ ${matrix}`,
       category: finding.impact || "bounded-review",
       description: finding.evidence,
       suggestion: finding.requiredOutcome,
-      repairScope: finding.severity === "CRITICAL" || finding.severity === "MAJOR" ? "structural" : "local",
+      repairScope: finding.repairScope
+        ?? (finding.findingId === "length-budget" ? "structural" : "unknown"),
     }));
   }
 
