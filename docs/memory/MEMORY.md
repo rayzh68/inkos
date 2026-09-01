@@ -122,6 +122,15 @@
 - 该 bounded convergence 已通过 `GPT_AUTONOMOUS_PRODUCTION_COST_SOURCE_REVIEW`，reviewed head `4e732b98f5f7ab9af9ee9136b66717fc55afe401` 经 PR `rayzh68/inkos#19` 以 merge commit `a2fc4f6e02fcc3283924579bde22d08f4d840d4d` 合入 master；开发、审核和落地期间真实 Provider/model calls 与 real-book mutation 均为 0。
 - Cost optimization 到此关闭。在真实连续生产工作之前，不再启动 Logic/Reviser prompt 优化、Planner removal、Provider caching、state/convergence simplification 或额外 selector work；下一优先级回到一键完成 Volume I 的 P0 production continuity closure。
 
+### P0 full-volume autonomous production continuity
+
+- Known-authority、证据充分且可修复的 Logic findings 可以使用既有 `REVISION_1` / `REVISION_2`；grounded Commercial Reader `HELD` 也可以使用同一既有 bounded prose revision slots。
+- Unknown、ambiguous、conflicting、unproven 或无法使用的 authority 继续 fail closed。Commercial Reader `HELD` 若没有 `CRITICAL`/`MAJOR` blocker、non-empty evidence 或 non-empty required outcome，仍立即 fail closed；`INVALID_OUTPUT` 在既有 bounded retry 后 fail closed。
+- Prose revision ceiling 仍为 2；candidate SHA 改变后仍必须取得 fresh Logic 与 fresh Reader。Chapter Transaction、exact-once、Commit、N+1、Stop、budgets、cost convergence 与 state convergence 均未改变。
+- Mocked full-book acceptance 从一次 simulated Start 连续运行 Chapter 006→039，形成 34 个 exact commits；逐章人工动作、duplicate Commit 与 N+1-before-Commit 均为 0，且 Chapter 038 Commit 先于 Chapter 039 Writer。
+- 该 closure 通过 `GPT_P0_FULL_VOLUME_PRODUCTION_SCOPED_REREVIEW`，externally reviewed head `0163976aa6d40d91764b6effb5447a0d3baf442e` 经 PR `rayzh68/inkos#20` 以 merge commit `f29cf9cc36f8262f055edb018b57327618111900` 合入 master。
+- 这是 development/offline PASS，不是真实生产 PASS。落地期间真实 Provider/model calls、real-book mutation 与 Chapter 006/007 action 均为 0；真实 Volume I acceptance 归 user + InkOS UI，Codex 不执行。
+
 ## 5. 不应反复重新设计的架构决定
 
 - Chapter Transaction 是章节生产和提交的正式边界。
