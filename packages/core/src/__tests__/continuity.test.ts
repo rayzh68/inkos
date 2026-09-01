@@ -155,6 +155,9 @@ describe("ContinuityAuditor", () => {
 
       expect(systemPrompt).toContain("ALL OUTPUT MUST BE IN ENGLISH");
       expect(systemPrompt).toContain("PROJECT AUDITOR OVERRIDE");
+      expect(systemPrompt).toContain(
+        'If the relevant authority is missing, ambiguous, conflicting, or cannot be proven from the supplied authority, repair_scope MUST be "unknown"',
+      );
     } finally {
       await rm(root, { recursive: true, force: true });
     }
