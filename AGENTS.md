@@ -29,6 +29,15 @@
 
 平台/OpenAI primitives 提供 main coordination、delegation、independent parallel work、isolated worktrees、reviewable diffs、tests 和 verification。InkOS policy 另行定义 FAST/FULL、Root Cause Lock、Implementation Lock、GPT Source Review、Provider/real-book authorization 和 Chapter Transaction/exact-once/N+1；不得把这些 InkOS policy 描述成唯一或官方的 OpenAI workflow。
 
+### 3.1 Approved InkOS automation integration model
+
+- Top-level Codex remains the InkOS development host and directly owns the authorized InkOS worktree. It may use the existing InkOS FAST / FULL / subagent policy, including isolated Git worktrees for genuinely independent work that satisfies the worktree and one-writer gates above.
+- Only after development, verification, and the bounded commit are complete may top-level Codex invoke the approved AI-Dev-Orchestrator standalone `protocol-run`.
+- `protocol-run` is post-development only. Its authority is limited to Goal validation, Project Context Gate, Authorization, Automated Validation, Evidence Generation, Source Review packaging, and the terminal `AWAITING_GPT_REVIEW` gate.
+- `protocol-run` must not spawn Codex or coordinate a nested development worker. Nested Codex is not required, and AI-Dev-Orchestrator is not the InkOS development host.
+- Browser Bridge is not part of the production development path. GPT handoff remains a manual Review ZIP upload.
+- This integration does not replace or weaken InkOS Root Cause Lock, Implementation Lock, same-worktree one-writer, Provider/real-book authorization, Chapter Transaction, exact-once, N+1, safety, GPT Source Review, push, or merge authorization rules.
+
 ## 4. Development Method V1
 
 ### 4.1 Common sequence
@@ -90,6 +99,17 @@ FAST 仍须锁清 scope、唯一写入者、DoD、验证、allowed/forbidden fil
 - production source、formal tests、project authority docs、formal schemas/manifests、required formal evidence、commits 和 merged PR history 是正式资产，不得作为 cleanup 对象删除。
 - Cleanup 必须同时证明 ownership 与 disposable status。不得因名称或时间“像临时文件”就删除；不得粗暴 recursive delete 未确认目录、destructive Git cleanup、reset 未知修改，或新建 cleanup subsystem、daemon、worktree manager。
 
+### 4.6 Manual pause / resume gate
+
+本 gate 只控制开发自动化任务的人工暂停，不属于 failure、completion 或 task closure，也不授权或定义真实小说生产、Chapter Transaction、Provider call 或 real-book runtime pause。
+
+- 当用户明确要求“人工暂停”“准备关机”“暂停开发”或等价操作时，不再启动新的 subagent、implementation、validation 或下一步骤；当前原子操作收敛到不会遗留半写入状态的安全边界后停止。
+- 暂停 checkpoint 必须记录 repository、worktree、branch、HEAD、Git status、changed files、未提交 diff hash（如有）、当前 Goal/阶段、已完成验证、未完成事项和 next safe action。它补充而不替代正式 task/Goal authority，恢复不得依赖 chat history、browser/Codex UI 或进程内存。不得为了暂停强制 commit 不完整实现，也不得 reset、clean、stash 未知修改；active worktree 必须保留。
+- 可在既有非 Git runtime/evidence 目录保存 retained `MANUAL_PAUSE_CHECKPOINT.json`，但不得把它提交为 InkOS production source。其最小字段为 `task_id`、`repo`、`worktree`、`branch`、`head`、`status_summary`、`changed_files`、`diff_hash`、`goal`、`scope`、`current_phase`、`last_completed_gate`、`completed_verification`、`pending_items`、`next_safe_action` 和 `timestamp`；禁止 credentials、API keys、tokens、Provider secrets 或 private book runtime payloads。
+- 安全 checkpoint 完成且没有不可安全中断的写入或进程时，返回 `RESULT=MANUAL_PAUSE_READY` 与 `SAFE_TO_POWER_OFF=YES`，然后停止。`AWAITING_GPT_REVIEW` 天然是 `SAFE_MANUAL_PAUSE_POINT=YES`，无需额外 commit。
+- 对“立即暂停”或“马上关机”，停止新增动作并尽力保存 checkpoint；不得为完成正常阶段继续长时间运行，也不得把未完成 command/subagent 声称为 PASS。返回 `RESULT=MANUAL_PAUSE_EMERGENCY` 以及按实际进程状态确定的 `SAFE_TO_POWER_OFF=YES|NO`；若为 `NO`，只说明必须等待的最小原子动作。
+- 用户要求“继续上次暂停任务”时，先执行 `RESUME_PRECHECK`：重新读取 authority，并核验 repository identity、worktree、branch、HEAD、Git status、diff hash/changed files、remote/master advancement、active sibling worktrees、previous Goal/scope 和 last completed gate。机器事实与 checkpoint 完全一致才可返回 `RESUME_PRECHECK=PASS` 并从 `NEXT_SAFE_ACTION` 继续；否则返回 `RESULT=BLOCKED_PAUSE_STATE_DRIFT`，不得自动 reset、rebase 或 clean。
+
 ## 5. 实现与审查
 
 - 功能修改和 bugfix 使用 TDD：先写能证明问题的失败测试，确认按预期失败，再做最小实现并确认通过；文档小修按其文档检查验证。
@@ -122,7 +142,7 @@ FAST 仍须锁清 scope、唯一写入者、DoD、验证、allowed/forbidden fil
 - 未获得明确授权，不得 Resume、Rewrite、Abandon、push（除非已预授权）、merge、部署或执行其他 production action。
 - `Ready`、可点击按钮、已有 active job、历史授权、成功测试、Draft Ready、mergeable 或建议的 NEXT 均不是新的生产授权。
 - 禁止修改、清理、reset 或复用 `D:\NovelFactory`；它是已停用/冻结系统。
-- 禁止恢复 `D:\AI-Dev-Orchestrator` 作为当前 InkOS 开发入口，也不得启动其 V0.4 或借其绕过本文件的开发流程。
+- 禁止恢复 `D:\AI-Dev-Orchestrator` 作为当前 InkOS development host/开发入口，也不得启动其 V0.4、nested Codex worker 或借其绕过本文件的开发流程。第 3.1 节批准的 post-development standalone `protocol-run` 只执行 validation/evidence/GPT gate，不构成开发入口。
 - 任务涉及其他仓库、部署、push 或生产执行时，必须取得独立且明确的授权。
 
 ## 8. 不可无意破坏的核心约束

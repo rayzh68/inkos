@@ -1,7 +1,7 @@
 # InkOS Current State
 
-**Snapshot date:** 2026-09-01
-**Task:** `P0_FULL_VOLUME_AUTONOMOUS_PRODUCTION_CLOSURE_FINAL_LANDING` — externally reviewed production-continuity source integration closeout
+**Snapshot date:** 2026-09-02
+**Task:** `INKOS_ORCHESTRATOR_INTEGRATION_RECONCILE_ON_LATEST_MASTER` — bounded authority-document reconciliation after the P0 landing
 **Rule:** 本文件是当前暂停点快照；继续工作前必须重新核验机器事实。
 
 ## 1. Repository
@@ -24,6 +24,29 @@
 | Working state | expected CLEAN after the authorized closeout commit and push; machine verification controls |
 
 The three authority/development-method commits were rebased without conflict onto the merged PR14 authority. Their content remains limited to `.gitignore`, `AGENTS.md`, and four authority Markdown files under `docs/`.
+
+### 1.1 Reconciled AI-Dev-Orchestrator integration
+
+| Field | Current fact |
+| --- | --- |
+| Reconciliation base | `99dd39d65ac5b0f450b14a9441b6bdf0f28daba0` |
+| `DEVELOPMENT_HOST` | `TOP_LEVEL_CODEX` |
+| `ORCHESTRATOR_ROLE` | `POST_DEVELOPMENT_PROTOCOL_VALIDATION_EVIDENCE_GPT_GATE` |
+| `NESTED_CODEX_REQUIRED` | `NO` |
+| `CODEX_SUBAGENT_POLICY` | `INKOS_FAST_FULL_POLICY` |
+| `GPT_REVIEW_MODE` | `MANUAL_REVIEW_ZIP_UPLOAD` |
+| `BROWSER_BRIDGE_PRODUCTION_DEPENDENCY` | `NO` |
+| `MANUAL_DEVELOPMENT_PAUSE` | `SUPPORTED_BY_SAFE_CHECKPOINT_PROTOCOL` |
+| Prior reviewed integration semantics | InkOS HEAD `6e659418b4fb4506d3eb308427172bde7e8984e1`; GPT Source Audit `PASS`; superseded as landing commit by this latest-master reconciliation |
+| Reconciliation protocol-run | `PENDING` |
+| Reconciliation GPT scoped review | `PENDING` |
+| Reconciliation merge | `NO` |
+
+Top-level Codex remains the development host and directly owns the authorized InkOS worktree. AI-Dev-Orchestrator is limited to the approved post-development standalone `protocol-run`: Goal validation, Project Context Gate, Authorization, Automated Validation, Evidence Generation, retained Source Review packaging, and the manual `AWAITING_GPT_REVIEW` stop. It does not launch or coordinate Codex and does not replace InkOS development, Provider/real-book, transaction, safety, review, push, or merge authority.
+
+The manual development pause gate preserves the active worktree and a non-secret machine checkpoint; pause is neither completion nor production authority, and resume requires a fresh machine-state precheck rather than chat or UI memory. `AWAITING_GPT_REVIEW` is a safe manual pause point. This is a development policy, not a claim that Orchestrator durable task-state automation or automatic power-off resume is already implemented. These rules do not alter real-production pause or Chapter execution contracts.
+
+This reconciliation preserves every P0 landing fact below. It is not `CLOSED`: a fresh `protocol-run`, retained Review ZIP, and independent GPT scoped review are still required before any later landing authorization.
 
 ## 2. PR #14 — merged milestone
 
