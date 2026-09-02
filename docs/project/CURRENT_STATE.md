@@ -1,7 +1,7 @@
 # InkOS Current State
 
 **Snapshot date:** 2026-09-02
-**Task:** `INKOS_ORCHESTRATOR_INTEGRATION_RECONCILE_ON_LATEST_MASTER` — bounded authority-document reconciliation after the P0 landing
+**Task:** `INKOS_ORCHESTRATOR_INTEGRATION_SCOPED_REWORK_CURRENT_STATE_ONLY` — correct current production authority after real acceptance
 **Rule:** 本文件是当前暂停点快照；继续工作前必须重新核验机器事实。
 
 ## 1. Repository
@@ -360,46 +360,61 @@ The PR #17 settlement parser correction checks on reviewed head `2e61e146` are l
 - Autonomous chapter convergence PR #18 is merged; reviewed head `d74a0a48` remains directly reachable from master through merge commit `d684c2a8`.
 - Autonomous production cost convergence PR #19 is merged; reviewed head `4e732b98` remains directly reachable from master through merge commit `a2fc4f6e`.
 - P0 full-volume production-continuity PR #20 is merged; externally reviewed head `0163976a` remains directly reachable from master through merge commit `f29cf9cc` and its reviewed six-file source is byte-identical after merge.
-- The real InkOS production remains user-paused at Chapter 006 `SETTLING_STATE` / `PAUSED_PIPELINE_ERROR`; this landing performed no production action.
-- Real Chapter 006 remains uncommitted, and Chapter 007 has not started. The P0 source landing performed no production action.
-- Cost optimization remains closed. The next activity belongs to the user and InkOS UI for real Volume I acceptance; this label is not authorization for Codex to operate the UI, call a Provider/model, or start production.
+- Real production acceptance was attempted after the P0 landing. Chapter 006 advanced through Writer, targeted revision, Logic / Reader convergence, final chapter persistence, truth rebuilding, and State Validation, then failed at `SETTLING_STATE` with `PAUSED_PIPELINE_ERROR`.
+- Real Chapter 005 remains the latest committed authority. Chapter 006 remains uncommitted, and Chapter 007 has not started.
+- `ARCHITECTURE_VERDICT=REBUILD_CORE_PRODUCTION_PATH` means replacing only the truth-settlement production core; it does not mean rebuilding InkOS. The controller, Provider execution, exact-once, Chapter Transaction, Writer / Reviser, Logic / Reader, Commit chain, N+1, and `book-production-map` remain retained architecture.
+- The truth-settlement production core is frozen pending the next architecture lock. No production continuation, Provider/model call, real-book mutation, or real InkOS UI operation is authorized by this snapshot.
 - Authority documents, Development Method V1, official alignment, and the worktree lifecycle rules are the current development authority.
 - Development Method V1 has now been exercised through a complex FULL Subagent Path, scoped re-review, FAST documentation path, and release integration. The PR #20 feature worktree is removed only after the final docs commit push/reachability gate; its completion is proved by the final machine handoff rather than claimed early in this embedded snapshot.
 - No further PR14 business development is authorized by this snapshot.
 
-## 11. Current real production pause — preserved landing authority
+## 11. Current real production authority and architecture verdict
 
-The following formally revalidated machine facts are preserved from the latest read-only evidence; this landing did not reread or mutate real-book artifacts:
+| Field | Current authority |
+| --- | --- |
+| `REAL_ACCEPTANCE_ATTEMPTED` | `YES` |
+| Acceptance progression | Writer → targeted revision → Logic / Reader convergence → final chapter persistence → truth rebuilding → State Validation |
+| `REAL_PRODUCTION_ACCEPTANCE` | `ATTEMPTED_AND_FAILED_AT_SETTLING_STATE` |
+| `REAL_PRODUCTION_PASS` | `NO` |
+| `FAILURE_PHASE` | `SETTLING_STATE` |
+| `FAILURE_STATUS` | `PAUSED_PIPELINE_ERROR` |
+| Root production problem | The truth-settlement path could not project a material transaction consistently across truth surfaces. |
+| `ARCHITECTURE_VERDICT` | `REBUILD_CORE_PRODUCTION_PATH` |
+| Verdict scope | Replace only `TRUTH_SETTLEMENT_PRODUCTION_CORE`; this does not mean rebuild InkOS. |
+| Retained architecture | controller; Provider execution; exact-once; Chapter Transaction; Writer / Reviser; Logic / Reader; Commit chain; N+1; `book-production-map` |
+| `TRUTH_SETTLEMENT_LAYER` | `RED` |
+| `CROSS_SURFACE_CONSISTENCY` | `RED` |
+| `CONTROL_TRANSACTION_LAYER` | `GREEN` |
+| Chapter 005 | `LATEST_COMMITTED_AUTHORITY` |
+| Chapter 006 | `UNCOMMITTED` |
+| Chapter 007 | `NOT_STARTED` |
+| `CURRENT_REAL_JOB_ID` | `REQUIRES_MACHINE_REVALIDATION` |
+| `CURRENT_REAL_TRANSACTION_ID` | `REQUIRES_MACHINE_REVALIDATION` |
+| `REAL_PRODUCTION_STATUS` | `FROZEN_PENDING_TRUTH_SETTLEMENT_CORE_REPLACEMENT_ARCHITECTURE_LOCK` |
 
-- latest committed authority: Chapter 005;
-- current target: Chapter 006;
-- runtime status / phase: `PAUSED_PIPELINE_ERROR` / `SETTLING_STATE`;
-- real job: `autonomous-d69ce3bf6834220e42624eb34672b3ca`;
-- real transaction: `chapter-txn-590cbd1b1d3d3602205cf462edd5afa692c5cbb8`;
-- persisted recovery mode: `current-volume`;
-- Chapter 006 committed: no;
-- Chapter 007 started: no;
-- real production remains user-paused.
-
-The existing recovery identity must not be migrated to `full-book` during landing. No production authorization is granted to Codex.
+The prior published job and transaction identifiers are not current authority without fresh machine proof. This documentation-only correction did not inspect or mutate runtime artifacts, did not execute the replacement, and did not change Chapter Transaction, exact-once, N+1, Provider behavior, Writer / Reviser, Logic / Reader, Commit, truth-settlement implementation, UI, recovery, or `book-production-map`.
 
 ## 12. Production authorization
 
 | Action | Authorized now? |
 | --- | --- |
 | Read system-development Git/docs evidence | Yes, read-only |
-| Real Provider/model call | No |
-| Real-book/runtime mutation | No |
-| Chapter 005 Resume / Rewrite / Abandon / Commit | No |
-| Chapter 006 start | No |
-| Codex operation of the real InkOS UI | No |
-| NovelFactory or AI-Dev-Orchestrator modification | No |
+| `REAL_PROVIDER_CALLS_AUTHORIZED` | `NO` |
+| `REAL_MODEL_CALLS_AUTHORIZED` | `NO` |
+| `REAL_BOOK_MUTATION_AUTHORIZED` | `NO` |
+| Resume / Rewrite / Start | No |
+| Chapter 007 action | No |
+| `CODEX_REAL_UI_OPERATION_AUTHORIZED` | `NO` |
+| `ORCHESTRATOR_REAL_UI_OPERATION_AUTHORIZED` | `NO` |
+| NovelFactory modification | No |
+
+This freeze remains in force until the next architecture task is independently reviewed and explicitly authorized. It prohibits Resume, Rewrite, Start, Chapter 007, real Provider/model calls, real-book mutation, and Codex or Orchestrator operation of the real InkOS UI.
 
 ## 13. NEXT
 
-`RETURN_TO_USER_AND_INKOS_UI_FOR_REAL_VOLUME_I_ACCEPTANCE`
+`CANONICAL_CHAPTER_DELTA_AND_TRUTH_SETTLEMENT_CORE_REPLACEMENT_ARCHITECTURE_LOCK`
 
-The externally reviewed P0 source is landed, but real production has not been tested. Codex stops here. Any Studio cold start, UI action, Chapter 006 Resume/Rewrite/Abandon, real Provider/model call, or real-book/runtime mutation belongs to a later user-controlled InkOS UI preflight and requires its own explicit authority.
+This is the next architecture task, not authorization to execute it. Codex stops here without implementation, continued real acceptance, Studio/UI action, Chapter action, Provider/model call, or real-book/runtime mutation.
 
 ## 14. Update triggers
 
