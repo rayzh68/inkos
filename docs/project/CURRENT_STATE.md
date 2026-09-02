@@ -408,7 +408,7 @@ The prior published job and transaction identifiers are not current authority wi
 | `ORCHESTRATOR_REAL_UI_OPERATION_AUTHORIZED` | `NO` |
 | NovelFactory modification | No |
 
-This freeze remains in force until the next architecture task is independently reviewed and explicitly authorized. It prohibits Resume, Rewrite, Start, Chapter 007, real Provider/model calls, real-book mutation, and Codex or Orchestrator operation of the real InkOS UI.
+The real-production freeze remains in force until all of the following are complete: the approved truth-settlement core replacement is implemented; the implementation passes required development verification; the implementation passes independent external GPT Source Review; the reviewed implementation is landed into formal repository authority; the resulting runtime passes required development and cold-start preflight; and the user grants a separate explicit authorization for real production acceptance. Architecture Lock approval alone does not lift the real-production freeze. Until that later separate production authorization, the freeze prohibits Resume, Rewrite, or Start of Chapter 006; Start of Chapter 007; real Provider/model calls; real-book or real-runtime mutation; and Codex or Orchestrator operation of the real InkOS UI.
 
 ## 13. NEXT
 
