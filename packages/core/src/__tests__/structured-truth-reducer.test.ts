@@ -43,6 +43,35 @@ function predecessor(): StructuredTruthV1 {
 }
 
 function accepted(operations: BoundChapterDeltaBodyV1["operations"], prior = predecessor(), chapterNumber = 1): AcceptedChapterDeltaV1 {
+  const evidence: BoundChapterDeltaBodyV1["evidence"] = [{ kind: "FINAL_PROSE_SPAN", evidenceId: "ev-0001", startUtf16: 0, endUtf16: 1, quote: "x", candidateSha256: A }];
+  let evidenceOrdinal = 2;
+  const targetEvidenceIds = new Map<string, string>();
+  const boundOperations = operations.map((operation) => {
+    const target = operation.kind === "SET_FACT" || operation.kind === "RETRACT_FACT"
+      ? { nodeKind: "FACT_SLOT" as const, nodeId: operation.factSlotId }
+      : operation.kind === "SET_RELATION" || operation.kind === "RETRACT_RELATION"
+        ? { nodeKind: "RELATION" as const, nodeId: operation.relationId }
+        : undefined;
+    const requiresTargetEvidence = target !== undefined
+      && (operation.kind === "RETRACT_FACT" || operation.kind === "RETRACT_RELATION" || operation.before.state !== "UNKNOWN");
+    if (!target || !requiresTargetEvidence) return operation;
+    const record = target.nodeKind === "FACT_SLOT"
+      ? prior.facts.find((item) => item.factSlotId === target.nodeId)
+      : prior.relations.find((item) => item.relationId === target.nodeId);
+    if (!record) return operation;
+    const targetKey = `${target.nodeKind}:${target.nodeId}`;
+    let evidenceId = targetEvidenceIds.get(targetKey);
+    if (!evidenceId) {
+      evidenceId = `ev-${String(evidenceOrdinal).padStart(4, "0")}`;
+      evidenceOrdinal += 1;
+      targetEvidenceIds.set(targetKey, evidenceId);
+      evidence.push({
+        kind: "PREDECESSOR_TRUTH_RECORD", evidenceId, recordRef: target,
+        recordSha256: canonicalSha256(record), predecessorTruthSha256: canonicalSha256(prior),
+      });
+    }
+    return { ...operation, evidenceIds: [...operation.evidenceIds, evidenceId] };
+  });
   const body: BoundChapterDeltaBodyV1 = {
     schemaVersion: "1.0",
     transactionId: "txn-1",
@@ -58,8 +87,8 @@ function accepted(operations: BoundChapterDeltaBodyV1["operations"], prior = pre
     providerArtifactSha256: D,
     responseContentSha256: E,
     proposedDeltaCanonicalSha256: A,
-    evidence: [{ kind: "FINAL_PROSE_SPAN", evidenceId: "ev-0001", startUtf16: 0, endUtf16: 1, quote: "x", candidateSha256: A }],
-    operations,
+    evidence,
+    operations: boundOperations,
   };
   return { schemaVersion: "1.0", deltaId: canonicalSha256(body), delta: body };
 }
@@ -142,15 +171,19 @@ describe("pure structured-truth reducer", () => {
   });
 
   it("fails atomically on a stale before-value", () => {
-    const prior = predecessor();
+    const baseline = predecessor();
     const { entityId, operation } = entityDeclaration();
     const factKeyEntryId = createVocabularyCatalogV1([]).entries.find((entry) => entry.canonicalName === "state.status")!.entryId;
     const factSlotId = deriveFactSlotId({ bookId: "book-1", subjectEntityId: entityId, factKeyEntryId });
-    const delta = accepted([operation, {
+    const prior = reduceStructuredTruthV1({ predecessor: baseline, acceptedDelta: accepted([operation, {
       kind: "SET_FACT", operationId: "op-0002", subject: { nodeKind: "ENTITY", nodeId: entityId },
-      factKeyEntryId, factSlotId, before: { state: "ABSENT" },
-      after: { state: "VALUE", value: { valueType: "STRING", value: "active" } }, evidenceIds: ["ev-0001"],
-    }], prior);
+      factKeyEntryId, factSlotId, before: { state: "UNKNOWN" }, after: { state: "ABSENT" }, evidenceIds: ["ev-0001"],
+    }], baseline) });
+    const delta = accepted([{
+      kind: "SET_FACT", operationId: "op-0001", subject: { nodeKind: "ENTITY", nodeId: entityId },
+      factKeyEntryId, factSlotId, before: { state: "VALUE", value: { valueType: "STRING", value: "active" } },
+      after: { state: "VALUE", value: { valueType: "STRING", value: "inactive" } }, evidenceIds: ["ev-0001"],
+    }], prior, 2);
     const priorBytes = canonicalJson(prior);
     expect(() => reduceStructuredTruthV1({ predecessor: prior, acceptedDelta: delta })).toThrow(/before|UNKNOWN/i);
     expect(canonicalJson(prior)).toBe(priorBytes);
