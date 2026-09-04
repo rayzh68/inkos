@@ -157,7 +157,88 @@ function entityRefFactProposal(candidate: string): ChapterDeltaProposalV1 {
   } as ChapterDeltaProposalV1;
 }
 
+function predecessorWithFactAndRelation(): StructuredTruthV1 {
+  const candidate = "Ada knows that her current operational codename is Raven.";
+  const admitted = admitChapterDeltaV1({ rawProposal: JSON.stringify(sameDeltaProposal(candidate)), candidate, predecessor: emptyTruth(), host: hostFor(candidate) });
+  if (admitted.status !== "ACCEPTED") throw new Error("expected accepted predecessor fixture");
+  return reduceStructuredTruthV1({ predecessor: emptyTruth(), acceptedDelta: admitted.acceptedDelta });
+}
+
+function replacementProposal(
+  candidate: string,
+  predecessor: StructuredTruthV1,
+  kind: "SET_FACT" | "RETRACT_FACT" | "SET_RELATION" | "RETRACT_RELATION",
+  evidence: "PROSE_ONLY" | "SUBJECT_ONLY" | "TARGET" | "WRONG_TARGET_HASH",
+): ChapterDeltaProposalV1 {
+  const fact = predecessor.facts[0]!;
+  const relation = predecessor.relations[0]!;
+  const target = kind.endsWith("FACT")
+    ? { nodeKind: "FACT_SLOT" as const, nodeId: fact.factSlotId }
+    : { nodeKind: "RELATION" as const, nodeId: relation.relationId };
+  const subject = kind.endsWith("FACT") ? fact.subject : relation.subject;
+  const record = kind.endsWith("FACT") ? fact : relation;
+  const evidenceRecords: any[] = [{ kind: "FINAL_PROSE_SPAN", evidenceId: "ev-0001", startUtf16: 0, endUtf16: candidate.length, quote: candidate }];
+  if (evidence !== "PROSE_ONLY") evidenceRecords.push({
+    kind: "PREDECESSOR_TRUTH_RECORD",
+    evidenceId: "ev-0002",
+    recordRef: evidence === "SUBJECT_ONLY" ? subject : target,
+    recordSha256: evidence === "WRONG_TARGET_HASH" ? "f".repeat(64) : canonicalSha256(evidence === "SUBJECT_ONLY" ? predecessor.entities[0] : record),
+  });
+  const evidenceIds = evidence === "PROSE_ONLY" ? ["ev-0001"] : ["ev-0001", "ev-0002"];
+  const operation: any = kind.endsWith("FACT")
+    ? {
+      kind, operationId: "op-0001", subject: { refType: "ENTITY_ID", entityId: fact.subject.nodeId },
+      factKey: { refType: "FACT_KEY_ENTRY_ID", entryId: fact.factKeyEntryId }, before: fact.assertion,
+      after: kind === "SET_FACT" ? { state: "VALUE", value: { valueType: "STRING", value: "Crow" } } : { state: "UNKNOWN" }, evidenceIds,
+    }
+    : {
+      kind, operationId: "op-0001", subject: { nodeKind: relation.subject.nodeKind, refType: "NODE_ID", nodeId: relation.subject.nodeId },
+      relationPredicate: { refType: "RELATION_PREDICATE_ENTRY_ID", entryId: relation.predicateEntryId },
+      object: { nodeKind: relation.object.nodeKind, refType: "NODE_ID", nodeId: relation.object.nodeId }, before: relation.assertion,
+      after: kind === "SET_RELATION" ? { state: relation.assertion.state === "PRESENT" ? "ABSENT" : "PRESENT" } : { state: "UNKNOWN" }, evidenceIds,
+    };
+  return { schemaVersion: "1.0", kind: "CHAPTER_DELTA_PROPOSAL", status: "READY", operations: [operation], evidence: evidenceRecords, ambiguities: [] } as ChapterDeltaProposalV1;
+}
+
 describe("ChapterDelta proposal admission", () => {
+  it("requires exact target predecessor records for replacements and retractions in proposal, bound, and accepted admission", () => {
+    const predecessor = predecessorWithFactAndRelation();
+    const candidate = "Ada's current codename changes to Crow.";
+    const host = hostFor(candidate, predecessor);
+    for (const kind of ["SET_FACT", "RETRACT_FACT", "SET_RELATION", "RETRACT_RELATION"] as const) {
+      expect(() => admitChapterDeltaV1({ rawProposal: JSON.stringify(replacementProposal(candidate, predecessor, kind, "PROSE_ONLY")), candidate, predecessor, host }))
+        .toThrow(/exact target predecessor evidence/i);
+    }
+    const absentFactPredecessor = structuredClone(predecessor);
+    absentFactPredecessor.facts[0]!.assertion = { state: "ABSENT" };
+    expect(() => admitChapterDeltaV1({ rawProposal: JSON.stringify(replacementProposal(candidate, absentFactPredecessor, "SET_FACT", "PROSE_ONLY")), candidate, predecessor: absentFactPredecessor, host: hostFor(candidate, absentFactPredecessor) }))
+      .toThrow(/exact target predecessor evidence/i);
+    const absentRelationPredecessor = structuredClone(predecessor);
+    absentRelationPredecessor.relations[0]!.assertion = { state: "ABSENT" };
+    expect(() => admitChapterDeltaV1({ rawProposal: JSON.stringify(replacementProposal(candidate, absentRelationPredecessor, "SET_RELATION", "PROSE_ONLY")), candidate, predecessor: absentRelationPredecessor, host: hostFor(candidate, absentRelationPredecessor) }))
+      .toThrow(/exact target predecessor evidence/i);
+    expect(() => admitChapterDeltaV1({ rawProposal: JSON.stringify(replacementProposal(candidate, predecessor, "SET_FACT", "SUBJECT_ONLY")), candidate, predecessor, host }))
+      .toThrow(/exact target predecessor evidence/i);
+    expect(() => admitChapterDeltaV1({ rawProposal: JSON.stringify(replacementProposal(candidate, predecessor, "SET_FACT", "WRONG_TARGET_HASH")), candidate, predecessor, host }))
+      .toThrow(/record hash mismatch/i);
+
+    const admitted = admitChapterDeltaV1({ rawProposal: JSON.stringify(replacementProposal(candidate, predecessor, "SET_FACT", "TARGET")), candidate, predecessor, host });
+    expect(admitted.status).toBe("ACCEPTED");
+    if (admitted.status !== "ACCEPTED") throw new Error("expected exact-target replacement fixture");
+    const loaded = structuredClone(admitted.acceptedDelta) as any;
+    loaded.delta.evidence = loaded.delta.evidence.filter((item: { evidenceId: string }) => item.evidenceId !== "ev-0002");
+    loaded.delta.operations[0].evidenceIds = ["ev-0001"];
+    loaded.deltaId = canonicalSha256(loaded.delta);
+    expect(() => validateBoundChapterDeltaBodyV1(loaded.delta)).toThrow(/exact target predecessor evidence/i);
+    expect(() => validateAcceptedChapterDeltaV1(loaded, predecessor)).toThrow(/exact target predecessor evidence/i);
+  });
+
+  it("preserves prose-only admission for UNKNOWN-to-new fact and relation assertions", () => {
+    const candidate = "Ada knows that her current operational codename is Raven.";
+    expect(admitChapterDeltaV1({ rawProposal: JSON.stringify(sameDeltaProposal(candidate)), candidate, predecessor: emptyTruth(), host: hostFor(candidate) }).status)
+      .toBe("ACCEPTED");
+  });
+
   it("binds same-delta entity, vocabulary, fact-slot, and higher-order relation references", () => {
     const candidate = "Ada knows that her current operational codename is Raven.";
     const result = admitChapterDeltaV1({
