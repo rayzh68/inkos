@@ -43,7 +43,7 @@ function predecessor(): StructuredTruthV1 {
 }
 
 function accepted(operations: BoundChapterDeltaBodyV1["operations"], prior = predecessor(), chapterNumber = 1): AcceptedChapterDeltaV1 {
-  const evidence: BoundChapterDeltaBodyV1["evidence"] = [{ kind: "FINAL_PROSE_SPAN", evidenceId: "ev-0001", startUtf16: 0, endUtf16: 1, quote: "x", candidateSha256: A }];
+  const evidence: BoundChapterDeltaBodyV1["evidence"][number][] = [{ kind: "FINAL_PROSE_SPAN", evidenceId: "ev-0001", startUtf16: 0, endUtf16: 1, quote: "x", candidateSha256: A }];
   let evidenceOrdinal = 2;
   const targetEvidenceIds = new Map<string, string>();
   const boundOperations = operations.map((operation) => {

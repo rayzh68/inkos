@@ -422,19 +422,25 @@ function assertPredecessorEvidenceCompatibility(
       throw new Error("Predecessor evidence must equal the operation target, subject, or object");
     }
   }
-  assertRequiredTargetPredecessorEvidence(operation, proposed.evidenceIds.map((evidenceId) => evidence.get(evidenceId)!));
+  assertRequiredTargetPredecessorEvidence(
+    object(operation, "bound operation"),
+    proposed.evidenceIds.map((evidenceId) => object(evidence.get(evidenceId)!, "predecessor evidence")),
+  );
 }
 
 function assertRequiredTargetPredecessorEvidence(
-  operation: BoundOperationV1,
-  cited: readonly { readonly kind: string; readonly recordRef?: unknown }[],
+  operation: Readonly<Record<string, unknown>>,
+  cited: readonly Readonly<Record<string, unknown>>[],
 ): void {
-  const replacement = (operation.kind === "SET_FACT" || operation.kind === "SET_RELATION") && operation.before.state !== "UNKNOWN";
-  const retraction = operation.kind === "RETRACT_FACT" || operation.kind === "RETRACT_RELATION";
+  const kind = operation.kind;
+  const replacement = (kind === "SET_FACT" || kind === "SET_RELATION") && object(operation.before, "bound operation before").state !== "UNKNOWN";
+  const retraction = kind === "RETRACT_FACT" || kind === "RETRACT_RELATION";
   if (!replacement && !retraction) return;
-  const target = operation.kind === "SET_FACT" || operation.kind === "RETRACT_FACT"
-    ? { nodeKind: "FACT_SLOT", nodeId: operation.factSlotId }
-    : { nodeKind: "RELATION", nodeId: operation.relationId };
+  const targetId = kind === "SET_FACT" || kind === "RETRACT_FACT" ? operation.factSlotId : operation.relationId;
+  if (typeof targetId !== "string") throw new Error("Replacement or retraction target is missing");
+  const target = kind === "SET_FACT" || kind === "RETRACT_FACT"
+    ? { nodeKind: "FACT_SLOT", nodeId: targetId }
+    : { nodeKind: "RELATION", nodeId: targetId };
   if (!cited.some((evidence) => evidence.kind === "PREDECESSOR_TRUTH_RECORD" && canonicalJson(evidence.recordRef) === canonicalJson(target))) {
     throw new Error("Replacement or retraction requires exact target predecessor evidence");
   }
@@ -718,7 +724,7 @@ export function validateBoundChapterDeltaBodyV1(input: unknown): BoundChapterDel
         permitted.add(canonicalJson(operation.subject)); permitted.add(canonicalJson(operation.object)); permitted.add(canonicalJson({ nodeKind: "RELATION", nodeId: operation.relationId }));
       }
       for (const evidence of cited) if (evidence.kind === "PREDECESSOR_TRUTH_RECORD" && !permitted.has(canonicalJson(evidence.recordRef))) throw new Error("Bound predecessor evidence must equal the operation target, subject, or object");
-      assertRequiredTargetPredecessorEvidence(operation as BoundOperationV1, cited);
+      assertRequiredTargetPredecessorEvidence(operation, cited);
     }
   }
   const usedEvidenceIds = new Set((value.operations as Array<{ evidenceIds: string[] }>).flatMap((operation) => operation.evidenceIds));

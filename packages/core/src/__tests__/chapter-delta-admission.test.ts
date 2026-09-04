@@ -209,11 +209,11 @@ describe("ChapterDelta proposal admission", () => {
       expect(() => admitChapterDeltaV1({ rawProposal: JSON.stringify(replacementProposal(candidate, predecessor, kind, "PROSE_ONLY")), candidate, predecessor, host }))
         .toThrow(/exact target predecessor evidence/i);
     }
-    const absentFactPredecessor = structuredClone(predecessor);
+    const absentFactPredecessor = { ...predecessor, facts: predecessor.facts.map((fact) => ({ ...fact })) };
     absentFactPredecessor.facts[0]!.assertion = { state: "ABSENT" };
     expect(() => admitChapterDeltaV1({ rawProposal: JSON.stringify(replacementProposal(candidate, absentFactPredecessor, "SET_FACT", "PROSE_ONLY")), candidate, predecessor: absentFactPredecessor, host: hostFor(candidate, absentFactPredecessor) }))
       .toThrow(/exact target predecessor evidence/i);
-    const absentRelationPredecessor = structuredClone(predecessor);
+    const absentRelationPredecessor = { ...predecessor, relations: predecessor.relations.map((relation) => ({ ...relation })) };
     absentRelationPredecessor.relations[0]!.assertion = { state: "ABSENT" };
     expect(() => admitChapterDeltaV1({ rawProposal: JSON.stringify(replacementProposal(candidate, absentRelationPredecessor, "SET_RELATION", "PROSE_ONLY")), candidate, predecessor: absentRelationPredecessor, host: hostFor(candidate, absentRelationPredecessor) }))
       .toThrow(/exact target predecessor evidence/i);
