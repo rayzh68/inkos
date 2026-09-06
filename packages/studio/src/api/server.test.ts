@@ -351,6 +351,7 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
     resolveProductionScope: actual.resolveProductionScope,
     createAutonomousPipelineActions: actual.createAutonomousPipelineActions,
     assertChapterAuthorityMutationAllowed: actual.assertChapterAuthorityMutationAllowed,
+    assertTruthMutationAllowed: actual.assertTruthMutationAllowed,
     assertChapterWriterStartAllowed: actual.assertChapterWriterStartAllowed,
     inspectChapterAuthority: actual.inspectChapterAuthority,
     isChapterTransactionEnabled: actual.isChapterTransactionEnabled,
@@ -903,6 +904,23 @@ describe("createStudioServer daemon lifecycle", () => {
     await expect(readFile(join(storyDir, "current_focus.md"), "utf-8")).resolves.toBe(
       "# Current Focus\n\nPull focus back to the harbor trail.\n",
     );
+  });
+
+  it("rejects truth PUT on ambiguous durable cutover evidence before writing but keeps F planning editable", async () => {
+    const bookDir = join(root, "books", "truth-policy");
+    await mkdir(join(bookDir, "story/runtime/chapter-transactions/chapter-0001"), { recursive: true });
+    await writeFile(join(bookDir, "story/runtime/chapter-transactions/chapter-0001/transaction.json"), JSON.stringify({ truthMode: "CANONICAL_V2" }));
+    await writeFile(join(bookDir, "story/current_state.md"), "before");
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+    const request = (file: string) => app.request(`http://localhost/api/v1/books/truth-policy/truth/${file}`, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content: "after" }),
+    });
+    const denied = await request("current_state.md");
+    expect(denied.status).toBe(409);
+    expect(await readFile(join(bookDir, "story/current_state.md"), "utf8")).toBe("before");
+    expect((await request("outline/story_frame.md")).status).toBe(200);
+    expect(await readFile(join(bookDir, "story/outline/story_frame.md"), "utf8")).toBe("after");
   });
 
   it("exposes runtime context trace files as read-only truth diagnostics", async () => {

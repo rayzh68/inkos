@@ -25,18 +25,16 @@ function TypeScriptFiles(root: string): string[] {
   });
 }
 
-describe("Package A dormant boundary", () => {
-  it("adds exactly the nine locked production modules without exporting them from the package index", () => {
+describe("Package A activation boundary", () => {
+  it("keeps the nine locked Package A modules and exports their Package B public authority", () => {
     for (const modulePath of packageAModules) {
       expect(statSync(join(sourceRoot, modulePath)).isFile(), modulePath).toBe(true);
     }
     const index = readFileSync(join(sourceRoot, "index.ts"), "utf8");
-    for (const modulePath of packageAModules) {
-      expect(index, modulePath).not.toContain(modulePath.replace(/\.ts$/, ".js"));
-    }
+    for (const modulePath of packageAModules) expect(index, modulePath).toContain(modulePath.replace(/\.ts$/, ".js"));
   });
 
-  it("proves no pre-Package-B production source consumes the dormant core", () => {
+  it("limits Package A consumers to the locked Package B implementation files", () => {
     const importNeedles = [
       "models/chapter-delta", "models/structured-truth", "state/canonical-json", "state/truth-identities",
       "state/truth-vocabulary", "state/chapter-delta-admission", "state/structured-truth-reducer",
@@ -46,6 +44,19 @@ describe("Package A dormant boundary", () => {
       .filter((path) => !packageAModules.has(relative(sourceRoot, path).replace(/\\/g, "/")))
       .filter((path) => importNeedles.some((needle) => readFileSync(path, "utf8").includes(needle)))
       .map((path) => relative(sourceRoot, path).replace(/\\/g, "/"));
-    expect(consumers).toEqual([]);
+    expect(consumers.sort()).toEqual([
+      "agents/composer.ts",
+      "agents/continuity.ts",
+      "agents/planner.ts",
+      "agents/reviser.ts",
+      "agents/truth-extractor.ts",
+      "agents/truth-validator.ts",
+      "agents/writer.ts",
+      "index.ts",
+      "pipeline/canonical-truth-transaction.ts",
+      "pipeline/runner.ts",
+      "production/chapter-transaction.ts",
+      "utils/planning-materials.ts",
+    ]);
   });
 });

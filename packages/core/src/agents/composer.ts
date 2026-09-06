@@ -30,6 +30,8 @@ import type {
   ReferenceSectionSelectionRequest,
 } from "../references/reference-context.js";
 import { parseBookProductionMap, type ProductionVolume } from "../production/book-production-map.js";
+import { validateStructuredTruthV1, type StructuredTruthV1 } from "../models/structured-truth.js";
+import { canonicalJson } from "../state/canonical-json.js";
 
 export interface ComposeChapterInput {
   readonly book: BookConfig;
@@ -43,6 +45,8 @@ export interface ComposeChapterInput {
   readonly memorySemanticSelector?: MemorySemanticSelector;
   readonly strictStructuralOutlineSelection?: boolean;
   readonly onContextCompression?: ContextCompressionCallback;
+  /** Verified immutable predecessor authority supplied by the Chapter Transaction V2 gate. */
+  readonly authoritativeTruth?: StructuredTruthV1;
 }
 
 export type BookReferenceContextProvider = (
@@ -104,6 +108,7 @@ export async function composeGovernedChapter(input: ComposeChapterInput): Promis
     input.book.id,
     input.book.title,
     input.strictStructuralOutlineSelection === true,
+    input.authoritativeTruth,
   );
   const referenceContext = await loadReferenceContext(input);
   const selectedContext = [...baseContext.entries, ...referenceContext.entries];
@@ -123,7 +128,7 @@ export async function composeGovernedChapter(input: ComposeChapterInput): Promis
   const contextPackage = budgeted.contextPackage;
 
   const ruleStack = buildGovernedRuleStack(input.plan, input.chapterNumber);
-  const trace = buildGovernedTrace({
+  const baseTrace = buildGovernedTrace({
     chapterNumber: input.chapterNumber,
     plan: input.plan,
     contextPackage,
@@ -139,6 +144,18 @@ export async function composeGovernedChapter(input: ComposeChapterInput): Promis
         : {}),
     },
   });
+  const authoritativeSources = contextPackage.selectedContext
+    .filter((entry) => entry.source === "authority/committed-v2/state/truth.json")
+    .map((entry) => entry.source);
+  const trace: ChapterTrace = authoritativeSources.length === 0
+    ? baseTrace
+    : {
+        ...baseTrace,
+        contextTiers: {
+          protectedSources: [...new Set([...baseTrace.contextTiers.protectedSources, ...authoritativeSources])],
+          compressibleSources: baseTrace.contextTiers.compressibleSources.filter((source) => !authoritativeSources.includes(source)),
+        },
+      };
   const {
     contextPath,
     ruleStackPath,
@@ -186,8 +203,8 @@ async function applyContextBudgetIfNeeded(params: {
     return { contextPackage: params.contextPackage, notes: [] };
   }
 
-  const protectedEntries = selectedContext.filter((entry) => isProtectedContextSource(entry.source));
-  const compressibleEntries = selectedContext.filter((entry) => !isProtectedContextSource(entry.source));
+  const protectedEntries = selectedContext.filter((entry) => isComposerProtectedContextSource(entry.source));
+  const compressibleEntries = selectedContext.filter((entry) => !isComposerProtectedContextSource(entry.source));
   const protectedTokens = estimateSelectedContextTokens(protectedEntries);
   if (protectedTokens > availableInputTokens) {
     params.onContextCompression?.({
@@ -298,6 +315,10 @@ async function applyContextBudgetIfNeeded(params: {
       budgetTokens: compileBudget,
     },
   };
+}
+
+function isComposerProtectedContextSource(source: string): boolean {
+  return source === "authority/committed-v2/state/truth.json" || isProtectedContextSource(source);
 }
 
 function estimateSelectedContextTokens(entries: ContextPackage["selectedContext"]): number {
@@ -583,6 +604,7 @@ async function collectSelectedContext(
   bookId?: string,
   bookTitle?: string,
   strictStructuralOutlineSelection = false,
+  authoritativeTruth?: StructuredTruthV1,
 ): Promise<{
   readonly entries: ContextPackage["selectedContext"];
   readonly retrievalTrace: MemoryRetrievalTrace;
@@ -605,6 +627,18 @@ async function collectSelectedContext(
           excerpt: `goal=${plan.memo.goal}`,
         }];
 
+    const authoritativeTruthEntry = authoritativeTruth
+      ? (() => {
+          const truth = validateStructuredTruthV1(structuredClone(authoritativeTruth));
+          if (bookId && truth.bookId !== bookId) throw new Error("Authoritative truth book identity mismatch");
+          if (truth.throughChapter !== plan.intent.chapter - 1) throw new Error("Authoritative truth predecessor chapter mismatch");
+          return {
+            source: "authority/committed-v2/state/truth.json",
+            reason: "Verified immutable predecessor StructuredTruthV1 for N+1 governed writing.",
+            excerpt: canonicalJson(truth),
+          };
+        })()
+      : null;
     const entries = await Promise.all([
       maybeContextSource(
         storyDir,
@@ -621,11 +655,13 @@ async function collectSelectedContext(
         "audit_drift.md",
         "Carry forward audit drift guidance from the previous chapter without polluting hard state facts.",
       ),
-      maybeContextSource(
-        storyDir,
-        "current_state.md",
-        "Preserve hard state facts referenced by the active chapter brief or hard constraints.",
-      ),
+      authoritativeTruth
+        ? Promise.resolve(null)
+        : maybeContextSource(
+            storyDir,
+            "current_state.md",
+            "Preserve hard state facts referenced by the active chapter brief or hard constraints.",
+          ),
     ]);
     const outlineEntries = [
       ...await maybeOutlineSectionSources(
@@ -665,22 +701,41 @@ async function collectSelectedContext(
         "Preserve extracted fanfic canon constraints for governed writing.",
       ),
     ]);
-    const trailEntries = await buildRecentChapterTrailEntries(storyDir, plan.intent.chapter);
+    const trailEntries = authoritativeTruth
+      ? []
+      : await buildRecentChapterTrailEntries(storyDir, plan.intent.chapter);
 
-    const memorySelection = await retrieveMemorySelection({
-      bookDir: dirname(storyDir),
-      chapterNumber: plan.intent.chapter,
-      goal: plan.intent.goal,
-      outlineNode: plan.intent.outlineNode,
-      mustKeep: retrievalHints,
-      semanticSelector: memorySemanticSelector,
-    });
-    const hookDebtEntries = await buildHookDebtEntries(
-      storyDir,
-      plan,
-      memorySelection.activeHooks,
-      language,
-    );
+    const memorySelection = authoritativeTruth
+      ? {
+          summaries: [],
+          hooks: [],
+          activeHooks: [],
+          recyclableHooks: [],
+          facts: [],
+          volumeSummaries: [],
+          dbPath: "",
+          retrievalTrace: {
+            engine: "sqlite-fts5-bm25" as const,
+            query: "committed-v2-authority",
+            candidates: [],
+          },
+        }
+      : await retrieveMemorySelection({
+          bookDir: dirname(storyDir),
+          chapterNumber: plan.intent.chapter,
+          goal: plan.intent.goal,
+          outlineNode: plan.intent.outlineNode,
+          mustKeep: retrievalHints,
+          semanticSelector: memorySemanticSelector,
+        });
+    const hookDebtEntries = authoritativeTruth
+      ? []
+      : await buildHookDebtEntries(
+          storyDir,
+          plan,
+          memorySelection.activeHooks,
+          language,
+        );
 
     const summaryEntries = memorySelection.summaries.map((summary) => ({
       source: `story/chapter_summaries.md#${summary.chapter}`,
@@ -689,7 +744,7 @@ async function collectSelectedContext(
         .filter(Boolean)
         .join(" | "),
     }));
-    const factEntries = memorySelection.facts.map((fact) => ({
+    const factEntries = authoritativeTruth ? [] : memorySelection.facts.map((fact) => ({
       source: `story/current_state.md#${toFactAnchor(fact.predicate)}`,
       reason: "Relevant current-state fact retrieved for the current chapter goal.",
       excerpt: `${fact.predicate} | ${fact.object}`,
@@ -710,6 +765,7 @@ async function collectSelectedContext(
     return {
       entries: [
         ...chapterMemoEntry,
+        ...(authoritativeTruthEntry ? [authoritativeTruthEntry] : []),
         ...entries.filter((entry): entry is NonNullable<typeof entry> => entry !== null),
         ...outlineEntries,
         ...canonEntries.filter((entry): entry is NonNullable<typeof entry> => entry !== null),

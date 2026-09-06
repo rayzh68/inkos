@@ -1,5 +1,10 @@
 import type { LLMClient, LLMMessage, LLMResponse, OnStreamProgress } from "../llm/provider.js";
-import { runWorkerAgent, runWorkerAgentTool, type WorkerResultTool } from "../agent/worker-agent.js";
+import {
+  runWorkerAgent,
+  runWorkerAgentTool,
+  type FinalProviderRequestObservation,
+  type WorkerResultTool,
+} from "../agent/worker-agent.js";
 import type { Static, TSchema } from "@sinclair/typebox";
 import { appendPromptPackGuidance } from "../prompts/prompt-pack.js";
 import { searchWeb, fetchUrl } from "../utils/web-search.js";
@@ -20,6 +25,12 @@ export interface AgentContext {
   readonly activatedSkills?: ReadonlyArray<ActivatedSkillGuidance>;
 }
 
+interface AgentChatOptions {
+  readonly temperature?: number;
+  readonly maxTokens?: number;
+  readonly onFinalProviderRequest?: (request: FinalProviderRequestObservation) => void | Promise<void>;
+}
+
 export abstract class BaseAgent {
   protected readonly ctx: AgentContext;
 
@@ -33,7 +44,7 @@ export abstract class BaseAgent {
 
   protected async chat(
     messages: ReadonlyArray<LLMMessage>,
-    options?: { readonly temperature?: number; readonly maxTokens?: number },
+    options?: AgentChatOptions,
   ): Promise<LLMResponse> {
     return runWorkerAgent(this.ctx.client, this.ctx.model, await this.appendTaskSkillGuidance(messages), {
       ...options,
@@ -89,14 +100,11 @@ export abstract class BaseAgent {
    */
   protected async chatWithSearch(
     messages: ReadonlyArray<LLMMessage>,
-    options?: { readonly temperature?: number; readonly maxTokens?: number },
+    options?: AgentChatOptions,
   ): Promise<LLMResponse> {
     // OpenAI has native search — use it directly
     if (this.ctx.client.provider === "openai") {
-      return runWorkerAgent(this.ctx.client, this.ctx.model, appendActivatedSkillGuidance(
-        messages,
-        this.ctx.activatedSkills,
-      ), {
+      return runWorkerAgent(this.ctx.client, this.ctx.model, await this.appendTaskSkillGuidance(messages), {
         ...options,
         webSearch: true,
         onStreamProgress: this.ctx.onStreamProgress,

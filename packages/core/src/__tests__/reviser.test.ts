@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { ReviserAgent } from "../agents/reviser.js";
 import { buildLengthSpec } from "../utils/length-metrics.js";
 import type { AuditIssue } from "../agents/continuity.js";
+import { canonicalJson } from "../state/canonical-json.js";
+import { createVocabularyCatalogV1 } from "../state/truth-vocabulary.js";
 
 const ZERO_USAGE = {
   promptTokens: 0,
@@ -22,6 +24,65 @@ const CRITICAL_ISSUE: AuditIssue = {
 describe("ReviserAgent", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it("repairs a Chapter-1 prose defect from verified V2 truth with the exact empty predecessor", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-reviser-v2-authority-"));
+    const bookDir = join(root, "book");
+    const storyDir = join(bookDir, "story");
+    await mkdir(join(storyDir, "snapshots", "0"), { recursive: true });
+    await mkdir(join(bookDir, "chapters"), { recursive: true });
+    await writeFile(join(bookDir, "book.json"), JSON.stringify({ id: "book-1", title: "Book", genre: "xuanhuan", platform: "royalroad", chapterWordCount: 800, targetChapters: 10, status: "active", language: "en", createdAt: "2026-09-04", updatedAt: "2026-09-04" }));
+    for (const path of [
+      join(storyDir, "current_state.md"), join(storyDir, "particle_ledger.md"), join(storyDir, "pending_hooks.md"),
+      join(storyDir, "chapter_summaries.md"), join(storyDir, "character_matrix.md"),
+      join(storyDir, "snapshots", "0", "current_state.md"), join(storyDir, "snapshots", "0", "particle_ledger.md"),
+      join(storyDir, "snapshots", "0", "pending_hooks.md"), join(storyDir, "snapshots", "0", "chapter_summaries.md"),
+      join(bookDir, "chapters", "0000_Public.md"),
+    ]) await writeFile(path, `MUTABLE_POISON:${path}`, "utf8");
+    const authoritativeTruth = {
+      schemaVersion: "1.0", kind: "STRUCTURED_TRUTH", bookId: "book-1", throughChapter: 0,
+      lineage: { kind: "BASELINE", predecessorCommitSha256: "a".repeat(64), baselineSourceManifestSha256: "b".repeat(64), seedVocabularyCatalogSha256: "c".repeat(64), baselineMethod: "DETERMINISTIC", baselineConstructionReceiptSha256: "d".repeat(64) },
+      vocabulary: createVocabularyCatalogV1([]), entities: [], facts: [], relations: [],
+      provenance: { schemaVersion: "1.0", producerKind: "BASELINE", producerId: "inkos.truth-baseline.builder.v1", producerVersion: "1.0", canonicalizationId: "inkos.jcs-ijson.v1", truthSchemaVersion: "1.0", vocabularySchemaVersion: "1.0", coreVocabularyVersion: "1.0" },
+    } as const;
+    const agent = new ReviserAgent({ client: { provider: "openai", apiFormat: "chat", stream: false, defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} } }, model: "test-model", projectRoot: root });
+    const chatSpy = vi.spyOn(ReviserAgent.prototype as never, "chat" as never).mockResolvedValue({
+      content: "=== FIXED_ISSUES ===\n- fixed\n\n=== REVISED_CONTENT ===\nRevised.", usage: ZERO_USAGE,
+    });
+    try {
+      await agent.reviseChapter(bookDir, "Original.", 1, [CRITICAL_ISSUE], "rewrite", "xuanhuan", {
+        authoritativeTruth,
+        predecessorChapterBody: "",
+      } as never);
+      const prompt = (chatSpy.mock.calls[0]?.[0] as ReadonlyArray<{ content: string }>).map((message) => message.content).join("\n");
+      expect(prompt).toContain(canonicalJson(authoritativeTruth));
+      expect(prompt).toContain("opening chapter");
+      expect(prompt).not.toContain("MUTABLE_POISON");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an empty V2 predecessor after Chapter 1", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-reviser-v2-empty-later-"));
+    const bookDir = join(root, "book");
+    await mkdir(join(bookDir, "story"), { recursive: true });
+    const authoritativeTruth = {
+      schemaVersion: "1.0", kind: "STRUCTURED_TRUTH", bookId: "book-1", throughChapter: 1,
+      lineage: { kind: "CHAPTER_DELTA", predecessorCommitSha256: "a".repeat(64), predecessorTruthSha256: "b".repeat(64), predecessorVocabularyCatalogSha256: "c".repeat(64), candidateSha256: "d".repeat(64), deltaId: "e".repeat(64), acceptedDeltaArtifactSha256: "f".repeat(64) },
+      vocabulary: createVocabularyCatalogV1([]), entities: [], facts: [], relations: [],
+      provenance: { schemaVersion: "1.0", producerKind: "CHAPTER_DELTA", producerId: "inkos.structured-truth.reducer.v1", producerVersion: "1.0", canonicalizationId: "inkos.jcs-ijson.v1", truthSchemaVersion: "1.0", vocabularySchemaVersion: "1.0", coreVocabularyVersion: "1.0" },
+    } as const;
+    const agent = new ReviserAgent({ client: { provider: "openai", apiFormat: "chat", stream: false, defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} } }, model: "test-model", projectRoot: root });
+    try {
+      await expect(agent.reviseChapter(bookDir, "Original.", 2, [CRITICAL_ISSUE], "rewrite", "xuanhuan", {
+        authoritativeTruth,
+        predecessorChapterBody: "",
+      } as never)).rejects.toThrow(/immutable predecessor chapter prose/i);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("prefers book language override when building revision prompts", async () => {

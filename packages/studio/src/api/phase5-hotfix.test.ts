@@ -24,6 +24,9 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
 
   class MockStateManager {
     constructor(private readonly root: string) {}
+    acquireBookLock(id: string) {
+      return new actual.StateManager(this.root).acquireBookLock(id);
+    }
     async listBooks(): Promise<string[]> {
       return [];
     }
@@ -78,6 +81,7 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
     createLogger: vi.fn(() => logger),
     computeAnalytics: vi.fn(() => ({})),
     isSafeBookId: actual.isSafeBookId,
+    assertTruthMutationAllowed: actual.assertTruthMutationAllowed,
     chatCompletion: chatCompletionMock,
     loadProjectConfig: loadProjectConfigMock,
     GLOBAL_ENV_PATH: join(tmpdir(), "inkos-global.env"),

@@ -1,5 +1,7 @@
 import { readFile, writeFile, mkdir, readdir, rm, stat, unlink, open } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { assertLegacyTruthMutationAllowed, assertTruthMutationAllowed } from "../interaction/truth-authority.js";
+import { safeMutationPath } from "../utils/path-safety.js";
 import { join, resolve } from "node:path";
 import type { BookConfig } from "../models/book.js";
 import type { ChapterMeta } from "../models/chapter.js";
@@ -547,6 +549,7 @@ export class StateManager {
     index: ReadonlyArray<ChapterMeta>,
     options: { readonly allowEmptyWithChapterFiles?: boolean } = {},
   ): Promise<void> {
+    await assertTruthMutationAllowed({ bookDir, relativePath: "chapters/index.json" });
     const chaptersDir = join(bookDir, "chapters");
     await mkdir(chaptersDir, { recursive: true });
     const safeIndex = index.length === 0 && !options.allowEmptyWithChapterFiles
@@ -564,14 +567,16 @@ export class StateManager {
   }
 
   async snapshotStateAt(bookDir: string, chapterNumber: number): Promise<void> {
+    await assertTruthMutationAllowed({ bookDir, relativePath: `story/snapshots/${chapterNumber}` });
     const storyDir = join(bookDir, "story");
     const snapshotDir = join(storyDir, "snapshots", String(chapterNumber));
-    await mkdir(snapshotDir, { recursive: true });
 
     const files = [
       "current_state.md", "particle_ledger.md", "pending_hooks.md",
       "chapter_summaries.md", "subplot_board.md", "emotional_arcs.md", "character_matrix.md",
     ];
+    await this.preflightStateCopy(bookDir, chapterNumber, files, false);
+    await mkdir(snapshotDir, { recursive: true });
     await Promise.all(
       files.map(async (f) => {
         try {
@@ -651,6 +656,7 @@ export class StateManager {
   }
 
   async restoreState(bookId: string, chapterNumber: number): Promise<boolean> {
+    await assertLegacyTruthMutationAllowed(this.bookDir(bookId));
     const storyDir = join(this.bookDir(bookId), "story");
     const snapshotDir = join(storyDir, "snapshots", String(chapterNumber));
 
@@ -658,6 +664,7 @@ export class StateManager {
       "current_state.md", "particle_ledger.md", "pending_hooks.md",
       "chapter_summaries.md", "subplot_board.md", "emotional_arcs.md", "character_matrix.md",
     ];
+    await this.preflightStateCopy(this.bookDir(bookId), chapterNumber, files, true);
     try {
       // current_state.md and pending_hooks.md are required;
       // particle_ledger.md is optional (numericalSystem=false genres don't have it)
@@ -709,6 +716,28 @@ export class StateManager {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  private async preflightStateCopy(bookDir: string, chapterNumber: number, files: readonly string[], restoring: boolean): Promise<void> {
+    const snapshot = `story/snapshots/${chapterNumber}`;
+    for (const file of files) {
+      await safeMutationPath(bookDir, `story/${file}`);
+      await safeMutationPath(bookDir, `${snapshot}/${file}`);
+    }
+    const names = new Set<string>();
+    for (const directory of ["story/state", `${snapshot}/state`]) {
+      const path = await safeMutationPath(bookDir, directory);
+      const entries = await readdir(path).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return [];
+        throw error;
+      });
+      for (const name of entries) names.add(name);
+    }
+    for (const name of names) {
+      await safeMutationPath(bookDir, `story/state/${name}`);
+      await safeMutationPath(bookDir, `${snapshot}/state/${name}`);
+      if (restoring) await assertTruthMutationAllowed({ bookDir, relativePath: `story/state/${name}` });
     }
   }
 

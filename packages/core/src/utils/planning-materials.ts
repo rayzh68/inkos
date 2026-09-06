@@ -11,6 +11,8 @@ import {
   readVolumeMap,
   readCurrentStateWithFallback,
 } from "./outline-paths.js";
+import { validateStructuredTruthV1, type StructuredTruthV1 } from "../models/structured-truth.js";
+import { canonicalJson } from "../state/canonical-json.js";
 
 export interface PlanningSeedMaterials {
   readonly storyDir: string;
@@ -26,6 +28,7 @@ export interface PlanningSeedMaterials {
   readonly recentSummaries: ReadonlyArray<StoredSummary>;
   readonly previousEndingHook?: string;
   readonly previousEndingExcerpt?: string;
+  readonly authoritativeTruthJson?: string;
 }
 
 export interface PlanningMaterials extends PlanningSeedMaterials {
@@ -85,6 +88,8 @@ async function readPreviousEndingExcerpt(
 export async function loadPlanningSeedMaterials(params: {
   readonly bookDir: string;
   readonly chapterNumber: number;
+  readonly authoritativeTruth?: StructuredTruthV1;
+  readonly predecessorChapterBody?: string;
 }): Promise<PlanningSeedMaterials> {
   const storyDir = join(params.bookDir, "story");
   const sourcePaths = {
@@ -100,6 +105,15 @@ export async function loadPlanningSeedMaterials(params: {
   // outline/volume_map.md). Fall back to the legacy files transparently.
   const placeholder = "(文件尚未创建)";
 
+  const authoritativeTruth = params.authoritativeTruth
+    ? validateStructuredTruthV1(structuredClone(params.authoritativeTruth))
+    : undefined;
+  if (authoritativeTruth && authoritativeTruth.throughChapter !== params.chapterNumber - 1) {
+    throw new Error("Planner authoritative truth predecessor chapter mismatch");
+  }
+  if (authoritativeTruth && params.predecessorChapterBody === undefined) {
+    throw new Error("Planner immutable predecessor prose is missing");
+  }
   const [
     authorIntent,
     currentFocus,
@@ -115,12 +129,14 @@ export async function loadPlanningSeedMaterials(params: {
     readFileOrDefault(sourcePaths.currentFocus),
     readStoryFrame(params.bookDir, placeholder),
     readVolumeMap(params.bookDir, placeholder),
-    readFileOrDefault(sourcePaths.chapterSummaries),
+    authoritativeTruth ? Promise.resolve("") : readFileOrDefault(sourcePaths.chapterSummaries),
     readFileOrDefault(sourcePaths.bookRules),
     // Phase 5 consolidation: derive initial state from roles + pending_hooks
     // seed rows when current_state.md is still just the architect's placeholder.
-    readCurrentStateWithFallback(params.bookDir, placeholder),
-    readPreviousEndingExcerpt(params.bookDir, params.chapterNumber),
+    authoritativeTruth ? Promise.resolve(canonicalJson(authoritativeTruth)) : readCurrentStateWithFallback(params.bookDir, placeholder),
+    authoritativeTruth
+      ? Promise.resolve(params.predecessorChapterBody!.trim().slice(-320).trim() || undefined)
+      : readPreviousEndingExcerpt(params.bookDir, params.chapterNumber),
     readBriefFile(sourcePaths.brief),
   ]);
 
@@ -141,6 +157,7 @@ export async function loadPlanningSeedMaterials(params: {
     recentSummaries: chapterSummaries.slice(0, 4).sort((left, right) => left.chapter - right.chapter),
     previousEndingHook: chapterSummaries[0]?.hookActivity || undefined,
     previousEndingExcerpt,
+    ...(authoritativeTruth ? { authoritativeTruthJson: canonicalJson(authoritativeTruth) } : {}),
   };
 }
 
@@ -151,13 +168,20 @@ export async function gatherPlanningMaterials(params: {
   readonly outlineNode?: string;
   readonly mustKeep?: ReadonlyArray<string>;
   readonly seed?: PlanningSeedMaterials;
+  readonly authoritativeTruth?: StructuredTruthV1;
+  readonly predecessorChapterBody?: string;
 }): Promise<PlanningMaterials> {
   const seed = params.seed ?? await loadPlanningSeedMaterials({
     bookDir: params.bookDir,
     chapterNumber: params.chapterNumber,
+    ...(params.authoritativeTruth ? { authoritativeTruth: params.authoritativeTruth } : {}),
+    ...(params.predecessorChapterBody !== undefined ? { predecessorChapterBody: params.predecessorChapterBody } : {}),
   });
 
-  const memorySelection = await retrieveMemorySelection({
+  const memorySelection = seed.authoritativeTruthJson ? {
+    summaries: [], hooks: [], activeHooks: [], recyclableHooks: [], facts: [], volumeSummaries: [], dbPath: "",
+    retrievalTrace: { engine: "sqlite-fts5-bm25" as const, query: "committed-v2-authority", candidates: [] },
+  } : await retrieveMemorySelection({
     bookDir: params.bookDir,
     chapterNumber: params.chapterNumber,
     goal: params.goal,
@@ -175,11 +199,15 @@ export async function gatherPlanningMaterials(params: {
       join(seed.storyDir, "current_focus.md"),
       join(seed.storyDir, "outline", "story_frame.md"),
       join(seed.storyDir, "outline", "volume_map.md"),
-      join(seed.storyDir, "chapter_summaries.md"),
       join(seed.storyDir, "book_rules.md"),
-      join(seed.storyDir, "current_state.md"),
-      join(seed.storyDir, "pending_hooks.md"),
-      ...(memorySelection.dbPath ? [memorySelection.dbPath] : []),
+      ...(seed.authoritativeTruthJson
+        ? ["authority/committed-v2/state/truth.json", "authority/committed-v2/chapter.md"]
+        : [
+            join(seed.storyDir, "chapter_summaries.md"),
+            join(seed.storyDir, "current_state.md"),
+            join(seed.storyDir, "pending_hooks.md"),
+            ...(memorySelection.dbPath ? [memorySelection.dbPath] : []),
+          ]),
     ],
   };
 }

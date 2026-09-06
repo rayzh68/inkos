@@ -1,4 +1,6 @@
 import { BaseAgent } from "./base.js";
+import { assertLegacyTruthMutationAllowed } from "../interaction/truth-authority.js";
+import { safeMutationPath } from "../utils/path-safety.js";
 import type { BookConfig } from "../models/book.js";
 import type { GenreProfile } from "../models/genre-profile.js";
 import type { BookRules } from "../models/book-rules.js";
@@ -58,6 +60,8 @@ import {
   readCharacterContext,
   readCurrentStateWithFallback,
 } from "../utils/outline-paths.js";
+import { validateStructuredTruthV1, type StructuredTruthV1 } from "../models/structured-truth.js";
+import { canonicalJson } from "../state/canonical-json.js";
 
 export interface WriteChapterInput {
   readonly book: BookConfig;
@@ -74,6 +78,12 @@ export interface WriteChapterInput {
   readonly temperatureOverride?: number;
   /** Formal transaction flow defers paid truth extraction until literary review selects final prose. */
   readonly deferStateSettlement?: boolean;
+  /** Verified immutable predecessor authority supplied by the V2 transaction gate. */
+  readonly authoritativeTruth?: StructuredTruthV1;
+  /** Exact verified predecessor chapter body from immutable Commit V2 authority. */
+  readonly predecessorChapterBody?: string;
+  /** Bounded recent chapter bodies loaded only from verified immutable Commit V2 bundles. */
+  readonly immutableRecentChapterBodies?: ReadonlyArray<string>;
 }
 
 export interface SettleChapterStateInput {
@@ -168,6 +178,16 @@ export class WriterAgent extends BaseAgent {
     const { book, bookDir, chapterNumber } = input;
 
     const placeholder = "(文件尚未创建)";
+    const authoritativeTruthJson = input.authoritativeTruth
+      ? canonicalJson(validateStructuredTruthV1(structuredClone(input.authoritativeTruth)))
+      : undefined;
+    if (input.authoritativeTruth && (input.authoritativeTruth.bookId !== book.id || input.authoritativeTruth.throughChapter !== chapterNumber - 1)) {
+      throw new Error("Writer authoritative truth predecessor identity mismatch");
+    }
+    if (input.authoritativeTruth && input.predecessorChapterBody === undefined) {
+      throw new Error("Writer immutable predecessor prose is missing");
+    }
+    const canonicalTruthSurface = authoritativeTruthJson ?? placeholder;
     const [
       volumeOutline, styleGuide, currentState, ledger, hooks,
       chapterSummaries, subplotBoard, emotionalArcs, characterMatrix, styleProfileRaw,
@@ -179,18 +199,20 @@ export class WriterAgent extends BaseAgent {
         // section. When the file is only a seed placeholder, derive initial state
         // from roles/*.Current_State + pending_hooks startChapter=0 rows so the
         // writer still sees substantive content instead of a runtime-append note.
-        readCurrentStateWithFallback(bookDir, placeholder),
-        this.readFileOrDefault(join(bookDir, "story/particle_ledger.md")),
-        this.readFileOrDefault(join(bookDir, "story/pending_hooks.md")),
-        this.readFileOrDefault(join(bookDir, "story/chapter_summaries.md")),
-        this.readFileOrDefault(join(bookDir, "story/subplot_board.md")),
-        this.readFileOrDefault(join(bookDir, "story/emotional_arcs.md")),
-        readCharacterContext(bookDir, placeholder),
+        authoritativeTruthJson ? Promise.resolve(canonicalTruthSurface) : readCurrentStateWithFallback(bookDir, placeholder),
+        authoritativeTruthJson ? Promise.resolve(canonicalTruthSurface) : this.readFileOrDefault(join(bookDir, "story/particle_ledger.md")),
+        authoritativeTruthJson ? Promise.resolve(canonicalTruthSurface) : this.readFileOrDefault(join(bookDir, "story/pending_hooks.md")),
+        authoritativeTruthJson ? Promise.resolve(canonicalTruthSurface) : this.readFileOrDefault(join(bookDir, "story/chapter_summaries.md")),
+        authoritativeTruthJson ? Promise.resolve(canonicalTruthSurface) : this.readFileOrDefault(join(bookDir, "story/subplot_board.md")),
+        authoritativeTruthJson ? Promise.resolve(canonicalTruthSurface) : this.readFileOrDefault(join(bookDir, "story/emotional_arcs.md")),
+        authoritativeTruthJson ? Promise.resolve(canonicalTruthSurface) : readCharacterContext(bookDir, placeholder),
         this.readFileOrDefault(join(bookDir, "story/style_profile.json")),
         this.readFileOrDefault(join(bookDir, "story/fanfic_canon.md")),
       ]);
 
-    const fingerprintChapters = await this.loadRecentChapters(bookDir, chapterNumber, 5);
+    const fingerprintChapters = authoritativeTruthJson
+      ? input.predecessorChapterBody!
+      : await this.loadRecentChapters(bookDir, chapterNumber, 5);
 
     // Load genre profile + book rules
     const { profile: genreProfile, body: genreBody } =
@@ -210,10 +232,15 @@ export class WriterAgent extends BaseAgent {
     }
     const governedMemoryBlocks = buildGovernedMemoryEvidenceBlocks(input.contextPackage, resolvedLanguage);
     const englishVarianceBrief = resolvedLanguage === "en"
-      ? await buildEnglishVarianceBrief({
-          bookDir,
-          chapterNumber,
-        })
+      ? input.authoritativeTruth
+        ? await buildEnglishVarianceBrief({
+            chapterNumber,
+            authorityChapterBodies: input.immutableRecentChapterBodies ?? [],
+          })
+        : await buildEnglishVarianceBrief({
+            bookDir,
+            chapterNumber,
+          })
       : null;
 
     // Build fanfic context if fanfic_canon.md exists
@@ -233,7 +260,7 @@ export class WriterAgent extends BaseAgent {
       resolvedLengthSpec,
     ), "longform.writer");
 
-    const creativeUserPrompt = this.buildGovernedUserPrompt({
+    const creativeUserPromptBase = this.buildGovernedUserPrompt({
       chapterNumber,
       chapterMemo: input.chapterMemo,
       chapterIntentData: input.chapterIntentData,
@@ -245,6 +272,9 @@ export class WriterAgent extends BaseAgent {
       varianceBrief: englishVarianceBrief?.text,
       selectedEvidenceBlock: this.joinGovernedEvidenceBlocks(governedMemoryBlocks),
     });
+    const creativeUserPrompt = authoritativeTruthJson
+      ? `${creativeUserPromptBase}\n\n## Verified committed V2 truth authority (complete)\n${authoritativeTruthJson}\n\n## Verified immutable predecessor chapter prose\n${input.predecessorChapterBody}`
+      : creativeUserPromptBase;
 
     const creativeTemperature = input.temperatureOverride ?? 0.7;
 
@@ -682,6 +712,10 @@ export class WriterAgent extends BaseAgent {
     numericalSystem: boolean = true,
     language: "zh" | "en" = "zh",
   ): Promise<void> {
+    await assertLegacyTruthMutationAllowed(bookDir);
+    for (const path of ["chapters", "story/state", "story/current_state.md", "story/pending_hooks.md", "story/particle_ledger.md", "story/chapter_summaries.md", "story/subplot_board.md", "story/emotional_arcs.md", "story/character_matrix.md"]) {
+      await safeMutationPath(bookDir, path, path === "story/state");
+    }
     const chaptersDir = join(bookDir, "chapters");
     await mkdir(chaptersDir, { recursive: true });
 

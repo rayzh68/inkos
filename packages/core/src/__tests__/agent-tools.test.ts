@@ -1459,13 +1459,16 @@ describe("agent deterministic writing tools", () => {
     const tool = createWriteFileTool(root);
 
     const result = await tool.execute("tool-10", {
-      path: "harbor/story/runtime/notes.md",
+      path: "harbor/story/outline/notes.md",
       content: "# Notes\n\nWatch the harbor ledger.\n",
     });
 
     expect(result.content[0]?.type).toBe("text");
-    await expect(readFile(join(state.bookDir("harbor"), "story", "runtime", "notes.md"), "utf-8"))
+    await expect(readFile(join(state.bookDir("harbor"), "story", "outline", "notes.md"), "utf-8"))
       .resolves.toContain("Watch the harbor ledger");
+    const protectedWrite = await tool.execute("tool-runtime", { path: "harbor/story/runtime/notes.md", content: "forbidden" });
+    expect(JSON.stringify(protectedWrite)).toContain("TRUTH_AUTHORITY_MUTATION_FORBIDDEN");
+    await expect(readFile(join(state.bookDir("harbor"), "story/runtime/notes.md"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("writes Phase 5 outline truth files through write_truth_file", async () => {

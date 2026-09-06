@@ -1,5 +1,34 @@
+import { createHash } from "node:crypto";
 import { BaseAgent, type AgentContext } from "./base.js";
 import type { ScoredReview, ReviewFinding } from "../pipeline/bounded-review.js";
+import type { LLMMessage } from "../llm/provider.js";
+import type { FinalProviderRequestObservation } from "../agent/worker-agent.js";
+
+export interface ReviewProviderRequestEvidence {
+  readonly provider: string;
+  readonly model: string;
+  readonly messages: readonly LLMMessage[];
+  readonly temperature: number;
+  readonly maxTokens: number;
+  readonly stream: boolean;
+  readonly webSearch: boolean;
+  readonly extra: Readonly<Record<string, unknown>>;
+  readonly reviewLanguage?: "zh" | "en";
+  readonly inputFingerprint: string;
+}
+
+export function fingerprintReviewProviderRequest(
+  request: Omit<ReviewProviderRequestEvidence, "inputFingerprint">,
+): string {
+  return createHash("sha256").update(JSON.stringify({
+    provider: request.provider,
+    model: request.model,
+    messages: request.messages,
+    temperature: request.temperature,
+    maxTokens: request.maxTokens,
+    stream: request.stream,
+  }), "utf8").digest("hex");
+}
 
 const DIMENSIONS = [
   "opening_hook",
@@ -85,6 +114,10 @@ export function parseCommercialReaderResponse(
     if (decision !== "APPROVED" && decision !== "APPROVED_WITH_NOTES" && decision !== "REVISION_REQUIRED" && decision !== "HELD") {
       return invalid(meta);
     }
+    if ((decision === "APPROVED" || decision === "APPROVED_WITH_NOTES")
+      && findings.some((finding) => finding.severity === "CRITICAL" || finding.severity === "MAJOR")) {
+      return invalid(meta);
+    }
     return {
       reviewerRole: "commercial-reader",
       provider: meta.provider,
@@ -115,8 +148,9 @@ export class CommercialReaderAgent extends BaseAgent {
     readonly content: string;
     readonly candidateSha: string;
     readonly chapterIntent?: string;
-  }): Promise<ScoredReview> {
-    const response = await this.chat([
+    readonly onFinalProviderRequest?: (request: FinalProviderRequestObservation) => void | Promise<void>;
+  }): Promise<ScoredReview & { readonly providerRequest?: ReviewProviderRequestEvidence; readonly providerInputFingerprint?: string }> {
+    const messages: readonly LLMMessage[] = [
       {
         role: "system",
         content: `You are an independent commercial reader for English-language fiction. Do not alter canon or prose. Score only reader experience and return JSON with reviewer_role, total_score, dimension_scores, decision, and findings. decision MUST be exactly one of: APPROVED, APPROVED_WITH_NOTES, REVISION_REQUIRED, HELD. Return a JSON object shaped like {"reviewer_role":"commercial-reader","total_score":90,"dimension_scores":{"opening_hook":90,"pacing_tension":90,"emotional_investment":90,"plot_clarity":90,"dialogue_appeal":90,"western_cultural_naturalness":90,"commercial_appeal":90,"ending_hook":90},"decision":"APPROVED","findings":[]}. Dimensions and weights: opening_hook 15, pacing_tension 20, emotional_investment 20, plot_clarity 10, dialogue_appeal 10, western_cultural_naturalness 10, commercial_appeal 10, ending_hook 5. Every finding requires finding_id, severity CRITICAL|MAJOR|MINOR|NOTE, evidence, impact, required_outcome. Empty, truncated, wrong-chapter, or wrong-enum output is INVALID_OUTPUT.`,
@@ -125,12 +159,25 @@ export class CommercialReaderAgent extends BaseAgent {
         role: "user",
         content: `Review Chapter ${params.chapterNumber}.\n\nChapter intent:\n${params.chapterIntent ?? "(not supplied)"}\n\nCandidate:\n${params.content}`,
       },
-    ], { temperature: 0.2 });
+    ];
+    const temperature = 0.2;
+    const observed: { current?: FinalProviderRequestObservation } = {};
+    const response = await this.chat(messages, {
+      temperature,
+      onFinalProviderRequest: async (request) => {
+        await params.onFinalProviderRequest?.(request);
+        observed.current = request;
+      },
+    });
     const result = parseCommercialReaderResponse(response.content, {
       candidateSha: params.candidateSha,
       provider: this.ctx.client.service ?? this.ctx.client.provider,
       model: this.ctx.model,
     });
-    return { ...result, tokenUsage: response.usage };
+    if (!observed.current) return { ...result, tokenUsage: response.usage };
+    const providerRequestUnsigned = { ...observed.current, reviewLanguage: "en" as const };
+    const providerInputFingerprint = fingerprintReviewProviderRequest(providerRequestUnsigned);
+    const providerRequest = { ...providerRequestUnsigned, inputFingerprint: providerInputFingerprint };
+    return { ...result, tokenUsage: response.usage, providerRequest, providerInputFingerprint };
   }
 }

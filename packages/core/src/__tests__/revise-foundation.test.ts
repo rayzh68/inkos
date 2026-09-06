@@ -29,6 +29,24 @@ const testBook = (): BookConfig => ({
 });
 
 describe("architect generateFoundation with reviseFrom option", () => {
+  it("preflights nested foundation junctions before Runner backups or Provider admission", async () => {
+    const { mkdtemp, mkdir, rm, symlink, readdir } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { PipelineRunner } = await import("../pipeline/runner.js");
+    const root = await mkdtemp(join(tmpdir(), "inkos-foundation-boundary-"));
+    try {
+      const story = join(root, "books/test-book/story");
+      await mkdir(join(story, "roles"), { recursive: true });
+      await mkdir(join(root, "outside"));
+      await symlink(join(root, "outside"), join(story, "roles/redirect"), "junction");
+      const generation = vi.spyOn(ArchitectAgent.prototype, "generateFoundation").mockRejectedValue(new Error("forbidden model work"));
+      await expect(new PipelineRunner({ client: TEST_CLIENT, model: "test", projectRoot: root }).reviseFoundation("test-book", "revise"))
+        .rejects.toThrow("UNSAFE_PATH_COMPONENT");
+      expect(generation).not.toHaveBeenCalled();
+      expect((await readdir(story)).filter((name) => name.startsWith(".backup-"))).toEqual([]);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
   afterEach(() => {
     vi.restoreAllMocks();
   });

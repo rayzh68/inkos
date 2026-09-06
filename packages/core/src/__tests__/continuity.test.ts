@@ -2,7 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ContinuityAuditor } from "../agents/continuity.js";
+import type { StructuredTruthV1 } from "../models/structured-truth.js";
+import { createVocabularyCatalogV1 } from "../state/truth-vocabulary.js";
+import { canonicalJson } from "../state/canonical-json.js";
+import { ContinuityAuditor, parseContinuityAuditResponse } from "../agents/continuity.js";
 import {
   bindCandidateFactEvidence,
   buildSemanticAdjudicationBatch,
@@ -16,9 +19,69 @@ const ZERO_USAGE = {
   totalTokens: 0,
 } as const;
 
+function committedTruthForAudit(): StructuredTruthV1 {
+  return {
+    schemaVersion: "1.0", kind: "STRUCTURED_TRUTH", bookId: "audit-v2", throughChapter: 0,
+    lineage: { kind: "BASELINE", predecessorCommitSha256: "a".repeat(64), baselineSourceManifestSha256: "b".repeat(64), seedVocabularyCatalogSha256: "c".repeat(64), baselineMethod: "DETERMINISTIC", baselineConstructionReceiptSha256: "d".repeat(64) },
+    vocabulary: createVocabularyCatalogV1([]), entities: [], facts: [], relations: [],
+    provenance: { schemaVersion: "1.0", producerKind: "BASELINE", producerId: "inkos.truth-baseline.builder.v1", producerVersion: "1.0", canonicalizationId: "inkos.jcs-ijson.v1", truthSchemaVersion: "1.0", vocabularySchemaVersion: "1.0", coreVocabularyVersion: "1.0" },
+  };
+}
+
 describe("ContinuityAuditor", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it("uses complete committed V2 truth and excludes every mutable legacy truth surface", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-auditor-v2-authority-"));
+    const bookDir = join(root, "books", "audit-v2");
+    const storyDir = join(bookDir, "story");
+    await mkdir(join(storyDir, "outline"), { recursive: true });
+    const poison = "POISON_MUTABLE_TRUTH";
+    await Promise.all([
+      writeFile(join(bookDir, "book.json"), JSON.stringify({ id: "audit-v2", title: "Audit", genre: "other", platform: "tomato", status: "active", targetChapters: 10, chapterWordCount: 20, language: "en", createdAt: "2026-09-04T00:00:00.000Z", updatedAt: "2026-09-04T00:00:00.000Z" }), "utf8"),
+      writeFile(join(storyDir, "outline", "volume_map.md"), "# Volume\n", "utf8"),
+      writeFile(join(storyDir, "style_guide.md"), "# Style\n", "utf8"),
+      ...["current_state.md", "particle_ledger.md", "pending_hooks.md", "chapter_summaries.md", "subplot_board.md", "emotional_arcs.md", "character_matrix.md"].map((name) => writeFile(join(storyDir, name), poison, "utf8")),
+    ]);
+    const truth = committedTruthForAudit();
+    const immutablePredecessorBody = "IMMUTABLE COMMITTED PREDECESSOR PROSE";
+    const auditor = new ContinuityAuditor({ client: { provider: "openai", apiFormat: "chat", stream: false, defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} } }, model: "test-model", projectRoot: root });
+    let exactFinalMessages: ReadonlyArray<{ role: "system" | "user" | "assistant"; content: string }> = [];
+    const chat = vi.spyOn(auditor as unknown as { chat: (...args: any[]) => Promise<unknown> }, "chat").mockImplementation(async (
+      messages: ReadonlyArray<{ role: "system" | "user" | "assistant"; content: string }>,
+      options: { onFinalProviderRequest?: (request: unknown) => void },
+    ) => {
+      exactFinalMessages = messages.map((message, index) => index === 0
+        ? { ...message, content: `${message.content}\n\nACTIVATED_FINAL_LOGIC_GUIDANCE` }
+        : message);
+      options.onFinalProviderRequest?.({
+        provider: "openai", model: "test-model", messages: exactFinalMessages,
+        temperature: 0.3, maxTokens: 4096, stream: false,
+      });
+      return { content: JSON.stringify({ passed: true, issues: [], summary: "ok" }), usage: ZERO_USAGE };
+    });
+    try {
+      const result = await auditor.auditChapter(bookDir, "Ada opens the gate.", 1, "other", {
+        authoritativeTruth: truth,
+        predecessorChapterBody: immutablePredecessorBody,
+      });
+      const messages = chat.mock.calls[0]?.[0] as ReadonlyArray<{ role: string; content: string }>;
+      const prompt = messages.map((message) => message.content).join("\n");
+      expect(prompt).toContain(canonicalJson(truth));
+      expect(prompt).toContain(immutablePredecessorBody);
+      expect(prompt).not.toContain(poison);
+      expect(result.providerRequest?.messages).toEqual(exactFinalMessages);
+      expect(result.providerRequest?.messages[0]?.content).toContain("ACTIVATED_FINAL_LOGIC_GUIDANCE");
+      expect((result as typeof result & { providerInputFingerprint?: string }).providerInputFingerprint).toBe(
+        createHash("sha256").update(JSON.stringify({
+          provider: "openai", model: "test-model", messages: exactFinalMessages,
+          temperature: 0.3, maxTokens: 4096, stream: false,
+        }), "utf8").digest("hex"),
+      );
+      expect(result.providerRequest).toMatchObject({ reviewLanguage: "en" });
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 
   it("returns a critical audit issue instead of throwing when audit output is not JSON", () => {
@@ -38,7 +101,7 @@ describe("ContinuityAuditor", () => {
       projectRoot: "/tmp/inkos-auditor-bad-json-test",
     });
 
-    const result = (auditor as any).parseAuditResult("模型只返回了一段散文，没有 JSON。", "zh");
+    const result = parseContinuityAuditResponse("模型只返回了一段散文，没有 JSON。", "zh");
 
     expect(result.passed).toBe(false);
     expect(result.summary).toContain("审稿输出解析失败");
@@ -67,7 +130,7 @@ describe("ContinuityAuditor", () => {
       projectRoot: "/tmp/inkos-auditor-repair-scope-test",
     });
 
-    const result = (auditor as any).parseAuditResult(JSON.stringify({
+    const result = parseContinuityAuditResponse(JSON.stringify({
       passed: false,
       issues: [{
         severity: "critical",
@@ -83,6 +146,82 @@ describe("ContinuityAuditor", () => {
       repairScope: "structural",
       category: "模型审稿判断",
     });
+  });
+
+  it.each(["CRITICAL", "MAJOR", "unknown", "Warning"])(
+    "fails closed on non-contract Logic severity %s instead of downgrading it to warning",
+    (severity) => {
+      const result = parseContinuityAuditResponse(JSON.stringify({
+        passed: true,
+        issues: [{ severity, category: "logic", description: "invalid severity", suggestion: "repair" }],
+        summary: "must not approve",
+      }), "en");
+
+      expect(result.issues).toEqual([expect.objectContaining({ severity: "critical" })]);
+    },
+  );
+
+  it("preserves valid lowercase Logic major as an explicit MAJOR classification", () => {
+    const result = parseContinuityAuditResponse(JSON.stringify({
+      passed: false,
+      issues: [{ severity: "major", category: "logic", description: "major defect", suggestion: "repair" }],
+      summary: "repair",
+    }), "en");
+
+    expect(result.issues[0]).toMatchObject({ explicitSeverity: "MAJOR" });
+  });
+
+  it.each(["critical", "warning", "info"] as const)(
+    "preserves valid lowercase Logic severity %s",
+    (severity) => {
+      const result = parseContinuityAuditResponse(JSON.stringify({
+        passed: severity !== "critical",
+        issues: [{ severity, category: "logic", description: "valid severity", suggestion: "repair" }],
+        summary: "parsed",
+      }), "en");
+
+      expect(result.issues[0]?.severity).toBe(severity);
+    },
+  );
+
+  it("fails closed through the public Logic auditor when Provider output uses wrong-case CRITICAL", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-auditor-invalid-severity-"));
+    const bookDir = join(root, "books", "audit-invalid");
+    const storyDir = join(bookDir, "story");
+    await mkdir(join(storyDir, "outline"), { recursive: true });
+    await Promise.all([
+      writeFile(join(bookDir, "book.json"), JSON.stringify({
+        id: "audit-invalid", title: "Audit", genre: "other", platform: "tomato", status: "active",
+        targetChapters: 10, chapterWordCount: 20, language: "en",
+        createdAt: "2026-09-05T00:00:00.000Z", updatedAt: "2026-09-05T00:00:00.000Z",
+      }), "utf8"),
+      writeFile(join(storyDir, "outline", "volume_map.md"), "# Volume\n", "utf8"),
+      writeFile(join(storyDir, "style_guide.md"), "# Style\n", "utf8"),
+      ...["current_state.md", "particle_ledger.md", "pending_hooks.md", "chapter_summaries.md", "subplot_board.md", "emotional_arcs.md", "character_matrix.md"]
+        .map((name) => writeFile(join(storyDir, name), "# Empty\n", "utf8")),
+    ]);
+    const auditor = new ContinuityAuditor({
+      client: { provider: "test", apiFormat: "chat", stream: false, defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} } } as never,
+      model: "test-model",
+      projectRoot: root,
+    });
+    vi.spyOn(auditor as unknown as { chat: (...args: any[]) => Promise<unknown> }, "chat").mockResolvedValue({
+      content: JSON.stringify({
+        passed: true,
+        overall_score: 95,
+        dimension_scores: { causal_logic: 95 },
+        issues: [{ severity: "CRITICAL", category: "canon", description: "contradiction", suggestion: "repair" }],
+        summary: "must not approve",
+      }),
+      usage: ZERO_USAGE,
+    });
+
+    try {
+      const result = await auditor.auditChapter(bookDir, "Candidate chapter.", 1, "other");
+      expect(result.issues).toEqual([expect.objectContaining({ severity: "critical" })]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("prefers book language override when building audit prompts", async () => {
@@ -136,17 +275,20 @@ describe("ContinuityAuditor", () => {
       projectRoot: root,
     });
 
-    const chatSpy = vi.spyOn(ContinuityAuditor.prototype as never, "chat" as never).mockResolvedValue({
-      content: JSON.stringify({
+    const chatSpy = vi.spyOn(ContinuityAuditor.prototype as never, "chat" as never).mockImplementation(async (...args: unknown[]) => {
+      const messages = args[0] as ReadonlyArray<{ role: "system" | "user" | "assistant"; content: string }>;
+      const options = args[1] as { temperature?: number; onFinalProviderRequest?: (request: unknown) => void };
+      options.onFinalProviderRequest?.({ provider: "openai", model: "test-model", messages,
+        temperature: options.temperature ?? 0.7, maxTokens: 4096, stream: false });
+      return { content: JSON.stringify({
         passed: true,
         issues: [],
         summary: "ok",
-      }),
-      usage: ZERO_USAGE,
+      }), usage: ZERO_USAGE };
     });
 
     try {
-      await auditor.auditChapter(bookDir, "Chapter body.", 1, "xuanhuan");
+      const result = await auditor.auditChapter(bookDir, "Chapter body.", 1, "xuanhuan");
 
       const messages = chatSpy.mock.calls[0]?.[0] as
         | ReadonlyArray<{ content: string }>
@@ -158,6 +300,7 @@ describe("ContinuityAuditor", () => {
       expect(systemPrompt).toContain(
         'If the relevant authority is missing, ambiguous, conflicting, or cannot be proven from the supplied authority, repair_scope MUST be "unknown"',
       );
+      expect(result.providerRequest).toMatchObject({ reviewLanguage: "en" });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -399,9 +542,12 @@ describe("ContinuityAuditor", () => {
       projectRoot: root,
     });
 
-    const chatSpy = vi.spyOn(ContinuityAuditor.prototype as never, "chat" as never).mockResolvedValue({
-      content: JSON.stringify({ passed: true, issues: [], summary: "ok" }),
-      usage: ZERO_USAGE,
+    const chatSpy = vi.spyOn(ContinuityAuditor.prototype as never, "chat" as never).mockImplementation(async (...args: unknown[]) => {
+      const messages = args[0] as ReadonlyArray<{ role: "system" | "user" | "assistant"; content: string }>;
+      const options = args[1] as { temperature?: number; onFinalProviderRequest?: (request: unknown) => void };
+      options.onFinalProviderRequest?.({ provider: "openai", model: "test-model", messages,
+        temperature: options.temperature ?? 0.7, maxTokens: 4096, stream: false });
+      return { content: JSON.stringify({ passed: true, issues: [], summary: "ok" }), usage: ZERO_USAGE };
     });
 
     const memoBody = [
@@ -431,7 +577,7 @@ describe("ContinuityAuditor", () => {
     ].join("\n");
 
     try {
-      await auditor.auditChapter(bookDir, "Chapter body.", 42, "xuanhuan", {
+      const result = await auditor.auditChapter(bookDir, "Chapter body.", 42, "xuanhuan", {
         chapterMemo: {
           chapter: 42,
           goal: "陆焚抢回残刃并离开",
@@ -460,6 +606,8 @@ describe("ContinuityAuditor", () => {
       expect(userPrompt).toContain("## 章尾必须发生的改变");
       // Legacy volume-outline block is gone.
       expect(userPrompt).not.toContain("## 卷纲");
+      expect(result.providerRequest).toMatchObject({ reviewLanguage: "zh" });
+      expect(result.providerRequest?.messages.at(-1)?.content).toMatch(/## 待审章节内容\nChapter body\.$/u);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

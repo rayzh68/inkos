@@ -1,15 +1,27 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile, symlink, access } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WriterAgent } from "../agents/writer.js";
 import { buildLengthSpec } from "../utils/length-metrics.js";
+import type { StructuredTruthV1 } from "../models/structured-truth.js";
+import { createVocabularyCatalogV1 } from "../state/truth-vocabulary.js";
+import { canonicalJson } from "../state/canonical-json.js";
 
 const ZERO_USAGE = {
   promptTokens: 0,
   completionTokens: 0,
   totalTokens: 0,
 } as const;
+
+function committedTruthForWriter(bookId: string, throughChapter: number): StructuredTruthV1 {
+  return {
+    schemaVersion: "1.0", kind: "STRUCTURED_TRUTH", bookId, throughChapter,
+    lineage: { kind: "BASELINE", predecessorCommitSha256: "a".repeat(64), baselineSourceManifestSha256: "b".repeat(64), seedVocabularyCatalogSha256: "c".repeat(64), baselineMethod: "DETERMINISTIC", baselineConstructionReceiptSha256: "d".repeat(64) },
+    vocabulary: createVocabularyCatalogV1([]), entities: [], facts: [], relations: [],
+    provenance: { schemaVersion: "1.0", producerKind: "BASELINE", producerId: "inkos.truth-baseline.builder.v1", producerVersion: "1.0", canonicalizationId: "inkos.jcs-ijson.v1", truthSchemaVersion: "1.0", vocabularySchemaVersion: "1.0", coreVocabularyVersion: "1.0" },
+  };
+}
 
 function createGovernedWriterInput(chapter: number) {
   return {
@@ -56,8 +68,65 @@ function createCaptureLogger() {
 }
 
 describe("WriterAgent", () => {
+  it("rejects a state junction before creating chapter publication directories", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-writer-boundary-"));
+    try {
+      const bookDir = join(root, "book");
+      await mkdir(join(bookDir, "story"), { recursive: true });
+      await mkdir(join(root, "outside"));
+      await symlink(join(root, "outside"), join(bookDir, "story/state"), "junction");
+      const agent = new WriterAgent({ client: {} as never, model: "test", projectRoot: root });
+      await expect(agent.saveChapter(bookDir, { chapterNumber: 1, title: "Title", content: "body", updatedState: "state", updatedHooks: "hooks", runtimeStateSnapshot: {} } as never, false)).rejects.toThrow("UNSAFE_PATH_COMPONENT");
+      await expect(access(join(bookDir, "chapters"))).rejects.toThrow();
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it("uses complete committed V2 truth and excludes mutable legacy truth surfaces from governed writing", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-writer-v2-authority-"));
+    const bookDir = join(root, "books", "book-v2");
+    const storyDir = join(bookDir, "story");
+    await mkdir(join(storyDir, "outline"), { recursive: true });
+    await mkdir(join(bookDir, "chapters"), { recursive: true });
+    const poison = "POISON_MUTABLE_TRUTH";
+    await Promise.all([
+      writeFile(join(storyDir, "outline", "volume_map.md"), "# Volume\n", "utf8"),
+      writeFile(join(storyDir, "style_guide.md"), "# Style\n", "utf8"),
+      writeFile(join(storyDir, "style_profile.json"), "{}", "utf8"),
+      ...["current_state.md", "particle_ledger.md", "pending_hooks.md", "chapter_summaries.md", "subplot_board.md", "emotional_arcs.md", "character_matrix.md"].map((name) => writeFile(join(storyDir, name), poison, "utf8")),
+      writeFile(join(bookDir, "chapters", "0001_poison.md"), `# Poison\n\n${poison}`, "utf8"),
+      writeFile(join(bookDir, "chapters", "0002_poison.md"), `# Poison\n\n${poison}`, "utf8"),
+    ]);
+    const truth = committedTruthForWriter("book-v2", 2);
+    const immutableRecentChapterBodies = [
+      "Mara kept the ledger close to her chest. The corridor stayed quiet after the bell. There it was again.",
+      "Mara kept the ledger close to her chest while ash fell. The corridor stayed quiet until dawn. There it was again.",
+    ] as const;
+    const immutablePredecessorBody = immutableRecentChapterBodies.at(-1)!;
+    const agent = new WriterAgent({
+      client: { provider: "openai", apiFormat: "chat", stream: false, defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} } },
+      model: "test-model", projectRoot: root,
+    });
+    const chat = vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat").mockResolvedValue({
+      content: "=== CHAPTER_TITLE ===\nGate\n=== CHAPTER_CONTENT ===\nAda opens the gate.\n=== PRE_WRITE_CHECK ===\n- ok",
+      usage: ZERO_USAGE,
+    });
+    try {
+      await agent.writeChapter({
+        book: { id: "book-v2", title: "Book", platform: "tomato", genre: "other", status: "active", targetChapters: 10, chapterWordCount: 20, language: "en", createdAt: "2026-09-04T00:00:00.000Z", updatedAt: "2026-09-04T00:00:00.000Z" },
+        bookDir, chapterNumber: 3, ...createGovernedWriterInput(3), authoritativeTruth: truth,
+        predecessorChapterBody: immutablePredecessorBody,
+        immutableRecentChapterBodies,
+        deferStateSettlement: true, lengthSpec: buildLengthSpec(20, "en"),
+      });
+      const prompt = (chat.mock.calls[0]?.[0] as ReadonlyArray<{ content: string }>).map((message) => message.content).join("\n");
+      expect(prompt).toContain(canonicalJson(truth));
+      expect(prompt).toContain(immutablePredecessorBody);
+      expect(prompt).toContain("High-frequency phrases to avoid: close her chest");
+      expect(prompt).not.toContain(poison);
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 
   it("persists the chapter and legacy truth summary through one writer commit", async () => {

@@ -1,4 +1,4 @@
-import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, rm, writeFile, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it, vi } from "vitest";
@@ -39,6 +39,33 @@ describe("truth authority", () => {
 });
 
 describe("edit controller", () => {
+  it("never renames canonical truth bytes even in a book without Genesis", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-edit-canonical-"));
+    try {
+      await mkdir(join(root, "story/state"), { recursive: true });
+      await writeFile(join(root, "story/state/truth.json"), '{"name":"Old"}');
+      await writeFile(join(root, "story/story_bible.md"), "Old foundation");
+      await executeEditTransaction({ bookDir: () => root, loadChapterIndex: async () => [], saveChapterIndex: async () => {} },
+        { kind: "entity-rename", bookId: "book", entityType: "character", oldValue: "Old", newValue: "New" });
+      expect(await readFile(join(root, "story/state/truth.json"), "utf8")).toBe('{"name":"Old"}');
+      expect(await readFile(join(root, "story/story_bible.md"), "utf8")).toBe("New foundation");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("preflights chapter junctions before archiving or replacing prose", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-edit-junction-"));
+    try {
+      const bookDir = join(root, "book");
+      await mkdir(bookDir);
+      await mkdir(join(root, "outside"));
+      await writeFile(join(root, "outside/0001_Title.md"), "outside prose");
+      await symlink(join(root, "outside"), join(bookDir, "chapters"), "junction");
+      await expect(executeEditTransaction({ bookDir: () => bookDir, loadChapterIndex: async () => [], saveChapterIndex: async () => {} },
+        { kind: "chapter-replace", bookId: "book", chapterNumber: 1, fullText: "replacement" })).rejects.toThrow("UNSAFE_PATH_COMPONENT");
+      expect(await readFile(join(root, "outside/0001_Title.md"), "utf8")).toBe("outside prose");
+      await expect(access(join(root, "outside/.versions"))).rejects.toThrow();
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
   it("quarantines transaction authority while allowing entity rename in ordinary editable story files", async () => {
     const root = await mkdtemp(join(tmpdir(), "inkos-transaction-edit-quarantine-"));
     const bookDir = join(root, "books", "transaction-book");
@@ -47,7 +74,6 @@ describe("edit controller", () => {
         mkdir(join(bookDir, "chapters"), { recursive: true }),
         mkdir(join(bookDir, "story", "snapshots", "4"), { recursive: true }),
         mkdir(join(bookDir, "story", "roles"), { recursive: true }),
-        mkdir(join(bookDir, "story", "commits", "chapter-0005"), { recursive: true }),
         mkdir(join(bookDir, "story", "runtime", "bounded-autonomous", "provider-responses"), { recursive: true }),
         mkdir(join(bookDir, "story", "migrations", "cutover"), { recursive: true }),
         mkdir(join(bookDir, "story", "acceptance"), { recursive: true }),
@@ -59,7 +85,6 @@ describe("edit controller", () => {
       await writeFile(join(bookDir, "story", "snapshots", "4", "current_state.md"), "Old snapshot");
       await createChapterGenesis({ bookDir, bookId: "transaction-book", lastTrustedChapter: 4, trustedSnapshotDir: join(bookDir, "story", "snapshots", "4") });
       const protectedEvidenceFiles = [
-        join(bookDir, "story", "commits", "chapter-0005", "commit.json"),
         join(bookDir, "story", "runtime", "bounded-autonomous", "provider-responses", "response.json"),
         join(bookDir, "story", "migrations", "cutover", "receipt.json"),
         join(bookDir, "story", "acceptance", "proof.md"),
@@ -79,6 +104,15 @@ describe("edit controller", () => {
       expect(result.touchedFiles).toContain(join("story", "roles", "New.md"));
       await expect(readFile(join(bookDir, "story", "roles", "New.md"), "utf-8")).resolves.toContain("New remains editable");
       expect(await Promise.all(protectedFiles.map((path) => readFile(path, "utf-8")))).toEqual(before);
+
+      await mkdir(join(bookDir, "story", "commits", "chapter-0005"), { recursive: true });
+      const corruptCommit = join(bookDir, "story", "commits", "chapter-0005", "commit.json");
+      await writeFile(corruptCommit, "Old immutable authority");
+      await expect(executeEditTransaction({
+        bookDir: () => bookDir, loadChapterIndex: async () => [], saveChapterIndex: async () => undefined,
+      }, { kind: "entity-rename", bookId: "transaction-book", entityType: "character", oldValue: "New", newValue: "Third" })).rejects.toThrow();
+      expect(await readFile(corruptCommit, "utf8")).toBe("Old immutable authority");
+      expect(await readFile(join(bookDir, "story", "roles", "New.md"), "utf8")).toContain("New remains editable");
 
       for (const request of [
         { kind: "chapter-replace" as const, bookId: "transaction-book", chapterNumber: 4, fullText: "replacement" },
@@ -518,6 +552,6 @@ describe("edit controller", () => {
         oldValue: "陆尘",
         newValue: "林砚",
       },
-    )).rejects.toThrow(/not a directory|ENOTDIR/i);
+    )).rejects.toThrow(/not a directory|ENOTDIR|UNSAFE_PATH_COMPONENT/i);
   });
 });

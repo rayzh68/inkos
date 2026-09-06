@@ -17,6 +17,7 @@ import { writeExportArtifact } from "./export-artifact.js";
 import { safeChildPath } from "../utils/path-safety.js";
 import { deriveBookIdFromTitle } from "../utils/book-id.js";
 import { normalizePlatformOrOther } from "../models/book.js";
+import { assertTruthMutationAllowed } from "./truth-authority.js";
 
 const SAFE_TRUTH_FLAT_FILE_NAMES = new Set([
   "author_intent.md",
@@ -520,17 +521,20 @@ export function createInteractionToolsFromDeps(
       };
     }),
     updateCurrentFocus: async (bookId, content) => withBookMutationLock(state, bookId, async () => {
+      await assertTruthMutationAllowed({ bookDir: state.bookDir(bookId), relativePath: "story/current_focus.md" });
       await state.ensureControlDocuments(bookId);
       await writeFile(join(state.bookDir(bookId), "story", "current_focus.md"), content, "utf-8");
     }),
     updateAuthorIntent: async (bookId, content) => withBookMutationLock(state, bookId, async () => {
+      await assertTruthMutationAllowed({ bookDir: state.bookDir(bookId), relativePath: "story/author_intent.md" });
       await state.ensureControlDocuments(bookId);
       await writeFile(join(state.bookDir(bookId), "story", "author_intent.md"), content, "utf-8");
     }),
     writeTruthFile: async (bookId, fileName, content) => withBookMutationLock(state, bookId, async () => {
-      await state.ensureControlDocuments(bookId);
       const storyDir = join(state.bookDir(bookId), "story");
       const safeFileName = assertSafeTruthFileName(fileName);
+      await assertTruthMutationAllowed({ bookDir: state.bookDir(bookId), relativePath: `story/${safeFileName}` });
+      await state.ensureControlDocuments(bookId);
       const targetPath = safeChildPath(storyDir, safeFileName);
       await mkdir(dirname(targetPath), { recursive: true });
       await writeFile(targetPath, content, "utf-8");

@@ -6,6 +6,9 @@ import { PlannerAgent } from "../agents/planner.js";
 import * as llmProvider from "../llm/provider.js";
 import type { LLMClient } from "../llm/provider.js";
 import type { BookConfig } from "../models/book.js";
+import type { StructuredTruthV1 } from "../models/structured-truth.js";
+import { createVocabularyCatalogV1 } from "../state/truth-vocabulary.js";
+import { deriveBaselineEntityId } from "../state/truth-identities.js";
 
 const VALID_BODY = `
 ## 场景与篇幅预算
@@ -196,19 +199,67 @@ describe("PlannerAgent.planChapter memo generation", () => {
     expect(userMsg?.content).toContain("当面对质");
   });
 
+  it("uses complete committed V2 truth and excludes mutable truth surfaces from planning authority", async () => {
+    const truth: StructuredTruthV1 = {
+      schemaVersion: "1.0", kind: "STRUCTURED_TRUTH", bookId: "book-plan-1", throughChapter: 0,
+      lineage: { kind: "BASELINE", predecessorCommitSha256: "a".repeat(64), baselineSourceManifestSha256: "b".repeat(64), seedVocabularyCatalogSha256: "c".repeat(64), baselineMethod: "DETERMINISTIC", baselineConstructionReceiptSha256: "d".repeat(64) },
+      vocabulary: createVocabularyCatalogV1([]),
+      entities: [{
+        entityId: deriveBaselineEntityId({ bookId: "book-plan-1", baselineSourceManifestSha256: "b".repeat(64), entityKind: "story.character", identityKey: "alice" }), entityKind: "story.character", identityKey: "alice",
+        canonicalName: "COMMITTED_ONLY_ALICE", aliases: [], declaredAtChapter: 0,
+        declarationSource: {
+          origin: "BASELINE", bookId: "book-plan-1",
+          baselineSourceManifestSha256: "b".repeat(64),
+          baselineConstructionReceiptSha256: "d".repeat(64),
+          baselineRecordId: "e".repeat(64),
+        },
+      }],
+      facts: [], relations: [],
+      provenance: { schemaVersion: "1.0", producerKind: "BASELINE", producerId: "inkos.truth-baseline.builder.v1", producerVersion: "1.0", canonicalizationId: "inkos.jcs-ijson.v1", truthSchemaVersion: "1.0", vocabularySchemaVersion: "1.0", coreVocabularyVersion: "1.0" },
+    };
+    await Promise.all([
+      writeFile(join(bookDir, "story", "current_state.md"), "POISON_CURRENT_STATE", "utf8"),
+      writeFile(join(bookDir, "story", "pending_hooks.md"), "POISON_PENDING_HOOKS", "utf8"),
+      writeFile(join(bookDir, "story", "chapter_summaries.md"), "POISON_CHAPTER_SUMMARIES", "utf8"),
+      writeFile(join(bookDir, "story", "subplot_board.md"), "POISON_SUBPLOT", "utf8"),
+      writeFile(join(bookDir, "story", "emotional_arcs.md"), "POISON_EMOTIONAL", "utf8"),
+      writeFile(join(bookDir, "story", "character_matrix.md"), "POISON_CHARACTER", "utf8"),
+    ]);
+    const chatSpy = vi.spyOn(llmProvider, "chatCompletion").mockResolvedValue({ content: validMemoRaw(1), usage: ZERO_USAGE } as never);
+
+    const immutablePredecessorBody = "IMMUTABLE COMMITTED PREDECESSOR PROSE";
+    const result = await makePlanner().planChapter({
+      book: makeBook(), bookDir, chapterNumber: 1, authoritativeTruth: truth,
+      predecessorChapterBody: immutablePredecessorBody,
+    });
+
+    const messages = chatSpy.mock.calls[0]?.[2] as ReadonlyArray<{ role: string; content: string }>;
+    const prompt = messages.find((message) => message.role === "user")?.content ?? "";
+    expect(prompt).toContain("COMMITTED_ONLY_ALICE");
+    expect(prompt).toContain(immutablePredecessorBody);
+    expect(prompt).not.toContain("POISON_CURRENT_STATE");
+    expect(prompt).not.toContain("POISON_PENDING_HOOKS");
+    expect(prompt).not.toContain("POISON_CHAPTER_SUMMARIES");
+    expect(prompt).not.toContain("POISON_SUBPLOT");
+    expect(prompt).not.toContain("POISON_EMOTIONAL");
+    expect(prompt).not.toContain("POISON_CHARACTER");
+    expect(result.plannerInputs).toContain("authority/committed-v2/state/truth.json");
+    expect(result.plannerInputs.some((path) => /current_state|pending_hooks|chapter_summaries|memory\.db|snapshots|story[\\/]state/iu.test(path))).toBe(false);
+  });
+
   it("retries when the first response is malformed and succeeds on retry", async () => {
     const chatSpy = vi.spyOn(llmProvider, "chatCompletion")
       .mockResolvedValueOnce({
         content: "no memo sections here",
-        usage: ZERO_USAGE,
+        usage: { promptTokens: 2, completionTokens: 3, totalTokens: 5 },
       } as unknown as Awaited<ReturnType<typeof llmProvider.chatCompletion>>)
       .mockResolvedValueOnce({
         content: "still no memo sections",
-        usage: ZERO_USAGE,
+        usage: { promptTokens: 5, completionTokens: 7, totalTokens: 12 },
       } as unknown as Awaited<ReturnType<typeof llmProvider.chatCompletion>>)
       .mockResolvedValueOnce({
         content: validMemoRaw(4),
-        usage: ZERO_USAGE,
+        usage: { promptTokens: 11, completionTokens: 13, totalTokens: 24 },
       } as unknown as Awaited<ReturnType<typeof llmProvider.chatCompletion>>);
 
     const result = await makePlanner().planChapter({
@@ -220,6 +271,11 @@ describe("PlannerAgent.planChapter memo generation", () => {
     expect(chatSpy).toHaveBeenCalledTimes(3);
     expect(result.memo.chapter).toBe(4);
     expect(result.memo.isGoldenOpening).toBe(false);
+    expect((result as typeof result & { tokenUsage?: typeof ZERO_USAGE }).tokenUsage).toEqual({
+      promptTokens: 18,
+      completionTokens: 23,
+      totalTokens: 41,
+    });
 
     // Retry prompts must include the failure feedback
     const secondCallArgs = chatSpy.mock.calls[1]!;

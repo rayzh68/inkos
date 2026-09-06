@@ -19,6 +19,13 @@ import {
   type SemanticAdjudicationBatch,
   type SemanticAdjudicationResult,
 } from "./semantic-authority.js";
+import { validateStructuredTruthV1, type StructuredTruthV1 } from "../models/structured-truth.js";
+import { canonicalJson } from "../state/canonical-json.js";
+import {
+  fingerprintReviewProviderRequest,
+  type ReviewProviderRequestEvidence,
+} from "./commercial-reader.js";
+import type { FinalProviderRequestObservation } from "../agent/worker-agent.js";
 
 export interface AuditResult {
   readonly passed: boolean;
@@ -36,6 +43,8 @@ export interface AuditResult {
     readonly totalTokens: number;
     readonly actualCostUsd?: number;
   };
+  readonly providerRequest?: ReviewProviderRequestEvidence;
+  readonly providerInputFingerprint?: string;
 }
 
 export interface AuditIssue {
@@ -57,7 +66,106 @@ function normalizeRepairScope(value: unknown): AuditIssue["repairScope"] {
 
 function normalizeAuditSeverity(value: unknown): AuditIssue["severity"] {
   if (value === "critical" || value === "warning" || value === "info") return value;
-  return "warning";
+  if (value === "major") return "warning";
+  return "critical";
+}
+
+function extractBalancedAuditJson(text: string): string | null {
+  const start = text.indexOf("{");
+  if (start === -1) return null;
+  let depth = 0;
+  for (let index = start; index < text.length; index += 1) {
+    if (text[index] === "{") depth += 1;
+    if (text[index] === "}") depth -= 1;
+    if (depth === 0) return text.slice(start, index + 1);
+  }
+  return null;
+}
+
+function tryParseAuditJson(json: string, language: PromptLanguage): AuditResult | null {
+  try {
+    const parsed = JSON.parse(json);
+    if (typeof parsed.passed !== "boolean" && parsed.passed !== undefined) return null;
+    const rawScore = parsed.overall_score ?? parsed.overallScore;
+    const overallScore = typeof rawScore === "number" && Number.isFinite(rawScore)
+      ? Math.round(Math.max(0, Math.min(100, rawScore)))
+      : undefined;
+    const rawDimensions = parsed.dimension_scores ?? parsed.dimensionScores;
+    const dimensionScores = rawDimensions && typeof rawDimensions === "object" && !Array.isArray(rawDimensions)
+      ? Object.fromEntries(Object.entries(rawDimensions)
+        .filter(([, value]) => typeof value === "number" && Number.isFinite(value))
+        .map(([key, value]) => [key, Math.round(Math.max(0, Math.min(100, value as number)))]))
+      : undefined;
+    return {
+      passed: Boolean(parsed.passed ?? false),
+      issues: Array.isArray(parsed.issues)
+        ? parsed.issues.map((issue: Record<string, unknown>) => ({
+          severity: normalizeAuditSeverity(issue.severity),
+          category: (issue.category as string) ?? (language === "en" ? "Uncategorized" : "未分类"),
+          description: (issue.description as string) ?? "",
+          suggestion: (issue.suggestion as string) ?? "",
+          repairScope: normalizeRepairScope(issue.repair_scope ?? issue.repairScope),
+          ...(typeof issue.blocking === "boolean" ? { blocking: issue.blocking } : {}),
+          ...(issue.severity === "major" ? { explicitSeverity: "MAJOR" as const } : {}),
+        }))
+        : [],
+      summary: String(parsed.summary ?? ""),
+      overallScore,
+      ...(dimensionScores && Object.keys(dimensionScores).length > 0 ? { dimensionScores } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Deterministically parses the exact raw Logic/Canon Provider response. */
+export function parseContinuityAuditResponse(content: string, language: PromptLanguage = "zh"): AuditResult {
+  const candidates = [
+    extractBalancedAuditJson(content),
+    content.trim().startsWith("{") ? content.trim() : null,
+    content.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/)?.[1]?.trim() ?? null,
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const result = tryParseAuditJson(candidate, language);
+    if (result) return result;
+  }
+  const passedMatch = content.match(/"passed"\s*:\s*(true|false)/);
+  const issuesMatch = content.match(/"issues"\s*:\s*\[([\s\S]*?)\]/);
+  const summaryMatch = content.match(/"summary"\s*:\s*"([^"]*)"/);
+  if (passedMatch) {
+    const issues: AuditIssue[] = [];
+    const issuePattern = /\{[^{}]*"severity"\s*:\s*"[^"]*"[^{}]*\}/g;
+    let match: RegExpExecArray | null;
+    while (issuesMatch && (match = issuePattern.exec(issuesMatch[1]!)) !== null) {
+      try {
+        const issue = JSON.parse(match[0]);
+        issues.push({
+          severity: normalizeAuditSeverity(issue.severity),
+          category: issue.category ?? (language === "en" ? "Uncategorized" : "未分类"),
+          description: issue.description ?? "",
+          suggestion: issue.suggestion ?? "",
+          repairScope: normalizeRepairScope(issue.repair_scope ?? issue.repairScope),
+          ...(typeof issue.blocking === "boolean" ? { blocking: issue.blocking } : {}),
+          ...(issue.severity === "major" ? { explicitSeverity: "MAJOR" as const } : {}),
+        });
+      } catch {
+        // Skip one malformed issue while preserving the parseable verdict.
+      }
+    }
+    return { passed: passedMatch[1] === "true", issues, summary: summaryMatch?.[1] ?? "" };
+  }
+  return {
+    passed: false,
+    parseFailed: true,
+    issues: [{
+      severity: "critical",
+      category: language === "en" ? "System Error" : "系统错误",
+      description: language === "en" ? "Audit output format was invalid and could not be parsed as JSON." : "审稿输出格式异常，无法解析为 JSON",
+      suggestion: language === "en" ? "The model may not support reliable structured output. Try a stronger model or inspect the API response format." : "可能是模型不支持结构化输出。尝试换一个更大的模型，或检查 API 返回格式。",
+    }],
+    summary: language === "en" ? "Audit output parsing failed" : "审稿输出解析失败",
+  };
 }
 
 const DIMENSION_LABELS: Record<number, { readonly zh: string; readonly en: string }> = {
@@ -446,20 +554,36 @@ export class ContinuityAuditor extends BaseAgent {
         ledger?: string;
         hooks?: string;
       };
+      /** Verified immutable predecessor authority supplied by the V2 transaction gate. */
+      authoritativeTruth?: StructuredTruthV1;
+      /** Exact verified predecessor chapter body from immutable Commit V2 authority. */
+      predecessorChapterBody?: string;
+      /** Durable host authority hook completed immediately before Provider transport. */
+      onFinalProviderRequest?: (request: FinalProviderRequestObservation) => void | Promise<void>;
     },
   ): Promise<AuditResult> {
+    const authoritativeTruthJson = options?.authoritativeTruth
+      ? canonicalJson(validateStructuredTruthV1(structuredClone(options.authoritativeTruth)))
+      : undefined;
+    if (options?.authoritativeTruth && options.authoritativeTruth.throughChapter !== chapterNumber - 1) {
+      throw new Error("Continuity auditor authoritative truth predecessor mismatch");
+    }
+    if (options?.authoritativeTruth && options.predecessorChapterBody === undefined) {
+      throw new Error("Continuity auditor immutable predecessor prose is missing");
+    }
+    const canonicalTruthSurface = authoritativeTruthJson ?? "(文件不存在)";
     const [diskCurrentState, diskLedger, diskHooks, styleGuideRaw, subplotBoard, emotionalArcs, characterMatrix, chapterSummaries, parentCanon, fanficCanon, volumeOutline] =
       await Promise.all([
         // Phase 5 consolidation: derive initial state from roles + seed hooks
         // when current_state.md is still the architect seed placeholder.
-        readCurrentStateWithFallback(bookDir, "(文件不存在)"),
-        this.readFileSafe(join(bookDir, "story/particle_ledger.md")),
-        this.readFileSafe(join(bookDir, "story/pending_hooks.md")),
+        authoritativeTruthJson ? Promise.resolve(canonicalTruthSurface) : readCurrentStateWithFallback(bookDir, "(文件不存在)"),
+        authoritativeTruthJson ? Promise.resolve(canonicalTruthSurface) : this.readFileSafe(join(bookDir, "story/particle_ledger.md")),
+        authoritativeTruthJson ? Promise.resolve(canonicalTruthSurface) : this.readFileSafe(join(bookDir, "story/pending_hooks.md")),
         this.readFileSafe(join(bookDir, "story/style_guide.md")),
-        this.readFileSafe(join(bookDir, "story/subplot_board.md")),
-        this.readFileSafe(join(bookDir, "story/emotional_arcs.md")),
-        readCharacterContext(bookDir, "(文件不存在)"),
-        this.readFileSafe(join(bookDir, "story/chapter_summaries.md")),
+        authoritativeTruthJson ? Promise.resolve(canonicalTruthSurface) : this.readFileSafe(join(bookDir, "story/subplot_board.md")),
+        authoritativeTruthJson ? Promise.resolve(canonicalTruthSurface) : this.readFileSafe(join(bookDir, "story/emotional_arcs.md")),
+        authoritativeTruthJson ? Promise.resolve(canonicalTruthSurface) : readCharacterContext(bookDir, "(文件不存在)"),
+        authoritativeTruthJson ? Promise.resolve(canonicalTruthSurface) : this.readFileSafe(join(bookDir, "story/chapter_summaries.md")),
         this.readFileSafe(join(bookDir, "story/parent_canon.md")),
         this.readFileSafe(join(bookDir, "story/fanfic_canon.md")),
         readVolumeMap(bookDir, "(文件不存在)"),
@@ -472,7 +596,9 @@ export class ContinuityAuditor extends BaseAgent {
     const hasFanficCanon = fanficCanon !== "(文件不存在)";
 
     // Load last chapter full text for fine-grained continuity checking
-    const previousChapter = await this.loadPreviousChapter(bookDir, chapterNumber);
+    const previousChapter = authoritativeTruthJson
+      ? options!.predecessorChapterBody!
+      : await this.loadPreviousChapter(bookDir, chapterNumber);
 
     // Load genre profile and book rules
     const genreId = genre ?? "other";
@@ -731,89 +857,26 @@ ${chapterContent}`;
       { role: "user" as const, content: userPrompt },
     ];
     const chatOptions = { temperature: options?.temperature ?? 0.3 };
+    const observed: { current?: FinalProviderRequestObservation } = {};
+    const observedOptions = {
+      ...chatOptions,
+      onFinalProviderRequest: async (request: FinalProviderRequestObservation) => {
+        await options?.onFinalProviderRequest?.(request);
+        observed.current = request;
+      },
+    };
 
     // Use web search for fact verification when eraResearch is enabled
     const response = gp.eraResearch
-      ? await this.chatWithSearch(chatMessages, chatOptions)
-      : await this.chat(chatMessages, chatOptions);
+      ? await this.chatWithSearch(chatMessages, observedOptions)
+      : await this.chat(chatMessages, observedOptions);
 
-    const result = this.parseAuditResult(response.content, resolvedLanguage);
-    return { ...result, tokenUsage: response.usage };
-  }
-
-  private parseAuditResult(content: string, language: PromptLanguage): AuditResult {
-    // Try multiple JSON extraction strategies (handles small/local models)
-
-    // Strategy 1: Find balanced JSON object (not greedy)
-    const balanced = this.extractBalancedJson(content);
-    if (balanced) {
-      const result = this.tryParseAuditJson(balanced, language);
-      if (result) return result;
-    }
-
-    // Strategy 2: Try the whole content as JSON (some models output pure JSON)
-    const trimmed = content.trim();
-    if (trimmed.startsWith("{")) {
-      const result = this.tryParseAuditJson(trimmed, language);
-      if (result) return result;
-    }
-
-    // Strategy 3: Look for ```json code blocks
-    const codeBlockMatch = content.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
-    if (codeBlockMatch) {
-      const result = this.tryParseAuditJson(codeBlockMatch[1]!.trim(), language);
-      if (result) return result;
-    }
-
-    // Strategy 4: Try to extract individual fields via regex (last resort fallback)
-    const passedMatch = content.match(/"passed"\s*:\s*(true|false)/);
-    const issuesMatch = content.match(/"issues"\s*:\s*\[([\s\S]*?)\]/);
-    const summaryMatch = content.match(/"summary"\s*:\s*"([^"]*)"/);
-    if (passedMatch) {
-      const issues: AuditIssue[] = [];
-      if (issuesMatch) {
-        // Try to parse individual issue objects
-        const issuePattern = /\{[^{}]*"severity"\s*:\s*"[^"]*"[^{}]*\}/g;
-        let match: RegExpExecArray | null;
-        while ((match = issuePattern.exec(issuesMatch[1]!)) !== null) {
-          try {
-            const issue = JSON.parse(match[0]);
-	            issues.push({
-	              severity: normalizeAuditSeverity(issue.severity),
-	              category: issue.category ?? (language === "en" ? "Uncategorized" : "未分类"),
-	              description: issue.description ?? "",
-	              suggestion: issue.suggestion ?? "",
-	              repairScope: normalizeRepairScope(issue.repair_scope ?? issue.repairScope),
-	              ...(typeof issue.blocking === "boolean" ? { blocking: issue.blocking } : {}),
-	              ...(issue.severity === "major" ? { explicitSeverity: "MAJOR" as const } : {}),
-	            });
-          } catch {
-            // skip malformed individual issue
-          }
-        }
-      }
-      return {
-        passed: passedMatch[1] === "true",
-        issues,
-        summary: summaryMatch?.[1] ?? "",
-      };
-    }
-
-    return {
-      passed: false,
-      parseFailed: true,
-      issues: [{
-        severity: "critical",
-        category: language === "en" ? "System Error" : "系统错误",
-        description: language === "en"
-          ? "Audit output format was invalid and could not be parsed as JSON."
-          : "审稿输出格式异常，无法解析为 JSON",
-        suggestion: language === "en"
-          ? "The model may not support reliable structured output. Try a stronger model or inspect the API response format."
-          : "可能是模型不支持结构化输出。尝试换一个更大的模型，或检查 API 返回格式。",
-      }],
-      summary: language === "en" ? "Audit output parsing failed" : "审稿输出解析失败",
-    };
+    const result = parseContinuityAuditResponse(response.content, resolvedLanguage);
+    if (!observed.current) return { ...result, tokenUsage: response.usage };
+    const providerRequestUnsigned = { ...observed.current, reviewLanguage: resolvedLanguage };
+    const providerInputFingerprint = fingerprintReviewProviderRequest(providerRequestUnsigned);
+    const providerRequest = { ...providerRequestUnsigned, inputFingerprint: providerInputFingerprint };
+    return { ...result, tokenUsage: response.usage, providerRequest, providerInputFingerprint };
   }
 
   private buildReducedControlBlock(
@@ -858,54 +921,6 @@ ${selectedContext || "- none"}
 
 ### 当前覆盖
 ${overrides}\n`;
-  }
-
-  private extractBalancedJson(text: string): string | null {
-    const start = text.indexOf("{");
-    if (start === -1) return null;
-    let depth = 0;
-    for (let i = start; i < text.length; i++) {
-      if (text[i] === "{") depth++;
-      if (text[i] === "}") depth--;
-      if (depth === 0) return text.slice(start, i + 1);
-    }
-    return null;
-  }
-
-  private tryParseAuditJson(json: string, language: PromptLanguage = "zh"): AuditResult | null {
-    try {
-      const parsed = JSON.parse(json);
-      if (typeof parsed.passed !== "boolean" && parsed.passed !== undefined) return null;
-      const rawScore = parsed.overall_score ?? parsed.overallScore;
-      const overallScore = typeof rawScore === "number" && Number.isFinite(rawScore)
-        ? Math.round(Math.max(0, Math.min(100, rawScore)))
-        : undefined;
-      const rawDimensions = parsed.dimension_scores ?? parsed.dimensionScores;
-      const dimensionScores = rawDimensions && typeof rawDimensions === "object" && !Array.isArray(rawDimensions)
-        ? Object.fromEntries(Object.entries(rawDimensions)
-          .filter(([, value]) => typeof value === "number" && Number.isFinite(value))
-          .map(([key, value]) => [key, Math.round(Math.max(0, Math.min(100, value as number)))]))
-        : undefined;
-      return {
-        passed: Boolean(parsed.passed ?? false),
-        issues: Array.isArray(parsed.issues)
-	          ? parsed.issues.map((i: Record<string, unknown>) => ({
-	              severity: normalizeAuditSeverity(i.severity),
-	              category: (i.category as string) ?? (language === "en" ? "Uncategorized" : "未分类"),
-	              description: (i.description as string) ?? "",
-	              suggestion: (i.suggestion as string) ?? "",
-	              repairScope: normalizeRepairScope(i.repair_scope ?? i.repairScope),
-	              ...(typeof i.blocking === "boolean" ? { blocking: i.blocking } : {}),
-	              ...(i.severity === "major" ? { explicitSeverity: "MAJOR" as const } : {}),
-	            }))
-          : [],
-        summary: String(parsed.summary ?? ""),
-        overallScore,
-        ...(dimensionScores && Object.keys(dimensionScores).length > 0 ? { dimensionScores } : {}),
-      };
-    } catch {
-      return null;
-    }
   }
 
   private async loadPreviousChapter(bookDir: string, currentChapter: number): Promise<string> {

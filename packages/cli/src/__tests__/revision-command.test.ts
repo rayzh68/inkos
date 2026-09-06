@@ -7,10 +7,12 @@ const loadBookConfigMock = vi.fn();
 const logMock = vi.fn();
 const logErrorMock = vi.fn();
 const assertChapterAuthorityMutationAllowedMock = vi.fn();
+const assertLegacyTruthMutationAllowedMock = vi.fn();
 
 vi.mock("@actalk/inkos-core", () => ({
   DEFAULT_REVISE_MODE: "spot-fix",
   assertChapterAuthorityMutationAllowed: assertChapterAuthorityMutationAllowedMock,
+  assertLegacyTruthMutationAllowed: assertLegacyTruthMutationAllowedMock,
   PipelineRunner: class {
     reviseDraft = reviseDraftMock;
     resyncChapterArtifacts = resyncChapterArtifactsMock;
@@ -68,6 +70,7 @@ describe("revision-related CLI commands", () => {
     buildPipelineConfigMock.mockReturnValue({});
     loadBookConfigMock.mockResolvedValue({ language: "zh" });
     assertChapterAuthorityMutationAllowedMock.mockResolvedValue(undefined);
+    assertLegacyTruthMutationAllowedMock.mockResolvedValue(undefined);
   });
 
   it("passes one-off brief into revise command pipeline config", async () => {
@@ -80,6 +83,18 @@ describe("revision-related CLI commands", () => {
       revisionGate: "strict",
     });
     expect(reviseDraftMock).toHaveBeenCalledWith("demo-book", 3, "rewrite");
+  });
+
+  it("rejects write rewrite at central V2 cutover admission before chapter mutation or filesystem work", async () => {
+    assertLegacyTruthMutationAllowedMock.mockRejectedValueOnce(new Error("TRUTH_AUTHORITY_MUTATION_FORBIDDEN"));
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("EXIT_1"); }) as never);
+    try {
+      const { writeCommand } = await import("../commands/write.js");
+      await expect(writeCommand.parseAsync(["node", "write", "rewrite", "demo-book", "4", "--force"], { from: "node" })).rejects.toThrow("EXIT_1");
+      expect(logErrorMock).toHaveBeenCalledWith(expect.stringContaining("TRUTH_AUTHORITY_MUTATION_FORBIDDEN"));
+      expect(assertChapterAuthorityMutationAllowedMock).not.toHaveBeenCalled();
+      expect(reviseDraftMock).not.toHaveBeenCalled();
+    } finally { exit.mockRestore(); }
   });
 
   it("exposes write sync and passes brief into pipeline config", async () => {

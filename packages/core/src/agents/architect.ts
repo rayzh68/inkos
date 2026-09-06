@@ -4,6 +4,8 @@ import type { GenreProfile } from "../models/genre-profile.js";
 import { readGenreProfile } from "./rules-reader.js";
 import { writeFile, mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { resolveTruthCutoverState } from "../interaction/truth-authority.js";
+import { safeMutationPath } from "../utils/path-safety.js";
 import { renderHookSnapshot } from "../utils/memory-retrieval.js";
 import {
   shouldPromoteHook,
@@ -846,11 +848,26 @@ You MUST emit all **5 SECTION blocks in order**: story_frame → volume_map → 
     language: "zh" | "en" = "zh",
     mode: "init" | "revise" = "init",
   ): Promise<void> {
+    const legacyTruthWritable = await resolveTruthCutoverState(bookDir) === "LEGACY_V1_ONLY";
+    if (!legacyTruthWritable && mode === "init") throw new Error("TRUTH_AUTHORITY_MUTATION_FORBIDDEN: foundation initialization");
     const storyDir = join(bookDir, "story");
     const outlineDir = join(storyDir, "outline");
     const rolesDir = join(storyDir, "roles");
     const rolesMajorDir = join(rolesDir, "主要角色");
     const rolesMinorDir = join(rolesDir, "次要角色");
+
+    const phase5 = Boolean(output.storyFrame?.trim());
+    const plannedPaths = ["story/outline", "story/roles/主要角色", "story/roles/次要角色", "story/story_bible.md", "story/book_rules.md",
+      ...(phase5 ? ["story/outline/story_frame.md", "story/outline/volume_map.md"] : ["story/volume_outline.md"]),
+      ...(legacyTruthWritable ? ["story/character_matrix.md"] : []),
+      ...(mode === "init" ? ["story/current_state.md", "story/pending_hooks.md", "story/emotional_arcs.md"] : []),
+      ...(phase5 && output.rhythmPrinciples?.trim() ? [`story/outline/${language === "en" ? "rhythm_principles.md" : "节奏原则.md"}`] : []),
+    ];
+    for (const role of output.roles ?? []) {
+      const safeName = role.name.replace(/[/\\:*?"<>|]/g, "_").trim();
+      if (safeName) plannedPaths.push(`story/roles/${role.tier === "major" ? "主要角色" : "次要角色"}/${safeName}.md`);
+    }
+    for (const path of plannedPaths) await safeMutationPath(bookDir, path);
 
     await Promise.all([
       mkdir(storyDir, { recursive: true }),
@@ -945,11 +962,13 @@ You MUST emit all **5 SECTION blocks in order**: story_frame → volume_map → 
       this.buildStoryBibleShim(language),
       "utf-8",
     ));
-    writes.push(writeFile(
-      join(storyDir, "character_matrix.md"),
-      this.buildCharacterMatrixShim(roles, language),
-      "utf-8",
-    ));
+    if (legacyTruthWritable) {
+      writes.push(writeFile(
+        join(storyDir, "character_matrix.md"),
+        this.buildCharacterMatrixShim(roles, language),
+        "utf-8",
+      ));
+    }
 
     // Cleanup #1: volume_outline.md mirror removed. All readers now resolve
     // through readVolumeMap() in utils/outline-paths.ts, which prefers

@@ -8,6 +8,15 @@ export { type BookRules, type ParsedBookRules, BookRulesSchema, parseBookRules, 
 export { type DetectionHistoryEntry, type DetectionStats } from "./models/detection.js";
 export { type StyleProfile } from "./models/style-profile.js";
 export { type LengthCountingMode, type LengthSpec, type LengthTelemetry, type LengthWarning, LengthCountingModeSchema, LengthSpecSchema, LengthTelemetrySchema, LengthWarningSchema } from "./models/length-governance.js";
+export * from "./models/chapter-delta.js";
+export * from "./models/structured-truth.js";
+export * from "./state/canonical-json.js";
+export * from "./state/truth-identities.js";
+export * from "./state/truth-vocabulary.js";
+export * from "./state/chapter-delta-admission.js";
+export * from "./state/structured-truth-reducer.js";
+export * from "./state/structured-truth-projections.js";
+export * from "./state/projection-manifest.js";
 export {
   commitProductionArtifacts,
   createProductionRunSnapshot,
@@ -190,6 +199,8 @@ export {
   type PromptSource,
 } from "./prompts/index.js";
 export { PlannerAgent, type PlanChapterInput, type PlanChapterOutput } from "./agents/planner.js";
+export { TruthExtractorAgent, parseTruthExtractorResponse, type TruthExtractionRequest, type TruthExtractionResponse } from "./agents/truth-extractor.js";
+export { TruthValidatorAgent, parseTruthValidatorResponse, type TruthValidationRequest, type TruthValidationResult, type TruthValidationVerdict, type TruthValidatorResponse } from "./agents/truth-validator.js";
 export {
   ComposerAgent,
   composeGovernedChapter,
@@ -234,7 +245,7 @@ export {
   resolveProxyUrl,
 } from "./utils/proxy-fetch.js";
 export { assertSafeBookId, deriveBookIdFromTitle, isSafeBookId } from "./utils/book-id.js";
-export { safeChildPath } from "./utils/path-safety.js";
+export { safeChildPath, safeMutationPath } from "./utils/path-safety.js";
 export { toPosixPath } from "./utils/posix-path.js";
 export {
   AutomationModeSchema,
@@ -375,6 +386,12 @@ export { buildExportArtifact, writeExportArtifact } from "./interaction/export-a
 export {
   normalizeTruthFileName,
   classifyTruthAuthority,
+  classifyTruthMutationPath,
+  resolveTruthCutoverState,
+  assertTruthMutationAllowed,
+  assertLegacyTruthMutationAllowed,
+  type TruthCutoverState,
+  type TruthPathClass,
   type TruthAuthority,
 } from "./interaction/truth-authority.js";
 export {
@@ -580,6 +597,7 @@ export { analyzeHookHealth } from "./utils/hook-health.js";
 
 // Pipeline
 export { PipelineRunner, type PipelineConfig, type ChapterPipelineResult, type WriteChaptersOptions, type DraftResult, type PlanChapterResult, type ComposeChapterResult, type ReviseResult, type ExistingChapterReviewStatus, type ExistingChapterReviewResult, type ResumeAuditFailedChapterResult, type ReviseDraftOptions, type TruthFiles, type BookStatusInfo, type ImportChaptersInput, type ImportChaptersResult, type TokenUsageSummary } from "./pipeline/runner.js";
+export { runCanonicalTruthTransaction, type CanonicalTruthExtractionArtifact, type CanonicalTruthExtractionContextRecord, type CanonicalTruthValidationArtifact, type CanonicalTruthValidationContextRecord, type CanonicalTruthTransactionResult, type TruthApplicationReceiptV1 } from "./pipeline/canonical-truth-transaction.js";
 export { parseBookProductionMap, loadBookProductionMap, resolveProductionScope, type BookProductionMap, type ProductionVolume, type ProductionMode, type ProductionScope } from "./production/book-production-map.js";
 export { autonomousProductionStatePath, claimAutonomousJob, correctLegacyPendingChapterArtifactBindings, createAutonomousPipelineActions, createAutonomousProviderExecution, deriveAutonomousJobIdentity, loadAutonomousProductionState, refreshAutonomousJobClaim, releaseAutonomousJob, resolveFormalPendingChapterRecoveryPlan, runBoundedAutonomousScope, saveAutonomousProductionState, startAutonomousJobHeartbeat, verifyFormalPendingChapterRecoveryEvidence, type AutonomousJobClaim, type AutonomousProviderRecovery, type AutonomousRecoveryOwnership, type AutonomousRunProgress, type AutonomousRunStatus, type AutonomousStageMetadata, type FormalOfflineFinalizationPlan, type FormalBoundedStateRebaselinePlan, type FormalPendingChapterRecoveryPlan } from "./production/bounded-autonomous-controller.js";
 export {
@@ -588,12 +606,19 @@ export {
   assertChapterAuthorityMutationAllowed,
   assertChapterWriterStartAllowed,
   chapterTransactionStagingBookDir,
+  collectChapterProviderReferences,
+  collectBoundChapterProviderRequests,
   createChapterGenesis,
   finalizeChapterTransaction,
   inspectChapterAuthority,
   isChapterTransactionEnabled,
   loadChapterGenesis,
+  loadCommittedTruthForWriter,
+  loadCommittedV2PredecessorAuthority,
   reconcileChapterProjections,
+  reserveChapterTransactionProviderRequest,
+  bindChapterTransactionProviderRequest,
+  deriveChapterProviderUsage,
   recordChapterTransactionCandidate,
   recordChapterTransactionOperation,
   recordChapterTransactionReviewEvidence,
@@ -601,6 +626,7 @@ export {
   resolveChapterProviderOperation,
   stageChapterCommitCandidate,
   stageChapterCommitFromProjection,
+  stageTruthChapterCommitV2,
   verifyChapterCommit,
   verifyChapterCommitChain,
   type ChapterAuthorityState,
@@ -610,15 +636,22 @@ export {
   type ChapterCommitReviewAuthority,
   type ChapterCommitReviewStatus,
   type ChapterProviderReference,
+  type ChapterProviderRequestAuthority,
+  type ChapterProviderRequestBinding,
   type ChapterStateValidationAuthority,
   type ChapterGenesis,
   type ChapterTransactionHandle,
   type ChapterTransactionRecord,
+  type FirstV2BaselineContext,
+  type LegacyChapterCommitV1,
+  type TruthChapterCommitArtifactsV2,
+  type TruthChapterCommitV2,
 } from "./production/chapter-transaction.js";
 export { projectAutonomousEconomics, type AutonomousUsageRecord, type ForecastRange } from "./production/autonomous-economics.js";
 export { classifyFinalAuditDecision, type FinalAuditDecision } from "./pipeline/bounded-review.js";
 export { runBoundedReviewCycle, scoredLogicReviewFromAudit, type BoundedReviewResult, type BoundedCandidate, type ScoredReview, type ReviewFinding, type RoleTokenUsage } from "./pipeline/bounded-review.js";
 export { CommercialReaderAgent, parseCommercialReaderResponse } from "./agents/commercial-reader.js";
+export { parseContinuityAuditResponse } from "./agents/continuity.js";
 export { Scheduler, type SchedulerConfig } from "./pipeline/scheduler.js";
 export { detectChapter, detectAndRewrite, loadDetectionHistory, type DetectChapterResult, type DetectAndRewriteResult } from "./pipeline/detection-runner.js";
 export { runScriptCreation, runStoryboardCreation, runInteractiveFilmCreation, createStoryboardAssetsManifest, type ScriptCreationRunOptions, type ScriptCreationRunResult, type StoryboardAssetsManifest, type StoryboardCreationRunOptions, type StoryboardCreationRunResult, type InteractiveFilmCreationRunOptions, type InteractiveFilmCreationRunResult, type StoryboardImageAsset, type StoryboardImageAssetVariant } from "./pipeline/script-storyboard-runner.js";

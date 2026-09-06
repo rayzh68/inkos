@@ -898,6 +898,24 @@ describe("ArchitectAgent", () => {
     }
   });
 
+  it.each(["outline", "roles/主要角色"])("preflights %s junction before foundation writes or role cleanup", async (path) => {
+    const { mkdtemp, mkdir, rm, symlink, writeFile, readFile, readdir } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join, dirname } = await import("node:path");
+    const root = await mkdtemp(join(tmpdir(), "inkos-architect-boundary-"));
+    try {
+      const bookDir = join(root, "book");
+      await mkdir(dirname(join(bookDir, "story", path)), { recursive: true });
+      await mkdir(join(root, "outside"));
+      await writeFile(join(root, "outside/retained.md"), "outside");
+      await writeFile(join(bookDir, "story/story_bible.md"), "before");
+      await symlink(join(root, "outside"), join(bookDir, "story", path), "junction");
+      await expect(buildPhase5Agent().writeFoundationFiles(bookDir, { storyFrame: "frame", volumeMap: "map", storyBible: "bible", volumeOutline: "outline", bookRules: "rules", currentState: "state", pendingHooks: "hooks", roles: [] }, false, "en", "revise")).rejects.toThrow("UNSAFE_PATH_COMPONENT");
+      expect(await readFile(join(bookDir, "story/story_bible.md"), "utf8")).toBe("before");
+      expect(await readdir(join(root, "outside"))).toEqual(["retained.md"]);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it("writeFoundationFiles falls back to legacy layout when storyFrame is empty", async () => {
     const { mkdtemp, rm, access, readFile } = await import("node:fs/promises");
     const { tmpdir } = await import("node:os");
