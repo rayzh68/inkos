@@ -12,7 +12,8 @@ import { deleteLatestChapter } from "../state/chapter-delete.js";
 import { assertSafeTruthFileName, createInteractionToolsFromDeps } from "../interaction/project-tools.js";
 import { writeExportArtifact } from "../interaction/export-artifact.js";
 import { assertSafeBookId, deriveBookIdFromTitle } from "../utils/book-id.js";
-import { safeChildPath } from "../utils/path-safety.js";
+import { safeChildPath, safeMutationPath } from "../utils/path-safety.js";
+import { assertTruthMutationAllowed } from "../interaction/truth-authority.js";
 import {
   normalizePlatformId,
   normalizePlatformOrOther,
@@ -70,6 +71,14 @@ function textResult<T = undefined>(text: string, details?: T): AgentToolResult<T
  */
 function safeBooksPath(booksRoot: string, relativePath: string): string {
   return safeChildPath(booksRoot, relativePath);
+}
+
+async function safeBookMutationPath(booksRoot: string, requestedPath: string): Promise<string> {
+  const filePath = await safeMutationPath(booksRoot, requestedPath);
+  const [bookId, ...segments] = requestedPath.split(/[\\/]/u);
+  if (!bookId || !segments.length) throw new Error("Book-relative file path required");
+  await assertTruthMutationAllowed({ bookDir: join(booksRoot, bookId), relativePath: segments.join("/") });
+  return filePath;
 }
 
 function resolveToolBookId(
@@ -3616,7 +3625,7 @@ export function createEditTool(projectRoot: string): AgentTool<typeof EditParams
       params: Static<typeof EditParams>,
     ): Promise<AgentToolResult<undefined>> {
       try {
-        const filePath = safeBooksPath(booksRoot, params.path);
+        const filePath = await safeBookMutationPath(booksRoot, params.path);
         const content = await readFile(filePath, "utf-8");
         const idx = content.indexOf(params.old_string);
         if (idx === -1) {
@@ -3661,7 +3670,7 @@ export function createWriteFileTool(projectRoot: string): AgentTool<typeof Write
       params: Static<typeof WriteFileParams>,
     ): Promise<AgentToolResult<undefined>> {
       try {
-        const filePath = safeBooksPath(booksRoot, params.path);
+        const filePath = await safeBookMutationPath(booksRoot, params.path);
         const parentDir = resolve(filePath, "..");
         const { mkdir } = await import("node:fs/promises");
         await mkdir(parentDir, { recursive: true });

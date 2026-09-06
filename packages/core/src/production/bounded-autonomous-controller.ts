@@ -17,6 +17,7 @@ import {
 import { classifyFinalAuditDecision, type ReviewerRole, type ScoredReview } from "../pipeline/bounded-review.js";
 import { commitAtomicFileSet } from "../utils/atomic-file-set.js";
 import { countChapterLength, resolveLengthCountingMode } from "../utils/length-metrics.js";
+import { assertChapterTransactionOpen } from "./chapter-transaction.js";
 
 export type AutonomousRunStatus =
   | "RUNNING"
@@ -324,6 +325,11 @@ async function writeAutonomousHeartbeat(leasePath: string, claim: AutonomousJobC
   const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(temp, `${JSON.stringify({ ...claim, updatedAt: new Date().toISOString() }, null, 2)}\n`, "utf-8");
   await rename(temp, path);
+}
+
+/** Shares the existing book admission guard; callers hold it only for durable local publication. */
+export function withChapterTransactionPublicationGuard<T>(bookDir: string, task: () => Promise<T>): Promise<T> {
+  return withAutonomousLeaseGuard(join(bookDir, "story", "runtime", "bounded-autonomous", "active-job.json"), task);
 }
 
 /** Atomically grants the single cross-process right to run one book job. */
@@ -2090,6 +2096,9 @@ export function createAutonomousProviderExecution(params: {
   };
   const markTransportStarted = async (identity: LLMCallExecutionIdentity): Promise<void> => {
     params.assertModelCallAdmission?.();
+    if (identity.transactionId) await assertChapterTransactionOpen({
+      bookDir: join(params.projectRoot, "books", params.bookId), transactionId: identity.transactionId, chapterNumber: activeChapter,
+    });
     const progress = await loadAutonomousProductionState<AutonomousRunProgress>(params.projectRoot, params.bookId);
     if (progress?.jobId !== params.jobId) return;
     const history = [...(progress.providerAttemptHistory ?? [])];
@@ -2124,6 +2133,9 @@ export function createAutonomousProviderExecution(params: {
     const attempt = Math.max(0, ...history.filter((entry) => entry.logicalStepId === identity.logicalStepId).map((entry) => entry.attempt)) + 1;
     if (attempt > 3) throw new Error("PROVIDER_RETRY_EXHAUSTED");
     const transportAttemptId = `${identity.logicalStepId}:transport-attempt:${attempt}`;
+    if (identity.transactionId) await assertChapterTransactionOpen({
+      bookDir: join(params.projectRoot, "books", params.bookId), transactionId: identity.transactionId, chapterNumber: activeChapter,
+    });
     history.push({
       transportAttemptId, logicalStepId: identity.logicalStepId, chapterNumber: activeChapter, role: identity.role,
       provider: identity.provider, requestedModel: identity.model, attempt, classification: "TRANSPORT_STARTED",
@@ -2265,9 +2277,14 @@ export function createAutonomousProviderExecution(params: {
     await saveAutonomousProductionState(params.projectRoot, params.bookId, normalized);
     return normalized;
   };
-  const policy: LLMCallExecutionPolicy = {
-    prepare: async (request) => {
+  const admissionGuard = <T>(task: () => Promise<T>) => withAutonomousLeaseGuard(
+    autonomousProductionLeasePath(params.projectRoot, params.bookId), task,
+  );
+  const prepareRequest: LLMCallExecutionPolicy["prepare"] = async (request) => {
       const identity = identify(request);
+      if (identity.transactionId) await assertChapterTransactionOpen({
+        bookDir: join(params.projectRoot, "books", params.bookId), transactionId: identity.transactionId, chapterNumber: activeChapter,
+      });
       const cachedResponse = await readArtifact(identity);
       if (!cachedResponse) {
         let progress = await loadAutonomousProductionState<AutonomousRunProgress>(params.projectRoot, params.bookId);
@@ -2287,9 +2304,15 @@ export function createAutonomousProviderExecution(params: {
         }
       }
       return { identity, ...(cachedResponse ? { cachedResponse } : {}) };
-    },
+  };
+  const policy: LLMCallExecutionPolicy = {
+    prepare: (request) => admissionGuard(() => prepareRequest(request)),
     persistSuccess: persistArtifact,
-    markTransportStarted,
+    markTransportStarted: async (identity) => {
+      // Provider preflight follows prepare. Only the actual start hook may
+      // recheck OPEN and durably admit this transport under the terminal guard.
+      await admissionGuard(() => markTransportStarted(identity));
+    },
     markTransportReturned,
     persistFailure,
   };

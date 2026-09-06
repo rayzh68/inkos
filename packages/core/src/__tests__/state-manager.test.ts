@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, rm, writeFile, readFile, mkdir, stat } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, readFile, mkdir, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StateManager } from "../state/manager.js";
@@ -17,6 +17,35 @@ describe("StateManager", () => {
 
   afterEach(async () => {
     await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it.each(["snapshot", "restore"])("preflights structured-state junctions before any %s mutation", async (operation) => {
+    const story = join(manager.bookDir("test-book"), "story");
+    const snapshot = join(story, "snapshots/0");
+    const outside = join(tempDir, "outside");
+    await mkdir(snapshot, { recursive: true });
+    await mkdir(outside);
+    for (const name of ["current_state.md", "pending_hooks.md"]) {
+      await writeFile(join(story, name), "current");
+      await writeFile(join(snapshot, name), "snapshot");
+    }
+    await writeFile(join(outside, "state.json"), "outside");
+    await symlink(outside, join(story, "state"), "junction");
+    await expect(operation === "snapshot" ? manager.snapshotState("test-book", 0) : manager.restoreState("test-book", 0)).rejects.toThrow("UNSAFE_PATH_COMPONENT");
+    expect(await readFile(join(story, "current_state.md"), "utf8")).toBe("current");
+    expect(await readFile(join(snapshot, "current_state.md"), "utf8")).toBe("snapshot");
+    expect(await readFile(join(outside, "state.json"), "utf8")).toBe("outside");
+  });
+
+  it("rejects legacy restore of canonical truth before replacing Markdown", async () => {
+    const story = join(manager.bookDir("test-book"), "story");
+    await mkdir(join(story, "snapshots/0/state"), { recursive: true });
+    await writeFile(join(story, "current_state.md"), "current");
+    await writeFile(join(story, "snapshots/0/current_state.md"), "snapshot");
+    await writeFile(join(story, "snapshots/0/pending_hooks.md"), "hooks");
+    await writeFile(join(story, "snapshots/0/state/truth.json"), "canonical authority");
+    await expect(manager.restoreState("test-book", 0)).rejects.toThrow("TRUTH_AUTHORITY_MUTATION_FORBIDDEN");
+    expect(await readFile(join(story, "current_state.md"), "utf8")).toBe("current");
   });
 
   // -------------------------------------------------------------------------

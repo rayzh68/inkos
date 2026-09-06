@@ -1,5 +1,6 @@
 import { access, cp, mkdir, readdir, rm, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { join, relative } from "node:path";
+import { assertLegacyTruthMutationAllowed, safeMutationPath } from "@actalk/inkos-core";
 
 export interface BookBackupInfo {
   readonly id: string;
@@ -43,23 +44,27 @@ export async function createBookBackup(
   bookId: string,
   options: CreateBookBackupOptions = {},
 ): Promise<CreateBookBackupResult> {
-  const bookDir = join(root, "books", bookId);
+  const bookDir = await safeMutationPath(root, `books/${bookId}`);
   const bookInfo = await stat(bookDir).catch(() => null);
   if (!bookInfo?.isDirectory()) {
     throw new Error(`Book "${bookId}" not found at books/${bookId}/.`);
   }
 
-  const backupsDir = bookBackupsDir(root, bookId);
-  await mkdir(backupsDir, { recursive: true });
+  await verifyBackupComponents(bookDir);
+
+  const backupsDir = await safeMutationPath(root, `.inkos/backups/${bookId}`);
 
   const clock = options.now ?? (() => new Date());
   const base = options.suffix ? `${formatStamp(clock())}-${options.suffix}` : formatStamp(clock());
+  await safeMutationPath(backupsDir, base);
   let backupId = base;
   for (let attempt = 2; await pathExists(join(backupsDir, backupId)); attempt += 1) {
     backupId = `${base}-${attempt}`;
   }
 
   const backupPath = join(backupsDir, backupId);
+  await mkdir(backupsDir, { recursive: true });
+  await safeMutationPath(backupsDir, backupId);
   await cp(bookDir, backupPath, { recursive: true });
   return { bookId, backupId, path: backupPath };
 }
@@ -101,6 +106,8 @@ export async function restoreBookBackup(
   }
 
   const backupPath = join(bookBackupsDir(root, bookId), backupId);
+  await safeMutationPath(root, `.inkos/backups/${bookId}/${backupId}`);
+  await safeMutationPath(root, `books/${bookId}`);
   const backupInfo = await stat(backupPath).catch(() => null);
   if (!backupInfo?.isDirectory()) {
     throw new Error(
@@ -111,6 +118,8 @@ export async function restoreBookBackup(
 
   const bookDir = join(root, "books", bookId);
   const bookExists = await stat(bookDir).then((info) => info.isDirectory()).catch(() => false);
+  await assertLegacyTruthMutationAllowed(bookDir);
+  await verifyBackupComponents(backupPath);
   let preRestoreBackupId: string | null = null;
   if (bookExists) {
     const preRestore = await createBookBackup(root, bookId, { now: options.now, suffix: "pre-restore" });
@@ -121,6 +130,14 @@ export async function restoreBookBackup(
   await cp(backupPath, bookDir, { recursive: true });
 
   return { bookId, restoredFrom: backupId, preRestoreBackupId };
+}
+
+async function verifyBackupComponents(root: string, directory = root): Promise<void> {
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    await safeMutationPath(root, relative(root, path));
+    if (entry.isDirectory()) await verifyBackupComponents(root, path);
+  }
 }
 
 function formatStamp(date: Date): string {

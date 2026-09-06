@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { ConsolidatorAgent } from "@actalk/inkos-core";
+import { assertLegacyTruthMutationAllowed, ConsolidatorAgent, StateManager } from "@actalk/inkos-core";
 import { loadConfig, buildPipelineConfig, findProjectRoot, resolveBookId, log, logError } from "../utils.js";
 
 export const consolidateCommand = new Command("consolidate")
@@ -11,6 +11,9 @@ export const consolidateCommand = new Command("consolidate")
       const config = await loadConfig();
       const root = findProjectRoot();
       const bookId = await resolveBookId(bookIdArg, root);
+      const state = new StateManager(root);
+      const bookDir = state.bookDir(bookId);
+      await assertLegacyTruthMutationAllowed(bookDir);
 
       const pipelineConfig = buildPipelineConfig(config, root);
       const consolidator = new ConsolidatorAgent({
@@ -18,10 +21,6 @@ export const consolidateCommand = new Command("consolidate")
         model: pipelineConfig.model,
         projectRoot: root,
       });
-
-      const { StateManager } = await import("@actalk/inkos-core");
-      const state = new StateManager(root);
-      const bookDir = state.bookDir(bookId);
 
       if (!opts.json) log(`Consolidating chapter summaries for "${bookId}"...`);
 

@@ -1,5 +1,7 @@
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { assertLegacyTruthMutationAllowed } from "../interaction/truth-authority.js";
+import { safeMutationPath } from "../utils/path-safety.js";
 import {
   ChapterSummariesStateSchema,
   CurrentStateStateSchema,
@@ -44,10 +46,19 @@ interface MarkdownBootstrapState {
   readonly durableStoryProgress: number;
 }
 
+async function preflightBootstrapPaths(bookDir: string): Promise<void> {
+  for (const path of ["book.json", "chapters/index.json", "story/current_state.md", "story/pending_hooks.md", "story/chapter_summaries.md",
+    ...["manifest.json", "current_state.json", "hooks.json", "chapter_summaries.json"].map((file) => `story/state/${file}`)]) {
+    await safeMutationPath(bookDir, path);
+  }
+}
+
 export async function bootstrapStructuredStateFromMarkdown(params: {
   readonly bookDir: string;
   readonly fallbackChapter?: number;
 }): Promise<BootstrapStructuredStateResult> {
+  await assertLegacyTruthMutationAllowed(params.bookDir);
+  await preflightBootstrapPaths(params.bookDir);
   const storyDir = join(params.bookDir, "story");
   const stateDir = join(storyDir, "state");
   const manifestPath = join(stateDir, "manifest.json");
@@ -128,6 +139,8 @@ export async function rewriteStructuredStateFromMarkdown(params: {
   readonly bookDir: string;
   readonly fallbackChapter?: number;
 }): Promise<BootstrapStructuredStateResult> {
+  await assertLegacyTruthMutationAllowed(params.bookDir);
+  await preflightBootstrapPaths(params.bookDir);
   const storyDir = join(params.bookDir, "story");
   const stateDir = join(storyDir, "state");
   const manifestPath = join(stateDir, "manifest.json");

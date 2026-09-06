@@ -37,12 +37,15 @@ import {
   readSubplotBoard,
 } from "./planner-context.js";
 import type { StoredHook } from "../state/memory-db.js";
+import type { StructuredTruthV1 } from "../models/structured-truth.js";
 
 export interface PlanChapterInput {
   readonly book: BookConfig;
   readonly bookDir: string;
   readonly chapterNumber: number;
   readonly externalContext?: string;
+  readonly authoritativeTruth?: StructuredTruthV1;
+  readonly predecessorChapterBody?: string;
 }
 
 export interface PlanChapterOutput {
@@ -51,6 +54,31 @@ export interface PlanChapterOutput {
   readonly intentMarkdown: string;
   readonly plannerInputs: ReadonlyArray<string>;
   readonly runtimePath: string;
+  readonly tokenUsage?: PlannerTokenUsage;
+}
+
+export interface PlannerTokenUsage {
+  readonly promptTokens: number;
+  readonly completionTokens: number;
+  readonly totalTokens: number;
+  readonly actualCostUsd?: number;
+}
+
+interface PlannerMemoInput {
+  readonly storyDir: string;
+  readonly bookDir: string;
+  readonly chapterNumber: number;
+  readonly isGoldenOpening: boolean;
+  readonly fallbackGoal: string;
+  readonly chapterSummariesRaw: string;
+  readonly previousEndingExcerpt?: string;
+  readonly brief?: string;
+  readonly chapterContext?: string;
+  readonly relevantHooks?: ReadonlyArray<StoredHook>;
+  readonly recyclableHooks?: ReadonlyArray<StoredHook>;
+  readonly language?: "zh" | "en";
+  readonly lengthSpec: LengthSpec;
+  readonly authoritativeTruthJson?: string;
 }
 
 const MEMO_RETRY_LIMIT = 3;
@@ -82,6 +110,8 @@ export class PlannerAgent extends BaseAgent {
     const seedMaterials = await loadPlanningSeedMaterials({
       bookDir: input.bookDir,
       chapterNumber: input.chapterNumber,
+      ...(input.authoritativeTruth ? { authoritativeTruth: input.authoritativeTruth } : {}),
+      ...(input.predecessorChapterBody !== undefined ? { predecessorChapterBody: input.predecessorChapterBody } : {}),
     });
     const outlineNode = this.findOutlineNode(seedMaterials.volumeOutline, input.chapterNumber);
     const goal = this.deriveGoal(
@@ -108,6 +138,8 @@ export class PlannerAgent extends BaseAgent {
       outlineNode,
       mustKeep,
       seed: seedMaterials,
+      ...(input.authoritativeTruth ? { authoritativeTruth: input.authoritativeTruth } : {}),
+      ...(input.predecessorChapterBody !== undefined ? { predecessorChapterBody: input.predecessorChapterBody } : {}),
     });
     const memorySelection = materials.memorySelection;
     const activeHookCount = memorySelection.activeHooks.filter(
@@ -135,7 +167,7 @@ export class PlannerAgent extends BaseAgent {
       input.book.chapterWordCount,
       input.book.language ?? "zh",
     );
-    const memo = await this.planChapterMemo({
+    const plannedMemo = await this.planChapterMemoWithUsage({
       storyDir,
       bookDir: input.bookDir,
       chapterNumber: input.chapterNumber,
@@ -152,7 +184,9 @@ export class PlannerAgent extends BaseAgent {
       // for English books instead of always-Chinese.
       language: input.book.language ?? "zh",
       lengthSpec,
+      authoritativeTruthJson: seedMaterials.authoritativeTruthJson,
     });
+    const memo = plannedMemo.memo;
 
     // memo.goal is LLM-produced and specific (<=50 chars, validated).
     // Overwrite intent.goal so downstream composer/retrieval gets the
@@ -176,6 +210,7 @@ export class PlannerAgent extends BaseAgent {
       intentMarkdown,
       plannerInputs: materials.plannerInputs,
       runtimePath,
+      tokenUsage: plannedMemo.tokenUsage,
     };
   }
 
@@ -184,25 +219,19 @@ export class PlannerAgent extends BaseAgent {
    * 3 times on parse failure, injecting the error message back into the user
    * prompt so the LLM can correct itself.
    */
-  async planChapterMemo(input: {
-    readonly storyDir: string;
-    readonly bookDir: string;
-    readonly chapterNumber: number;
-    readonly isGoldenOpening: boolean;
-    readonly fallbackGoal: string;
-    readonly chapterSummariesRaw: string;
-    readonly previousEndingExcerpt?: string;
-    readonly brief?: string;
-    readonly chapterContext?: string;
-    readonly relevantHooks?: ReadonlyArray<StoredHook>;
-    readonly recyclableHooks?: ReadonlyArray<StoredHook>;
-    readonly language?: "zh" | "en";
-    readonly lengthSpec: LengthSpec;
-  }): Promise<ChapterMemo> {
+  async planChapterMemo(input: PlannerMemoInput): Promise<ChapterMemo> {
+    return (await this.planChapterMemoWithUsage(input)).memo;
+  }
+
+  private async planChapterMemoWithUsage(input: PlannerMemoInput): Promise<{
+    readonly memo: ChapterMemo;
+    readonly tokenUsage: PlannerTokenUsage;
+  }> {
+    const canonicalTruthSurface = input.authoritativeTruthJson ?? "";
     const [characterMatrix, subplotBoard, emotionalArcs, bookRulesRaw] = await Promise.all([
-      readCharacterMatrix(input.storyDir),
-      readSubplotBoard(input.storyDir),
-      readEmotionalArcs(input.storyDir),
+      input.authoritativeTruthJson ? Promise.resolve(canonicalTruthSurface) : readCharacterMatrix(input.storyDir),
+      input.authoritativeTruthJson ? Promise.resolve(canonicalTruthSurface) : readSubplotBoard(input.storyDir),
+      input.authoritativeTruthJson ? Promise.resolve(canonicalTruthSurface) : readEmotionalArcs(input.storyDir),
       readBookRules(input.storyDir),
     ]);
 
@@ -220,7 +249,7 @@ export class PlannerAgent extends BaseAgent {
       ? "Fix and re-emit."
       : "请修正后重新输出。";
 
-    const userMessage = buildPlannerUserMessage({
+    const baseUserMessage = buildPlannerUserMessage({
       chapterNumber: input.chapterNumber,
       previousChapterEndingExcerpt: input.previousEndingExcerpt?.trim()
         ? input.previousEndingExcerpt.trim()
@@ -250,11 +279,15 @@ export class PlannerAgent extends BaseAgent {
       chapterContext: input.chapterContext ?? "",
       language,
     });
+    const userMessage = input.authoritativeTruthJson
+      ? `${baseUserMessage}\n\n## Verified committed V2 truth authority (complete)\n${input.authoritativeTruthJson}`
+      : baseUserMessage;
 
     const systemPrompt = getPlannerMemoSystemPrompt(language);
 
     let currentUserMessage = userMessage;
     let lastError: PlannerParseError | undefined;
+    let tokenUsage: PlannerTokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
 
     for (let attempt = 0; attempt < MEMO_RETRY_LIMIT; attempt += 1) {
       const response = await this.chat(
@@ -264,9 +297,17 @@ export class PlannerAgent extends BaseAgent {
         ],
         { temperature: 0.7 },
       );
+      tokenUsage = {
+        promptTokens: tokenUsage.promptTokens + response.usage.promptTokens,
+        completionTokens: tokenUsage.completionTokens + response.usage.completionTokens,
+        totalTokens: tokenUsage.totalTokens + response.usage.totalTokens,
+        ...((tokenUsage.actualCostUsd !== undefined || response.usage.actualCostUsd !== undefined)
+          ? { actualCostUsd: (tokenUsage.actualCostUsd ?? 0) + (response.usage.actualCostUsd ?? 0) }
+          : {}),
+      };
 
       try {
-        return parseMemo(response.content, input.chapterNumber, input.isGoldenOpening);
+        return { memo: parseMemo(response.content, input.chapterNumber, input.isGoldenOpening), tokenUsage };
       } catch (error) {
         if (!(error instanceof PlannerParseError)) {
           throw error;
@@ -279,7 +320,7 @@ export class PlannerAgent extends BaseAgent {
 
     const fallbackError = lastError ?? new PlannerParseError("memo planner exhausted retries without a specific error");
     this.log?.warn(`[planner] memo planner fell back after ${MEMO_RETRY_LIMIT} attempts: ${fallbackError.message}`);
-    return parseMemo(
+    return { memo: parseMemo(
       this.buildFallbackMemoMarkdown({
         chapterNumber: input.chapterNumber,
         isGoldenOpening: input.isGoldenOpening,
@@ -290,7 +331,7 @@ export class PlannerAgent extends BaseAgent {
       }),
       input.chapterNumber,
       input.isGoldenOpening,
-    );
+    ), tokenUsage };
   }
 
   private buildFallbackMemoMarkdown(input: {

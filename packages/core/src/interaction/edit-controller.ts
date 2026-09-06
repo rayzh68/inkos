@@ -5,7 +5,8 @@ import {
   archiveChapterVersion,
   type ChapterVersionSource,
 } from "../state/chapter-workspace.js";
-import { classifyTruthAuthority, normalizeTruthFileName, type TruthAuthority } from "./truth-authority.js";
+import { assertLegacyTruthMutationAllowed, assertTruthMutationAllowed, classifyTruthAuthority, classifyTruthMutationPath, normalizeTruthFileName, type TruthAuthority } from "./truth-authority.js";
+import { safeMutationPath } from "../utils/path-safety.js";
 import { assertChapterAuthorityMutationAllowed, loadChapterGenesis, type ChapterGenesis } from "../production/chapter-transaction.js";
 
 export type EditRequest =
@@ -142,7 +143,7 @@ function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-async function collectEditableFiles(dir: string): Promise<ReadonlyArray<string>> {
+async function collectEditableFiles(dir: string, root = dir): Promise<ReadonlyArray<string>> {
   const entries = await readdir(dir, { withFileTypes: true }).catch((error) => {
     if (isMissingDirectoryError(error)) {
       return [];
@@ -151,11 +152,13 @@ async function collectEditableFiles(dir: string): Promise<ReadonlyArray<string>>
   });
   const files = await Promise.all(entries.map(async (entry) => {
     const fullPath = join(dir, entry.name);
+    if (["A", "C", "D"].includes(classifyTruthMutationPath(relative(root, fullPath)))) return [];
+    await safeMutationPath(root, relative(root, fullPath));
     if (entry.isDirectory()) {
       // Snapshots are frozen history; dot-directories (e.g. chapters/.trash)
       // hold discarded content — neither may be rewritten by edits.
       if (entry.name === "snapshots" || entry.name.startsWith(".")) return [];
-      return collectEditableFiles(fullPath);
+      return collectEditableFiles(fullPath, root);
     }
     if (!/\.(md|json|ya?ml|txt)$/i.test(entry.name)) {
       return [];
@@ -241,6 +244,7 @@ async function executeEntityRename(
   request: Extract<EditRequest, { kind: "entity-rename" }>,
 ): Promise<ExecutedEditTransaction> {
   const root = deps.bookDir(request.bookId);
+  await assertLegacyTruthMutationAllowed(root);
   assertEntityRenameTargetIsSafe(request.newValue);
   const collected = await collectEditableFiles(root);
   const genesis = await loadChapterGenesis(root);
@@ -250,6 +254,8 @@ async function executeEntityRename(
       .map(({ filePath }) => filePath)
     : collected;
   const plannedRenames = await planEntityFileRenames(root, files, request.oldValue, request.newValue);
+  for (const file of files) await assertTruthMutationAllowed({ bookDir: root, relativePath: relative(root, file) });
+  for (const planned of plannedRenames) await assertTruthMutationAllowed({ bookDir: root, relativePath: relative(root, planned.toAbs) });
   const matcher = new RegExp(escapeRegExp(request.oldValue), "g");
   const touched = new Set<string>();
 
@@ -287,7 +293,7 @@ async function executeEntityRename(
 }
 
 async function findChapterPath(root: string, chapterNumber: number): Promise<{ readonly chaptersDir: string; readonly chapterPath: string; readonly chapterFile: string }> {
-  const chaptersDir = join(root, "chapters");
+  const chaptersDir = await safeMutationPath(root, "chapters");
   const paddedChapter = String(chapterNumber).padStart(4, "0");
   const chapterFile = (await readdir(chaptersDir).catch((error) => {
     if (isMissingDirectoryError(error)) {
@@ -300,7 +306,10 @@ async function findChapterPath(root: string, chapterNumber: number): Promise<{ r
   if (!chapterFile) {
     throw new Error(`Chapter ${chapterNumber} not found.`);
   }
-  return { chaptersDir, chapterPath: join(chaptersDir, chapterFile), chapterFile };
+  const chapterPath = await safeMutationPath(root, `chapters/${chapterFile}`);
+  await safeMutationPath(root, `chapters/.versions/${paddedChapter}`);
+  await safeMutationPath(root, "chapters/index.json");
+  return { chaptersDir, chapterPath, chapterFile };
 }
 
 async function clearChapterRuntimeFiles(root: string, chapterNumber: number): Promise<ReadonlyArray<string>> {
@@ -539,6 +548,7 @@ export async function executeEditTransaction(
     case "truth-file-edit": {
       const root = deps.bookDir(request.bookId);
       const normalizedFileName = normalizeTruthFileName(request.fileName);
+      await assertTruthMutationAllowed({ bookDir: root, relativePath: `story/${normalizedFileName}` });
       const filePath = join(root, "story", normalizedFileName);
       await writeFile(filePath, request.instruction, "utf-8");
       return {

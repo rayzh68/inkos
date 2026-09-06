@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createLLMTranslationModel } from "../translation/llm-model.js";
+import type { LLMClient } from "../llm/provider.js";
 
 const chatCompletionMock = vi.hoisted(() => vi.fn());
 
@@ -22,8 +23,19 @@ describe("LLM translation model", () => {
         content: JSON.stringify({ passed: true, summary: "Faithful.", issues: [] }),
         usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
       });
+    const client: LLMClient = {
+      provider: "openai",
+      apiFormat: "chat",
+      stream: true,
+      defaults: {
+        temperature: 0.7,
+        maxTokens: 8192,
+        thinkingBudget: 0,
+        extra: {},
+      },
+    };
     const model = createLLMTranslationModel({
-      client: { provider: "openai" } as never,
+      client,
       model: "test-model",
       activatedSkills: [{
         skill: {

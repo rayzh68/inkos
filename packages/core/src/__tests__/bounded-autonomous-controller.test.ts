@@ -4,13 +4,38 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claimAutonomousJob, correctLegacyPendingChapterArtifactBindings, createAutonomousPipelineActions, createAutonomousProviderExecution, deriveAutonomousJobIdentity, finalizePendingChapterOfflinePlan, refreshAutonomousJobClaim, releaseAutonomousJob, resolveFormalPendingChapterRecoveryPlan, runBoundedAutonomousScope, saveAutonomousProductionState, verifyFormalPendingChapterRecoveryEvidence } from "../production/bounded-autonomous-controller.js";
 import type { AutonomousRunProgress } from "../production/bounded-autonomous-controller.js";
-import { LLMCallExecutionError } from "../llm/provider.js";
+import { chatCompletion, LLMCallExecutionError, type LLMClient, type LLMCallExecutionPolicy } from "../llm/provider.js";
 import type { BookProductionMap } from "../production/book-production-map.js";
 import type { ChapterMeta } from "../models/chapter.js";
 import { abandonChapterTransactionAttempt, beginChapterTransaction, createChapterGenesis } from "../production/chapter-transaction.js";
 import { parseSettlerDeltaOutput } from "../agents/settler-delta-parser.js";
 
 const providerResponseFsReads = vi.hoisted(() => ({ directoryScans: 0, failNextProductionStateRename: false }));
+const policyCapture = vi.hoisted(() => ({ current: undefined as LLMCallExecutionPolicy | undefined }));
+
+// Observe the existing policy seam; its real AsyncLocalStorage behavior is retained.
+vi.mock("../llm/provider.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../llm/provider.js")>();
+  return { ...actual, runWithLLMCallExecutionPolicy: <T>(policy: LLMCallExecutionPolicy, task: () => Promise<T>) => {
+    policyCapture.current = policy;
+    return actual.runWithLLMCallExecutionPolicy(policy, task);
+  } };
+});
+
+/** These admission-unit tests use labelled transaction identities, with real durable OPEN records. */
+async function installSyntheticOpenTransactionAuthority(projectRoot: string, transactionId: string, chapterNumber = 5, bookId = "book") {
+  const chapterRoot = join(projectRoot, "books", bookId, "story/runtime/chapter-transactions", `chapter-${String(chapterNumber).padStart(4, "0")}`);
+  const prior = await readFile(join(chapterRoot, "transaction.json"), "utf8").catch(() => null);
+  if (prior && JSON.parse(prior).transactionId === transactionId) return;
+  const attemptNumber = prior ? 2 + (await readdir(join(chapterRoot, "attempts")).catch(() => [])).length : 1;
+  const root = attemptNumber === 1 ? chapterRoot : join(chapterRoot, "attempts", `attempt-${String(attemptNumber).padStart(4, "0")}`);
+  await mkdir(root, { recursive: true });
+  await writeFile(join(root, "transaction.json"), JSON.stringify({
+    schemaVersion: 1, kind: "CHAPTER_TRANSACTION", transactionId, bookId, chapterNumber,
+    previousAuthoritySha256: "a".repeat(64), productionAuthority: "synthetic-admission-unit-fixture",
+    state: "STAGING", createdAt: "2026-09-06T00:00:00.000Z", attemptNumber,
+  }));
+}
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
@@ -69,6 +94,111 @@ function providerFailure(params: {
 }
 
 describe("bounded autonomous production controller", () => {
+  it.each(["pre-aborted", "context-overflow"] as const)("two-P1 K2 %s preflight leaves no started transport or restart ambiguity", async (mode) => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-preflight-accounting-"));
+    const fetchTransport = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected synthetic transport"));
+    try {
+      const transactionId = "synthetic-preflight-transaction";
+      await installSyntheticOpenTransactionAuthority(root, transactionId);
+      await saveAutonomousProductionState(root, "book", { jobId: "job", status: "RUNNING", nextChapter: 5 });
+      const makeExecution = () => createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId: "job",
+        getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "custom", model: "model", transactionId }) });
+      const client: LLMClient = { provider: "openai", service: "custom", configSource: "studio", apiFormat: "chat", stream: false,
+        _apiKey: "synthetic-key", _piModel: { id: "model", name: "model", api: "openai-completions", provider: "openai",
+          baseUrl: "http://127.0.0.1:1/v1", reasoning: false, input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: mode === "context-overflow" ? 20 : 128000, maxTokens: 8192 },
+        defaults: { temperature: 0.1, maxTokens: 512, thinkingBudget: 0, extra: {} } };
+      const controller = new AbortController();
+      if (mode === "pre-aborted") controller.abort(new Error("synthetic pre-aborted"));
+      for (let restart = 0; restart < 2; restart += 1) {
+        const execution = makeExecution();
+        await expect(execution.execute(5, () => chatCompletion(client, "model", [{ role: "user", content: "ping" }], { signal: controller.signal })))
+          .rejects.toThrow(mode === "pre-aborted" ? /synthetic pre-aborted/ : /context window guard/);
+        const progress = await execution.loadPersistedProgress();
+        expect.soft((progress?.providerAttemptHistory ?? []).some((entry) => entry.transportStarted)).toBe(false);
+        expect.soft((progress?.providerAttemptHistory ?? []).some((entry) => entry.transportReturned)).toBe(false);
+        expect.soft(progress?.lastErrorClassification).not.toBe("AMBIGUOUS_PROVIDER_OUTCOME");
+      }
+      expect(fetchTransport).not.toHaveBeenCalled();
+    } finally { fetchTransport.mockRestore(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["actual-start", "terminal-race", "ambiguous"] as const)("two-P1 K2 %s uses actual guarded transport admission", async (mode) => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-actual-admission-"));
+    try {
+      const transactionId = "synthetic-actual-admission";
+      await installSyntheticOpenTransactionAuthority(root, transactionId);
+      await saveAutonomousProductionState(root, "book", { jobId: "job", status: "RUNNING", nextChapter: 5 });
+      const makeExecution = () => createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId: "job",
+        getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId }) });
+      const execution = makeExecution();
+      const request = { provider: "test", model: "model", inputFingerprint: "f".repeat(64) };
+      await execution.execute(5, async () => {});
+      const policy = policyCapture.current!;
+      const prepared = await policy.prepare(request);
+      expect.soft((await execution.loadPersistedProgress())?.providerAttemptHistory ?? []).toEqual([]);
+      if (mode === "terminal-race") {
+        const { withChapterTransactionPublicationGuard } = await import("../production/bounded-autonomous-controller.js");
+        await withChapterTransactionPublicationGuard(join(root, "books/book"), () => writeFile(
+          join(root, "books/book/story/runtime/chapter-transactions/chapter-0005/terminal-outcome.json"), JSON.stringify({
+            schemaVersion: 1, transactionId, bookId: "book", chapterNumber: 5, attemptNumber: 1,
+            previousAuthoritySha256: "a".repeat(64), outcome: "COMMIT_SELECTED", commitKind: "TRUTH_CHAPTER_COMMIT", commitSha256: "c".repeat(64),
+          })));
+        let transports = 0;
+        await expect((async () => { await policy.markTransportStarted!(prepared.identity); transports += 1; })()).rejects.toThrow(/COMMIT_SELECTED/);
+        expect(transports).toBe(0);
+        expect((await execution.loadPersistedProgress())?.providerAttemptHistory ?? []).toEqual([]);
+      } else {
+        await policy.markTransportStarted!(prepared.identity);
+        const admittedTransport = vi.fn(async () => {
+          expect((await execution.loadPersistedProgress())?.providerAttemptHistory).toMatchObject([
+            { transportStarted: true, transportReturned: false, classification: "TRANSPORT_STARTED" },
+          ]);
+          if (mode === "ambiguous") throw new Error("synthetic connection lost after send");
+        });
+        if (mode === "ambiguous") {
+          await expect(admittedTransport()).rejects.toThrow("synthetic connection lost after send");
+          await policy.persistFailure!(prepared.identity, { ...prepared.identity,
+            classification: "AMBIGUOUS_PROVIDER_OUTCOME", transportStarted: true, transportReturned: false });
+          const transport = vi.fn(async () => ({ content: "duplicate", usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } }));
+          await expect(makeExecution().runProviderCall(5, transport, request)).rejects.toMatchObject({ metadata: { classification: "AMBIGUOUS_PROVIDER_OUTCOME" } });
+          expect(transport).not.toHaveBeenCalled();
+        } else {
+          await admittedTransport();
+          await policy.markTransportReturned!(prepared.identity);
+          expect((await execution.loadPersistedProgress())?.providerAttemptHistory).toMatchObject([{ transportStarted: true, transportReturned: true }]);
+        }
+        expect(admittedTransport).toHaveBeenCalledTimes(1);
+      }
+    } finally { policyCapture.current = undefined; await rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["fresh", "retry"] as const)("consolidated K2 denies %s transport after COMMIT_SELECTED", async (mode) => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-selected-transport-"));
+    try {
+      const transactionId = "synthetic-selected-transaction";
+      await installSyntheticOpenTransactionAuthority(root, transactionId);
+      await saveAutonomousProductionState(root, "book", { jobId: "job", status: "RUNNING", nextChapter: 5 });
+      const execution = createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId: "job",
+        getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId }) });
+      const request = { provider: "test", model: "model", inputFingerprint: "e".repeat(64) };
+      if (mode === "retry") await expect(execution.runProviderCall(5, async () => {
+        throw Object.assign(new Error("503"), { status: 503 });
+      }, request)).rejects.toThrow("503");
+      const chapterRoot = join(root, "books/book/story/runtime/chapter-transactions/chapter-0005");
+      await writeFile(join(chapterRoot, "terminal-outcome.json"), JSON.stringify({
+        schemaVersion: 1, transactionId, bookId: "book", chapterNumber: 5, attemptNumber: 1,
+        previousAuthoritySha256: "a".repeat(64), outcome: "COMMIT_SELECTED", commitKind: "TRUTH_CHAPTER_COMMIT", commitSha256: "c".repeat(64),
+      }));
+      const runtimePath = join(root, "books/book/story/runtime/bounded-autonomous/production-state.json");
+      const before = await readFile(runtimePath);
+      const transport = vi.fn(async () => ({ content: "must not run", usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } }));
+      await expect(execution.runProviderCall(5, transport, request)).rejects.toThrow(/COMMIT_SELECTED/);
+      expect(transport).not.toHaveBeenCalled();
+      expect(await readFile(runtimePath)).toEqual(before);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it("proves a generic unindexed Chapter 6 preserved-review recovery and excludes true exhaustion", async () => {
     const root = await mkdtemp(join(tmpdir(), "inkos-preserved-review-"));
     const { createHash } = await import("node:crypto");
@@ -357,6 +487,7 @@ describe("bounded autonomous production controller", () => {
         provider: "test", model: "model", inputFingerprint: fingerprint,
       });
       let transactionalTransportCalls = 0;
+      await installSyntheticOpenTransactionAuthority(root, "chapter-txn-cutover");
       const transactional = createAutonomousProviderExecution({
         ...base,
         getActiveStage: () => ({ stage: "PREPARING", role: "planner", provider: "test", model: "model", transactionId: "chapter-txn-cutover" }),
@@ -377,6 +508,7 @@ describe("bounded autonomous production controller", () => {
     const root = await mkdtemp(join(tmpdir(), "inkos-provider-ambiguous-transaction-"));
     try {
       const stage = { stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId: "chapter-txn-ambiguous" };
+      await installSyntheticOpenTransactionAuthority(root, stage.transactionId);
       const execution = createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId: "job", getActiveStage: () => stage });
       const fingerprint = "a".repeat(64);
       const logicalStepId = execution.responseArtifactPath(fingerprint, "test", "model", 5).split(/[\\/]/u).at(-1)!.replace(/\.json$/u, "");
@@ -401,6 +533,43 @@ describe("bounded autonomous production controller", () => {
     }
   });
 
+  it("admits at most one concurrent transport across execution instances without holding the guard during transport", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-provider-admission-race-"));
+    try {
+      await installSyntheticOpenTransactionAuthority(root, "chapter-txn-race");
+      await saveAutonomousProductionState(root, "book", {
+        jobId: "job", status: "RUNNING", mode: "current-volume", nextChapter: 5, updatedAt: "2026-08-28T00:00:00.000Z",
+      });
+      const params = {
+        projectRoot: root, bookId: "book", jobId: "job",
+        getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId: "chapter-txn-race" }),
+      };
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let calls = 0;
+      let rejectedBeforeTransportReturned = false;
+      const invoke = () => createAutonomousProviderExecution(params).runProviderCall(5, async () => {
+        calls++;
+        await held;
+        return { content: "one result", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      }, { provider: "test", model: "model", inputFingerprint: "a".repeat(64) }).catch((error) => {
+        rejectedBeforeTransportReturned = true;
+        throw error;
+      });
+      const resultsPromise = Promise.allSettled([invoke(), invoke()]);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const observed = { calls, rejectedBeforeTransportReturned };
+      release();
+      const results = await resultsPromise;
+      expect(observed).toEqual({ calls: 1, rejectedBeforeTransportReturned: true });
+      expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+      const artifactNames = await readdir(join(root, "books", "book", "story", "runtime", "bounded-autonomous", "provider-responses"));
+      expect(artifactNames.filter((name) => name.endsWith(".json"))).toHaveLength(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("pauses as a pipeline error when local success persistence fails after one returned transport", async () => {
     const root = await mkdtemp(join(tmpdir(), "inkos-provider-local-persist-failure-"));
     try {
@@ -418,6 +587,7 @@ describe("bounded autonomous production controller", () => {
         startChapter: 1, targetChapter: 1, nextChapter: 1, completedThisRun: 0,
       }));
       const stage = { stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId: "chapter-txn-local-persist" };
+      await installSyntheticOpenTransactionAuthority(root, stage.transactionId, 1);
       const execution = createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId, getActiveStage: () => stage });
       let nextChapter = 1;
       let transportCalls = 0;
@@ -476,6 +646,7 @@ describe("bounded autonomous production controller", () => {
         startChapter: 1, targetChapter: 1, nextChapter: 1, completedThisRun: 0,
       }));
       const stage = { stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId: "chapter-txn-returned-checkpoint" };
+      await installSyntheticOpenTransactionAuthority(root, stage.transactionId, 1);
       const execution = createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId, getActiveStage: () => stage });
       let nextChapter = 1;
       let transportCalls = 0;
@@ -538,6 +709,7 @@ describe("bounded autonomous production controller", () => {
       };
       const jobId = deriveAutonomousJobIdentity({ map: oneChapterMap, mode: "current-volume", nextChapter: 1 });
       const currentLogicalStepId = `provider-step-${"1".repeat(64)}`;
+      await installSyntheticOpenTransactionAuthority(root, "current-txn", 1);
       const staleLogicalStepId = `provider-step-${"2".repeat(64)}`;
       const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
       await mkdir(runtimeDir, { recursive: true });
@@ -636,18 +808,23 @@ describe("bounded autonomous production controller", () => {
       await writeFile(join(runtimeDir, "production-state.json"), JSON.stringify({
         jobId: "job", status: "RUNNING", mode: "current-volume", nextChapter: 5,
       }));
-      const stage = { stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId: "chapter-txn-budget" };
+      let stage = { stage: "TRUTH_EXTRACTION", role: "truth-extractor", provider: "test", model: "model", transactionId: "chapter-txn-budget" };
+      await installSyntheticOpenTransactionAuthority(root, stage.transactionId);
       const execution = createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId: "job", getActiveStage: () => stage });
       let transports = 0;
       const requests = Array.from({ length: 18 }, (_, index) => ({
         provider: "test", model: "model", inputFingerprint: index.toString(16).padStart(64, "0"),
       }));
-      for (const request of requests) {
+      for (const [index, request] of requests.entries()) {
+        stage = index % 2 === 0
+          ? { ...stage, stage: "TRUTH_EXTRACTION", role: "truth-extractor" }
+          : { ...stage, stage: "TRUTH_VALIDATION", role: "truth-validator" };
         await execution.runProviderCall(5, async () => {
           transports += 1;
           return { content: request.inputFingerprint, usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
         }, request);
       }
+      stage = { ...stage, stage: "TRUTH_EXTRACTION", role: "truth-extractor" };
       const replay = await execution.runProviderCall(5, async () => {
         transports += 1;
         throw new Error("COMPLETE replay must not use transport");
@@ -663,6 +840,7 @@ describe("bounded autonomous production controller", () => {
       const runtime = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
       expect(new Set(runtime.providerAttemptHistory.map((entry: { logicalStepId: string }) => entry.logicalStepId)).size).toBe(18);
       expect(runtime.providerAttemptHistory.every((entry: { transactionId?: string }) => entry.transactionId === stage.transactionId)).toBe(true);
+      expect(new Set(runtime.providerAttemptHistory.map((entry: { role: string }) => entry.role))).toEqual(new Set(["truth-extractor", "truth-validator"]));
 
       // COMPLETE artifacts are the durable transaction authority. A restart from
       // pre-ceiling history that lacks transactionId must not reset admission.
@@ -691,12 +869,17 @@ describe("bounded autonomous production controller", () => {
         jobId: "job", status: "RUNNING", mode: "current-volume", nextChapter: 5,
       }));
       let transactionId = "chapter-txn-attempt-1";
+      await installSyntheticOpenTransactionAuthority(root, transactionId);
+      let role = "truth-extractor";
+      let stage = "TRUTH_EXTRACTION";
       const execution = createAutonomousProviderExecution({
         projectRoot: root, bookId: "book", jobId: "job",
-        getActiveStage: () => ({ stage: "WRITING", role: "writer", provider: "test", model: "model", transactionId }),
+        getActiveStage: () => ({ stage, role, provider: "test", model: "model", transactionId }),
       });
       let transports = 0;
       for (let logical = 0; logical < 8; logical += 1) {
+        role = logical % 2 === 0 ? "truth-extractor" : "truth-validator";
+        stage = logical % 2 === 0 ? "TRUTH_EXTRACTION" : "TRUTH_VALIDATION";
         const request = { provider: "test", model: "model", inputFingerprint: logical.toString(16).padStart(64, "a") };
         for (let attempt = 0; attempt < 3; attempt += 1) {
           await expect(execution.runProviderCall(5, async () => {
@@ -713,6 +896,7 @@ describe("bounded autonomous production controller", () => {
       expect(transports).toBe(24);
 
       transactionId = "chapter-txn-attempt-2";
+      await installSyntheticOpenTransactionAuthority(root, transactionId);
       const fresh = await execution.runProviderCall(5, async () => {
         transports += 1;
         return { content: "fresh attempt", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
@@ -721,6 +905,8 @@ describe("bounded autonomous production controller", () => {
       expect(transports).toBe(25);
       const runtime = JSON.parse(await readFile(join(runtimeDir, "production-state.json"), "utf-8"));
       expect(runtime.providerAttemptHistory.filter((entry: { transactionId?: string }) => entry.transactionId === "chapter-txn-attempt-1")).toHaveLength(24);
+      expect(new Set(runtime.providerAttemptHistory.filter((entry: { transactionId?: string }) => entry.transactionId === "chapter-txn-attempt-1").map((entry: { role: string }) => entry.role)))
+        .toEqual(new Set(["truth-extractor", "truth-validator"]));
       expect(runtime.providerAttemptHistory.filter((entry: { transactionId?: string }) => entry.transactionId === "chapter-txn-attempt-2")).toHaveLength(1);
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -736,6 +922,7 @@ describe("bounded autonomous production controller", () => {
         jobId: "job", status: "RUNNING", mode: "current-volume", nextChapter: 5,
       }));
       const transactionId = "chapter-txn-bootstrap";
+      await installSyntheticOpenTransactionAuthority(root, transactionId);
       const execution = createAutonomousProviderExecution({
         projectRoot: root,
         bookId: "book",
@@ -766,6 +953,8 @@ describe("bounded autonomous production controller", () => {
         jobId: "job", status: "RUNNING", mode: "current-volume", nextChapter: 5,
       }));
       let transactionId = "chapter-txn-a";
+      await installSyntheticOpenTransactionAuthority(root, transactionId);
+      await installSyntheticOpenTransactionAuthority(root, "chapter-txn-b");
       const execution = createAutonomousProviderExecution({
         projectRoot: root,
         bookId: "book",
@@ -798,6 +987,7 @@ describe("bounded autonomous production controller", () => {
       const runtimeDir = join(root, "books", "book", "story", "runtime", "bounded-autonomous");
       await mkdir(runtimeDir, { recursive: true });
       const transactionId = "chapter-txn-upgrade";
+      await installSyntheticOpenTransactionAuthority(root, transactionId);
       const history = Array.from({ length: 24 }, (_, index) => ({
         transportAttemptId: `legacy-step-${Math.floor(index / 3)}:transport-attempt:${index % 3 + 1}`,
         logicalStepId: `legacy-step-${Math.floor(index / 3)}`,
@@ -1085,6 +1275,7 @@ describe("bounded autonomous production controller", () => {
         stage: "SETTLING_STATE", role: "logic-canon-auditor", provider: "test", model: "model",
         transactionId: "chapter-txn-focused",
       };
+      await installSyntheticOpenTransactionAuthority(root, stage.transactionId, 6);
       let transports = 0;
       const request = { provider: "test", model: "model", inputFingerprint: "a".repeat(64) };
       const execution = createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId: "job", getActiveStage: () => stage });
@@ -1625,6 +1816,7 @@ describe("bounded autonomous production controller", () => {
         startChapter: 6, targetChapter: 6, nextChapter: 6, chapterNumber: 6, completedThisRun: 0,
       }), "utf-8");
       const stage = { stage: "SETTLING_STATE", role: "settler", provider: "openrouter", model: "provider/model", transactionId: "chapter-txn-synthetic-006" } as const;
+      await installSyntheticOpenTransactionAuthority(root, stage.transactionId, 6);
       const execution = createAutonomousProviderExecution({ projectRoot: root, bookId: "book", jobId: "job", getActiveStage: () => stage });
       const content = [
         "=== POST_SETTLEMENT ===",
@@ -1706,6 +1898,7 @@ describe("bounded autonomous production controller", () => {
       }));
       let role = "final-state-extractor";
       const transactionId = "chapter-txn-semantic-state";
+      await installSyntheticOpenTransactionAuthority(root, transactionId, 5);
       const execution = createAutonomousProviderExecution({
         projectRoot: root, bookId: "book", jobId: "job",
         getActiveStage: () => ({ stage: "SETTLING_STATE", role, provider: "test", model: "model", transactionId }),

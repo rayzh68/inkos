@@ -1,6 +1,8 @@
 import { BaseAgent } from "./base.js";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import { assertLegacyTruthMutationAllowed } from "../interaction/truth-authority.js";
+import { safeMutationPath } from "../utils/path-safety.js";
 import { readVolumeMap } from "../utils/outline-paths.js";
 import {
   parsePendingHooksMarkdown,
@@ -37,6 +39,10 @@ export class ConsolidatorAgent extends BaseAgent {
    * - Archives detailed summaries, keeps only recent volume's per-chapter rows
    */
   async consolidate(bookDir: string): Promise<ConsolidationResult> {
+    await assertLegacyTruthMutationAllowed(bookDir);
+    for (const path of ["story/chapter_summaries.md", "story/volume_summaries.md", "story/pending_hooks.md", "story/outline/volume_map.md", "story/volume_outline.md", "story/summaries_archive"]) {
+      await safeMutationPath(bookDir, path, path === "story/summaries_archive");
+    }
     const storyDir = join(bookDir, "story");
     const summariesPath = join(storyDir, "chapter_summaries.md");
     const volumeSummariesPath = join(storyDir, "volume_summaries.md");

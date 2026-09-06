@@ -25,6 +25,21 @@ async function writeChapter(bookDir: string, chapter: number, title: string, bod
 }
 
 describe("analyzeLongSpanFatigue", () => {
+  it("builds the English variance brief from immutable authority bodies without a public book path", async () => {
+    const brief = await buildEnglishVarianceBrief({
+      chapterNumber: 3,
+      authorityChapterBodies: [
+        "Mara kept the ledger close to her chest. The corridor stayed quiet after the bell. There it was again.",
+        "Mara kept the ledger close to her chest while ash fell. The corridor stayed quiet until dawn. There it was again.",
+      ],
+    });
+
+    expect(brief?.highFrequencyPhrases).toContain("close her chest");
+    expect(brief?.repeatedOpeningPatterns.length).toBeGreaterThan(0);
+    expect(brief?.repeatedEndingShapes.length).toBeGreaterThan(0);
+    expect(brief?.text).toContain("High-frequency phrases");
+  });
+
   it("warns when the last three chapter types are identical", async () => {
     const bookDir = await createBookDir("inkos-long-span-type-test-");
 

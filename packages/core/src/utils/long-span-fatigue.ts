@@ -42,17 +42,26 @@ const ENGLISH_PUNCTUATION = /[^a-z0-9]+/gi;
 export async function buildEnglishVarianceBrief(params: {
   readonly bookDir: string;
   readonly chapterNumber: number;
+  readonly authorityChapterBodies?: never;
+} | {
+  readonly chapterNumber: number;
+  readonly authorityChapterBodies: ReadonlyArray<string>;
 }): Promise<EnglishVarianceBrief | null> {
-  const chapterBodies = await loadPreviousChapterBodies(
-    params.bookDir,
-    params.chapterNumber,
-    CADENCE_WINDOW_DEFAULTS.englishVarianceLookback,
-  );
+  const authorityOnly = "authorityChapterBodies" in params;
+  const chapterBodies = authorityOnly
+    ? [...(params.authorityChapterBodies ?? [])].slice(-CADENCE_WINDOW_DEFAULTS.englishVarianceLookback)
+    : await loadPreviousChapterBodies(
+      params.bookDir,
+      params.chapterNumber,
+      CADENCE_WINDOW_DEFAULTS.englishVarianceLookback,
+    );
   if (chapterBodies.length < 2) {
     return null;
   }
 
-  const summaryRows = await loadSummaryRows(join(params.bookDir, "story", "chapter_summaries.md"));
+  const summaryRows = authorityOnly
+    ? []
+    : await loadSummaryRows(join(params.bookDir, "story", "chapter_summaries.md"));
   const recentRows = summaryRows
     .filter((row) => row.chapter < params.chapterNumber)
     .sort((left, right) => left.chapter - right.chapter)

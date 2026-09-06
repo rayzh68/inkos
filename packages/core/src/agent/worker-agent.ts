@@ -21,6 +21,29 @@ import {
 } from "../llm/provider.js";
 import { guardedPiStream } from "./pi-stream.js";
 import { isLlmStubEnabled, stubChatCompletion } from "./llm-stub.js";
+import { lookupModel } from "../llm/providers/lookup.js";
+
+export interface FinalProviderRequestObservation {
+  readonly provider: string;
+  readonly model: string;
+  readonly messages: readonly LLMMessage[];
+  readonly temperature: number;
+  readonly maxTokens: number;
+  readonly stream: boolean;
+  readonly webSearch: boolean;
+  readonly extra: Readonly<Record<string, unknown>>;
+}
+
+function immutableRequestSnapshot<T>(value: T): T {
+  const snapshot = structuredClone(value);
+  const freeze = (current: unknown): void => {
+    if (!current || typeof current !== "object" || Object.isFrozen(current)) return;
+    for (const nested of Object.values(current as Record<string, unknown>)) freeze(nested);
+    Object.freeze(current);
+  };
+  freeze(snapshot);
+  return snapshot;
+}
 
 export interface WorkerAgentOptions {
   readonly temperature?: number;
@@ -28,6 +51,7 @@ export interface WorkerAgentOptions {
   readonly webSearch?: boolean;
   readonly onStreamProgress?: OnStreamProgress;
   readonly onTextDelta?: (text: string) => void;
+  readonly onFinalProviderRequest?: (request: FinalProviderRequestObservation) => void | Promise<void>;
   readonly signal?: AbortSignal;
 }
 
@@ -39,6 +63,7 @@ export interface WorkerResultTool<TParameters extends TSchema> {
 }
 
 const EMPTY_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+const messagesWithActualProviderCost = new WeakSet<AssistantMessage>();
 
 function workerModel(client: LLMClient, modelId: string, maxTokens?: number): Model<Api> {
   const base = client._piModel;
@@ -81,7 +106,7 @@ function assistantMessage(
   stopReason: AssistantMessage["stopReason"],
   errorMessage?: string,
 ): AssistantMessage {
-  return {
+  const message: AssistantMessage = {
     role: "assistant",
     content: content ? [{ type: "text", text: content }] : [],
     api: model.api,
@@ -94,13 +119,15 @@ function assistantMessage(
           cacheRead: 0,
           cacheWrite: 0,
           totalTokens: response.usage.totalTokens,
-          cost: { ...EMPTY_COST, total: 0 },
+          cost: { ...EMPTY_COST, total: response.usage.actualCostUsd ?? 0 },
         }
       : emptyUsage(),
     stopReason,
     ...(errorMessage ? { errorMessage } : {}),
     timestamp: Date.now(),
   };
+  if (response?.usage?.actualCostUsd !== undefined) messagesWithActualProviderCost.add(message);
+  return message;
 }
 
 function localStopStream(model: Model<Api>) {
@@ -191,7 +218,27 @@ function providerWorkerStream(
     void (async () => {
       try {
         const signal = combineSignals(streamOptions?.signal, options.signal);
-        const response = await chatCompletion(client, model.id, contextMessages(context), {
+        const messages = immutableRequestSnapshot(contextMessages(context));
+        const requestedTemperature = options.temperature ?? client.defaults.temperature;
+        const temperature = client.service
+          ? lookupModel(client.service, model.id)?.temperature ?? requestedTemperature
+          : requestedTemperature;
+        const extra = immutableRequestSnapshot(client.defaults.extra ?? {});
+        const requestClient: LLMClient = {
+          ...client,
+          defaults: { ...client.defaults, extra },
+        };
+        await options.onFinalProviderRequest?.(immutableRequestSnapshot({
+          provider: client.service ?? client.provider,
+          model: model.id,
+          messages,
+          temperature,
+          maxTokens: options.maxTokens ?? client.defaults.maxTokens,
+          stream: client.stream,
+          webSearch: options.webSearch ?? false,
+          extra,
+        }));
+        const response = await chatCompletion(requestClient, model.id, messages, {
           ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
           ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
           ...(options.webSearch !== undefined ? { webSearch: options.webSearch } : {}),
@@ -289,7 +336,7 @@ export async function runWorkerAgent(
         promptTokens: final.usage.input,
         completionTokens: final.usage.output,
         totalTokens: final.usage.totalTokens,
-        ...(typeof final.usage.cost?.total === "number" && final.usage.cost.total > 0
+        ...(messagesWithActualProviderCost.has(final)
           ? { actualCostUsd: final.usage.cost.total }
           : {}),
       },

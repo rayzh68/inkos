@@ -5,6 +5,8 @@ import { BaseAgent, type AgentContext } from "../agents/base.js";
 
 const chatCompletionMock = vi.hoisted(() => vi.fn());
 const guardedPiStreamMock = vi.hoisted(() => vi.fn());
+const searchWebMock = vi.hoisted(() => vi.fn());
+const fetchUrlMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../llm/provider.js", () => ({
   chatCompletion: chatCompletionMock,
@@ -14,6 +16,11 @@ vi.mock("../agent/pi-stream.js", async () => {
   const actual = await vi.importActual<typeof import("../agent/pi-stream.js")>("../agent/pi-stream.js");
   return { ...actual, guardedPiStream: guardedPiStreamMock };
 });
+
+vi.mock("../utils/web-search.js", () => ({
+  searchWeb: searchWebMock,
+  fetchUrl: fetchUrlMock,
+}));
 
 function client(): AgentContext["client"] {
   return {
@@ -51,10 +58,30 @@ class TwoStepWorker extends BaseAgent {
   }
 }
 
+class ObservedWorker extends BaseAgent {
+  get name(): string { return "observed"; }
+
+  async runObserved(onFinalProviderRequest: (request: unknown) => void): Promise<void> {
+    await this.chat([
+      { role: "system", content: "base system" },
+      { role: "user", content: "inspect candidate" },
+    ], { temperature: 0.2, maxTokens: 8000, onFinalProviderRequest } as never);
+  }
+
+  async runObservedSearch(onFinalProviderRequest: (request: unknown) => void): Promise<void> {
+    await this.chatWithSearch([
+      { role: "system", content: "search system" },
+      { role: "user", content: "verify harbor fact" },
+    ], { temperature: 0.25, maxTokens: 7000, onFinalProviderRequest } as never);
+  }
+}
+
 describe("Pi worker harness", () => {
   beforeEach(() => {
     chatCompletionMock.mockReset();
     guardedPiStreamMock.mockReset();
+    searchWebMock.mockReset();
+    fetchUrlMock.mockReset();
   });
 
   afterEach(() => {
@@ -86,6 +113,75 @@ describe("Pi worker harness", () => {
       temperature: 0.2,
       maxTokens: 8000,
     });
+  });
+
+  it.each([0, 0.125])("preserves Provider actualCostUsd=%s through the real Worker response bridge", async (actualCostUsd) => {
+    chatCompletionMock.mockResolvedValue({
+      content: "cost-bound",
+      usage: { promptTokens: 5, completionTokens: 2, totalTokens: 7, actualCostUsd },
+    });
+
+    const result = await runWorkerAgent(client(), "deepseek-v4-pro", [
+      { role: "user", content: "preserve exact cost" },
+    ]);
+
+    expect(result.usage).toEqual({ promptTokens: 5, completionTokens: 2, totalTokens: 7, actualCostUsd });
+  });
+
+  it("observes the exact post-skill request immediately before Provider transport", async () => {
+    const events: string[] = [];
+    const observedClient = client();
+    (observedClient.defaults.extra as Record<string, unknown>).routing = { tier: "authority" };
+    chatCompletionMock.mockImplementation(async (transportClient) => {
+      events.push("transport");
+      expect(transportClient.defaults.extra).toEqual({ routing: { tier: "authority" } });
+      return { content: "完成", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+    });
+    const worker = new ObservedWorker({
+      client: observedClient, model: "deepseek-v4-flash", projectRoot: "/tmp/inkos-worker-test",
+      activatedSkills: [{
+        skill: { id: "canon-audit", name: "Canon audit", description: "Check canon.", body: "USE_BOUND_EVIDENCE", source: "builtin" },
+        resources: [],
+      }] as never,
+    });
+    let observed: any;
+
+    await worker.runObserved(async (request) => {
+      events.push("observe-start");
+      observed = request;
+      await Promise.resolve();
+      events.push("observe-complete");
+    });
+
+    expect(events).toEqual(["observe-start", "observe-complete", "transport"]);
+    expect(observed).toMatchObject({
+      provider: "kkaiapi", model: "deepseek-v4-flash", temperature: 0.2, maxTokens: 8000, stream: true,
+      extra: { routing: { tier: "authority" } },
+    });
+    expect(Object.isFrozen(observed.extra)).toBe(true);
+    expect(observed.messages).toEqual(chatCompletionMock.mock.calls[0]?.[2]);
+    expect(observed.messages[0].content).toContain("USE_BOUND_EVIDENCE");
+  });
+
+  it("observes native and self-hosted search augmentation in the exact final request", async () => {
+    chatCompletionMock.mockResolvedValue({ content: "完成", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } });
+    searchWebMock.mockResolvedValue([{ title: "Harbor", url: "https://example.test/harbor", snippet: "Verified harbor fact" }]);
+    fetchUrlMock.mockResolvedValue("Full harbor evidence");
+    const native = new ObservedWorker({ client: client(), model: "deepseek-v4-flash", projectRoot: "/tmp/inkos-worker-test" });
+    const selfHostedClient = { ...client(), provider: "anthropic", service: "custom-anthropic" } as AgentContext["client"];
+    const selfHosted = new ObservedWorker({ client: selfHostedClient, model: "deepseek-v4-flash", projectRoot: "/tmp/inkos-worker-test" });
+    let nativeObserved: any;
+    let selfHostedObserved: any;
+
+    await native.runObservedSearch((request) => { nativeObserved = request; });
+    await selfHosted.runObservedSearch((request) => { selfHostedObserved = request; });
+
+    expect(nativeObserved).toMatchObject({ webSearch: true, temperature: 0.25, maxTokens: 7000 });
+    expect(nativeObserved.messages).toEqual(chatCompletionMock.mock.calls[0]?.[2]);
+    expect(selfHostedObserved.messages).toEqual(chatCompletionMock.mock.calls[1]?.[2]);
+    expect(selfHostedObserved.messages.at(-1).content).toContain("## Web Search Results");
+    expect(selfHostedObserved.messages.at(-1).content).toContain("Full harbor evidence");
+    expect(selfHostedObserved.messages.at(-1).content).toMatch(/verify harbor fact$/u);
   });
 
   it("preserves provider failures instead of turning them into successful prose", async () => {

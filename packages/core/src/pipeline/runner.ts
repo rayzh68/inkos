@@ -1,7 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { assertLegacyTruthMutationAllowed, resolveTruthCutoverState } from "../interaction/truth-authority.js";
 import { createHash } from "node:crypto";
 import { createLLMClient, runWithLLMOutcomeObserver, type LLMClient, type LLMOutcomeRecord, type OnStreamProgress } from "../llm/provider.js";
-import { runWorkerAgent } from "../agent/worker-agent.js";
+import { runWorkerAgent, type FinalProviderRequestObservation } from "../agent/worker-agent.js";
 import type { Logger } from "../utils/logger.js";
 import type { BookConfig, FanficMode, RevisionGate } from "../models/book.js";
 import type { ChapterMeta } from "../models/chapter.js";
@@ -15,8 +16,11 @@ import {
 import { PlannerAgent, type PlanChapterOutput } from "../agents/planner.js";
 import { ComposerAgent, composeGovernedChapter, contextBudgetFromClient, type ComposeChapterOutput } from "../agents/composer.js";
 import { WriterAgent, type WriteChapterInput, type WriteChapterOutput } from "../agents/writer.js";
+import { TruthExtractorAgent, buildTruthExtractorMessages, TRUTH_EXTRACTOR_OPTIONS, type TruthExtractionRequest } from "../agents/truth-extractor.js";
+import { TruthValidatorAgent, TruthValidatorArtifactError, buildTruthValidatorMessages, TRUTH_VALIDATOR_OPTIONS, type TruthValidationRequest } from "../agents/truth-validator.js";
+import { safeMutationPath } from "../utils/path-safety.js";
 import { ChapterAnalyzerAgent } from "../agents/chapter-analyzer.js";
-import { ContinuityAuditor } from "../agents/continuity.js";
+import { ContinuityAuditor, parseContinuityAuditResponse } from "../agents/continuity.js";
 import {
   buildSemanticAdjudicationBatch,
   buildSemanticAuthorityEnvelope,
@@ -24,7 +28,7 @@ import {
   type SemanticAuthorityEnvelope,
   type SemanticAuthorityRecord,
 } from "../agents/semantic-authority.js";
-import { CommercialReaderAgent } from "../agents/commercial-reader.js";
+import { CommercialReaderAgent, parseCommercialReaderResponse, type ReviewProviderRequestEvidence } from "../agents/commercial-reader.js";
 import { ReviserAgent, DEFAULT_REVISE_MODE, type ReviseMode } from "../agents/reviser.js";
 import { StateValidatorAgent, type ValidationResult, type ValidationWarning } from "../agents/state-validator.js";
 import { RadarAgent } from "../agents/radar.js";
@@ -75,6 +79,14 @@ import {
   type ScoredReview,
 } from "./bounded-review.js";
 import { validateChapterTruthPersistence } from "./chapter-truth-validation.js";
+import {
+  runCanonicalTruthTransaction,
+  type CanonicalTruthExecutionIdentity,
+  type CanonicalTruthTransactionResult,
+} from "./canonical-truth-transaction.js";
+import { lookupModel } from "../llm/providers/lookup.js";
+import { canonicalJson, canonicalSha256 } from "../state/canonical-json.js";
+import type { StructuredTruthV1 } from "../models/structured-truth.js";
 import { loadPersistedPlan, relativeToBookDir, savePersistedPlan } from "./persisted-governed-plan.js";
 import { selectBookReferenceContext } from "../references/reference-context.js";
 import type { ActivatedSkillGuidance } from "../agent/skill-tool.js";
@@ -97,15 +109,26 @@ import {
 import {
   beginChapterTransaction,
   assertChapterAuthorityMutationAllowed,
+  collectChapterProviderReferences,
+  collectBoundChapterProviderRequests,
+  deriveChapterProviderUsage,
+  reserveChapterTransactionProviderRequest,
+  revalidateCanonicalTruthProviderEvidence,
+  loadRecoverableTruthChapterCommit,
+  bindChapterTransactionProviderRequest,
   chapterTransactionStagingBookDir,
   finalizeChapterTransaction,
   isChapterTransactionEnabled,
+  loadCommittedV2PredecessorAuthority,
   reconcileChapterProjections,
   recordChapterTransactionCandidate,
   recordChapterTransactionReviewEvidence,
   recordChapterTransactionReviewResult,
   stageChapterCommitFromProjection,
+  stageTruthChapterCommitV2,
   verifyChapterCommitChain,
+  ChapterArtifactEvidenceError,
+  type FirstV2BaselineContext,
   type ChapterTransactionHandle,
 } from "../production/chapter-transaction.js";
 
@@ -307,8 +330,28 @@ export interface PipelineConfig {
   readonly logger?: Logger;
   readonly onStreamProgress?: OnStreamProgress;
   readonly onContextCompression?: ContextCompressionCallback;
+  /** Maps a completed model response to the existing durable Provider execution evidence. */
+  readonly canonicalTruthEvidenceResolver?: (input: {
+    readonly role: "truth-extractor" | "truth-validator" | "logic-canon-auditor" | "commercial-reader";
+    readonly stage: "TRUTH_EXTRACTION" | "TRUTH_EXTRACTION_REPAIR" | "TRUTH_VALIDATION" | "LOGIC_REVIEW" | "READER_REVIEW";
+    readonly logicalOperationId: string;
+    readonly provider: string;
+    readonly model: string;
+    readonly responseContent: string;
+    readonly bookDir: string;
+    readonly transactionId: string;
+    readonly chapterNumber: number;
+    readonly expectedInputFingerprint?: string;
+  }) => Promise<{
+    readonly logicalOperationId: string;
+    readonly inputFingerprint: string;
+    readonly providerArtifactSha256: string;
+    readonly responseContentSha256: string;
+  }>;
+  /** Explicitly verified synthetic/first-cutover baseline; never derived from Markdown. */
+  readonly firstV2Baseline?: FirstV2BaselineContext;
   readonly onAutonomousStage?: (event: {
-    readonly stage: "PREPARING" | "WRITING" | "LOGIC_REVIEW" | "READER_REVIEW" | "REVISING_1" | "RESCUE_REVISING_2" | "SETTLING_STATE" | "STATE_REBASELINE_SETTLEMENT" | "STATE_REBASELINE_VALIDATION" | "APPROVED";
+    readonly stage: "PREPARING" | "WRITING" | "LOGIC_REVIEW" | "READER_REVIEW" | "REVISING_1" | "RESCUE_REVISING_2" | "TRUTH_EXTRACTION" | "TRUTH_EXTRACTION_REPAIR" | "TRUTH_VALIDATION" | "SETTLING_STATE" | "STATE_REBASELINE_SETTLEMENT" | "STATE_REBASELINE_VALIDATION" | "APPROVED";
     readonly role: string;
     readonly provider: string | null;
     readonly model: string | null;
@@ -568,6 +611,357 @@ export class PipelineRunner {
   constructor(config: PipelineConfig) {
     this.config = config;
     this.state = new StateManager(config.projectRoot);
+  }
+
+  /**
+   * Candidate-bound canonical truth settlement. This deliberately contains no
+   * legacy Markdown reconstruction or settlement agents: model output remains
+   * an untrusted proposal until Package A admits and applies it.
+   */
+  async runCanonicalTruthSettlement(input: {
+    readonly bookDir: string;
+    readonly transactionId: string;
+    readonly attemptId: string;
+    readonly attemptNumber: number;
+    readonly chapterNumber: number;
+    readonly candidate: string;
+    readonly predecessorCommitSha256: string;
+    readonly predecessor: StructuredTruthV1;
+    readonly committedAuthority?: string;
+    readonly chapterMemo?: string;
+  }): Promise<CanonicalTruthTransactionResult> {
+    const extractor = new TruthExtractorAgent(this.truthAgentCtxFor("truth-extractor", input.predecessor.bookId));
+    const validator = new TruthValidatorAgent(this.truthAgentCtxFor("truth-validator", input.predecessor.bookId));
+    const candidateSha256 = createHash("sha256").update(input.candidate, "utf8").digest("hex");
+    return runCanonicalTruthTransaction({
+      ...input,
+      candidateSha256,
+      revalidateProviderEvidence: (evidence) => revalidateCanonicalTruthProviderEvidence({ ...input, evidence }),
+      extractorExecution: (request) => this.canonicalTruthExecutionIdentity("truth-extractor", request),
+      validatorExecution: (request) => this.canonicalTruthExecutionIdentity("truth-validator", request),
+      extractor: async (request, execution) => {
+        const extractionStage = request.extractionKind === "INITIAL" ? "TRUTH_EXTRACTION" : "TRUTH_EXTRACTION_REPAIR";
+        const identity = this.resolveOverride("truth-extractor");
+        const provider = identity.client.service ?? identity.client.provider;
+        const currentExecution = this.canonicalTruthExecutionIdentity("truth-extractor", request);
+        if (canonicalJson(currentExecution) !== canonicalJson(execution)) throw new Error("CANONICAL_TRUTH_EXECUTION_IDENTITY_DRIFT");
+        const reservation = await reserveChapterTransactionProviderRequest({
+          bookDir: input.bookDir, transactionId: input.transactionId, chapterNumber: input.chapterNumber,
+          candidateSha256, role: "truth-extractor", stage: extractionStage,
+          requestOrdinal: request.repairOrdinal,
+          request: this.providerRequestFromCanonicalExecution(execution),
+        });
+        await this.config.onAutonomousStage?.({
+          stage: extractionStage, role: "truth-extractor",
+          provider,
+          model: identity.model, transactionId: input.transactionId,
+        });
+        let outcome: LLMOutcomeRecord | undefined;
+        const response = await runWithLLMOutcomeObserver(async (record) => {
+          if (outcome) throw new ChapterArtifactEvidenceError(
+            "ARTIFACT_EVIDENCE_DEFECT: CANONICAL_TRUTH_MULTIPLE_MODEL_OUTCOMES",
+            record,
+          );
+          outcome = record;
+        }, () => extractor.extract(request, async (observed) => {
+          const observedExecution = this.canonicalTruthExecutionFromObservation(observed);
+          if (canonicalJson(observedExecution) !== canonicalJson(execution)) {
+            throw new ChapterArtifactEvidenceError("ARTIFACT_EVIDENCE_DEFECT: Truth Extractor final request drift", observed);
+          }
+          await reserveChapterTransactionProviderRequest({
+            bookDir: input.bookDir, transactionId: input.transactionId, chapterNumber: input.chapterNumber,
+            candidateSha256, role: "truth-extractor", stage: extractionStage,
+            requestOrdinal: request.repairOrdinal, request: observed,
+          });
+        }));
+        const evidence = await this.resolveCanonicalTruthEvidence({
+          stage: extractionStage, logicalOperationId: outcome?.modelCallId ?? "",
+          provider: outcome?.provider ?? provider, model: outcome?.model ?? identity.model,
+          role: "truth-extractor", responseContent: response.rawProposal,
+          bookDir: input.bookDir, transactionId: input.transactionId,
+          chapterNumber: input.chapterNumber,
+          expectedInputFingerprint: execution.inputFingerprint,
+        });
+        const providerReference = this.providerReferenceFromCanonicalEvidence({
+          ...evidence, bookDir: input.bookDir, transactionId: input.transactionId, chapterNumber: input.chapterNumber,
+          role: "truth-extractor", stage: extractionStage, provider: currentExecution.provider, model: currentExecution.model,
+        });
+        await bindChapterTransactionProviderRequest({
+          bookDir: input.bookDir, transactionId: input.transactionId, reservationId: reservation.reservationId, providerReference,
+        });
+        return { rawProposal: response.rawProposal, usage: response.usage, ...evidence };
+      },
+      validator: async (request, execution, cycle) => {
+        const identity = this.resolveOverride("truth-validator");
+        const provider = identity.client.service ?? identity.client.provider;
+        const currentExecution = this.canonicalTruthExecutionIdentity("truth-validator", request);
+        if (canonicalJson(currentExecution) !== canonicalJson(execution)) throw new Error("CANONICAL_TRUTH_EXECUTION_IDENTITY_DRIFT");
+        const requestOrdinal = cycle.repairOrdinal;
+        const reservation = await reserveChapterTransactionProviderRequest({
+          bookDir: input.bookDir, transactionId: input.transactionId, chapterNumber: input.chapterNumber,
+          candidateSha256, role: "truth-validator", stage: "TRUTH_VALIDATION", requestOrdinal,
+          request: this.providerRequestFromCanonicalExecution(execution),
+        });
+        await this.config.onAutonomousStage?.({
+          stage: "TRUTH_VALIDATION", role: "truth-validator",
+          provider,
+          model: identity.model, transactionId: input.transactionId,
+        });
+        let outcome: LLMOutcomeRecord | undefined;
+        const response = await runWithLLMOutcomeObserver(async (record) => {
+          if (outcome) throw new ChapterArtifactEvidenceError(
+            "ARTIFACT_EVIDENCE_DEFECT: CANONICAL_TRUTH_MULTIPLE_MODEL_OUTCOMES",
+            record,
+          );
+          outcome = record;
+        }, () => validator.validate(request, async (observed) => {
+          const observedExecution = this.canonicalTruthExecutionFromObservation(observed);
+          if (canonicalJson(observedExecution) !== canonicalJson(execution)) {
+            throw new ChapterArtifactEvidenceError("ARTIFACT_EVIDENCE_DEFECT: Truth Validator final request drift", observed);
+          }
+          await reserveChapterTransactionProviderRequest({
+            bookDir: input.bookDir, transactionId: input.transactionId, chapterNumber: input.chapterNumber,
+            candidateSha256, role: "truth-validator", stage: "TRUTH_VALIDATION", requestOrdinal, request: observed,
+          });
+        })).catch((error: unknown) => {
+          if (error instanceof TruthValidatorArtifactError) return error;
+          throw error;
+        });
+        const evidence = await this.resolveCanonicalTruthEvidence({
+          stage: "TRUTH_VALIDATION", logicalOperationId: outcome?.modelCallId ?? "",
+          provider: outcome?.provider ?? provider, model: outcome?.model ?? identity.model,
+          role: "truth-validator", responseContent: response.rawResponse,
+          bookDir: input.bookDir, transactionId: input.transactionId,
+          chapterNumber: input.chapterNumber,
+          expectedInputFingerprint: execution.inputFingerprint,
+        });
+        const providerReference = this.providerReferenceFromCanonicalEvidence({
+          ...evidence, bookDir: input.bookDir, transactionId: input.transactionId, chapterNumber: input.chapterNumber,
+          role: "truth-validator", stage: "TRUTH_VALIDATION", provider: currentExecution.provider, model: currentExecution.model,
+        });
+        await bindChapterTransactionProviderRequest({
+          bookDir: input.bookDir, transactionId: input.transactionId, reservationId: reservation.reservationId, providerReference,
+        });
+        if (response instanceof TruthValidatorArtifactError) throw response;
+        return { verdict: response.verdict, diagnostics: response.diagnostics, rawResponse: response.rawResponse, usage: response.usage, ...evidence };
+      },
+    });
+  }
+
+  private async resolveCanonicalTruthEvidence(input: {
+    readonly role: "truth-extractor" | "truth-validator" | "logic-canon-auditor" | "commercial-reader";
+    readonly stage: "TRUTH_EXTRACTION" | "TRUTH_EXTRACTION_REPAIR" | "TRUTH_VALIDATION" | "LOGIC_REVIEW" | "READER_REVIEW";
+    readonly logicalOperationId: string;
+    readonly provider: string;
+    readonly model: string;
+    readonly responseContent: string;
+    readonly bookDir: string;
+    readonly transactionId: string;
+    readonly chapterNumber: number;
+    readonly requireExactResponse?: boolean;
+    readonly expectedInputFingerprint?: string;
+  }): Promise<{
+    readonly logicalOperationId: string;
+    readonly inputFingerprint: string;
+    readonly providerArtifactSha256: string;
+    readonly responseContentSha256: string;
+  }> {
+    try {
+    if (this.config.canonicalTruthEvidenceResolver) return await this.config.canonicalTruthEvidenceResolver(input);
+    const expectedResponseSha = createHash("sha256").update(input.responseContent, "utf8").digest("hex");
+    const root = join(input.bookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
+    let logicalOperationId = input.logicalOperationId;
+    if (!/^provider-step-[a-f0-9]{64}$/u.test(logicalOperationId)) {
+      const matches: string[] = [];
+      let names: string[];
+      try { names = await readdir(root); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") names = [];
+        else throw new Error("CANONICAL_TRUTH_PROVIDER_EVIDENCE_IO_FAILURE", { cause: error });
+      }
+      for (const name of names) {
+        if (!/^provider-step-[a-f0-9]{64}\.json$/u.test(name)) continue;
+        const candidate = JSON.parse(await readFile(join(root, name), "utf8")) as Record<string, unknown> & { readonly response?: { readonly content?: unknown } };
+        if (candidate.transaction_id === input.transactionId && candidate.chapter_number === input.chapterNumber
+          && candidate.role === input.role && candidate.stage === input.stage && candidate.provider === input.provider
+          && candidate.requested_model === input.model && candidate.response_artifact_status === "COMPLETE"
+          && candidate.content_sha256 === expectedResponseSha && candidate.response?.content === input.responseContent) matches.push(name.slice(0, -5));
+      }
+      if (matches.length !== 1) throw new Error(matches.length === 0 ? "CANONICAL_TRUTH_PROVIDER_LOGICAL_ID_MISSING" : "CANONICAL_TRUTH_PROVIDER_EVIDENCE_AMBIGUOUS");
+      logicalOperationId = matches[0]!;
+    }
+    let bytes: Buffer;
+    try { bytes = await readFile(join(root, `${logicalOperationId}.json`)); }
+    catch (error) {
+      throw new Error((error as NodeJS.ErrnoException).code === "ENOENT"
+        ? "CANONICAL_TRUTH_PROVIDER_EVIDENCE_MISSING"
+        : "CANONICAL_TRUTH_PROVIDER_EVIDENCE_IO_FAILURE", { cause: error });
+    }
+    let artifact: Record<string, unknown> & { readonly response?: { readonly content?: unknown } };
+    try { artifact = JSON.parse(bytes.toString("utf8")) as typeof artifact; }
+    catch (error) { throw new Error("CANONICAL_TRUTH_PROVIDER_EVIDENCE_INVALID_JSON", { cause: error }); }
+    if (artifact.schema_version !== "1.0" || artifact.response_artifact_status !== "COMPLETE"
+      || artifact.logical_step_id !== logicalOperationId || artifact.usage_identity !== logicalOperationId
+      || artifact.role !== input.role || artifact.stage !== input.stage
+      || artifact.chapter_number !== input.chapterNumber || artifact.transaction_id !== input.transactionId
+      || artifact.provider !== input.provider || artifact.requested_model !== input.model
+      || typeof artifact.content_sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(artifact.content_sha256)
+      || typeof artifact.response?.content !== "string"
+      || createHash("sha256").update(artifact.response.content, "utf8").digest("hex") !== artifact.content_sha256
+      || ((input.requireExactResponse ?? true)
+        && (artifact.content_sha256 !== expectedResponseSha || artifact.response.content !== input.responseContent))
+      || typeof artifact.input_fingerprint !== "string" || !/^[a-f0-9]{64}$/u.test(artifact.input_fingerprint)
+      || (input.expectedInputFingerprint !== undefined && artifact.input_fingerprint !== input.expectedInputFingerprint)) {
+      throw new Error("CANONICAL_TRUTH_PROVIDER_EVIDENCE_IDENTITY_MISMATCH");
+    }
+    return {
+      logicalOperationId,
+      inputFingerprint: artifact.input_fingerprint,
+      providerArtifactSha256: createHash("sha256").update(bytes).digest("hex"),
+      responseContentSha256: artifact.content_sha256,
+    };
+    } catch (error) {
+      if (error instanceof ChapterArtifactEvidenceError) throw error;
+      throw new ChapterArtifactEvidenceError("ARTIFACT_EVIDENCE_DEFECT: canonical Provider evidence resolution failed", error);
+    }
+  }
+
+  private async resolveTerminalReviewProviderEvidence(input: {
+    readonly role: "logic-canon-auditor" | "commercial-reader";
+    readonly stage: "LOGIC_REVIEW" | "READER_REVIEW";
+    readonly outcome?: LLMOutcomeRecord;
+    readonly fallbackProvider: string;
+    readonly fallbackModel: string;
+    readonly stableReview: unknown;
+    readonly bookDir: string;
+    readonly transactionId: string;
+    readonly chapterNumber: number;
+    readonly expectedInputFingerprint: string;
+    readonly reviewLanguage: "zh" | "en";
+  }): Promise<import("../production/chapter-transaction.js").ChapterProviderReference> {
+    try {
+    if (!/^[a-f0-9]{64}$/u.test(input.expectedInputFingerprint)
+      || (input.reviewLanguage !== "zh" && input.reviewLanguage !== "en")) {
+      throw new Error("TERMINAL_REVIEW_REQUEST_AUTHORITY_MISSING");
+    }
+    const candidateSha256 = (input.stableReview as { readonly reviewedCandidateSha?: unknown }).reviewedCandidateSha;
+    if (typeof candidateSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(candidateSha256)) {
+      throw new Error("TERMINAL_REVIEW_CANDIDATE_AUTHORITY_MISSING");
+    }
+    const provider = input.outcome?.provider ?? input.fallbackProvider;
+    const model = input.outcome?.model ?? input.fallbackModel;
+    let logicalOperationId = input.outcome?.modelCallId ?? "";
+    let responseContent = JSON.stringify(input.stableReview);
+    if (!this.config.canonicalTruthEvidenceResolver) {
+      const root = join(input.bookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
+      const boundRequests = await collectBoundChapterProviderRequests({
+        bookDir: input.bookDir, transactionId: input.transactionId, chapterNumber: input.chapterNumber,
+        candidateSha256, role: input.role, stage: input.stage,
+      });
+      const boundByLogicalOperation = new Map(boundRequests.map((entry) => [entry.binding.logicalOperationId, entry]));
+      let names: string[];
+      try { names = await readdir(root); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") names = [];
+        else throw new ChapterArtifactEvidenceError("ARTIFACT_EVIDENCE_DEFECT: terminal review Provider artifact I/O failure", error);
+      }
+      const parseable: Array<{ readonly logicalOperationId: string; readonly responseContent: string; readonly stableReview: ReturnType<PipelineRunner["stableChapterTransactionReview"]> }> = [];
+      for (const name of names) {
+        if (!/^provider-step-[a-f0-9]{64}\.json$/u.test(name)) continue;
+        let artifact: Record<string, unknown> & { readonly response?: { readonly content?: unknown } };
+        try { artifact = JSON.parse(await readFile(join(root, name), "utf8")) as typeof artifact; }
+        catch (error) { throw new ChapterArtifactEvidenceError("ARTIFACT_EVIDENCE_DEFECT: terminal review Provider evidence I/O or JSON failure", error); }
+        const boundRequest = boundByLogicalOperation.get(name.slice(0, -5));
+        if (boundRequests.length > 0 && !boundRequest && name.slice(0, -5) !== logicalOperationId) continue;
+        const expectedProvider = boundRequest?.reservation.request.provider ?? provider;
+        const expectedModel = boundRequest?.reservation.request.model ?? model;
+        const expectedFingerprint = boundRequest?.reservation.providerInputFingerprint ?? input.expectedInputFingerprint;
+        if (artifact.transaction_id !== input.transactionId || artifact.chapter_number !== input.chapterNumber
+          || artifact.role !== input.role || artifact.stage !== input.stage || artifact.provider !== expectedProvider
+          || artifact.requested_model !== expectedModel) continue;
+        const responseContent = artifact.response?.content;
+        if (artifact.schema_version !== "1.0" || artifact.logical_step_id !== name.slice(0, -5)
+          || artifact.usage_identity !== artifact.logical_step_id || artifact.response_artifact_status !== "COMPLETE"
+          || artifact.input_fingerprint !== expectedFingerprint
+          || typeof responseContent !== "string" || typeof artifact.content_sha256 !== "string"
+          || createHash("sha256").update(responseContent ?? "", "utf8").digest("hex") !== artifact.content_sha256) {
+          if (artifact.input_fingerprint !== expectedFingerprint) continue;
+          throw new ChapterArtifactEvidenceError("ARTIFACT_EVIDENCE_DEFECT: terminal review Provider evidence validation failure", artifact);
+        }
+        try {
+          const parsedAudit = input.role === "logic-canon-auditor"
+            ? parseContinuityAuditResponse(responseContent, input.reviewLanguage)
+            : null;
+          const parsed = parsedAudit
+            ? scoredLogicReviewFromAudit(parsedAudit, { candidateSha: candidateSha256, provider: expectedProvider, model: expectedModel })
+            : parseCommercialReaderResponse(responseContent, { candidateSha: candidateSha256, provider: expectedProvider, model: expectedModel });
+          parseable.push({ logicalOperationId: name.slice(0, -5), responseContent, stableReview: this.stableChapterTransactionReview(parsed) });
+        } catch (error) {
+          throw new ChapterArtifactEvidenceError("ARTIFACT_EVIDENCE_DEFECT: terminal review raw response parse failure", error);
+        }
+      }
+      const isApproval = (entry: typeof parseable[number]) => ["APPROVED", "APPROVED_WITH_NOTES"].includes(entry.stableReview.decision);
+      if (input.outcome) {
+        const exact = parseable.filter((entry) => entry.logicalOperationId === logicalOperationId);
+        if (exact.length !== 1) throw new ChapterArtifactEvidenceError("ARTIFACT_EVIDENCE_DEFECT: TERMINAL_REVIEW_MODEL_OUTCOME_MISSING_OR_INVALID", input.outcome);
+        if (canonicalJson(exact[0]!.stableReview) !== canonicalJson(input.stableReview)) throw new ChapterArtifactEvidenceError("ARTIFACT_EVIDENCE_DEFECT: TERMINAL_REVIEW_MODEL_OUTCOME_MISMATCH", input.outcome);
+        if (isApproval(exact[0]!) && parseable.filter(isApproval).length !== 1) throw new ChapterArtifactEvidenceError("ARTIFACT_EVIDENCE_DEFECT: TERMINAL_REVIEW_PROVIDER_EVIDENCE_AMBIGUOUS_CONFLICTING_APPROVALS", input.outcome);
+        responseContent = exact[0]!.responseContent;
+      } else {
+        const stableMatches = parseable.filter((entry) => canonicalJson(entry.stableReview) === canonicalJson(input.stableReview));
+        const selected = ["APPROVED", "APPROVED_WITH_NOTES"].includes((input.stableReview as { decision?: string }).decision ?? "")
+          ? stableMatches.filter(isApproval)
+          : stableMatches;
+        if (selected.length !== 1) throw new ChapterArtifactEvidenceError(
+          `ARTIFACT_EVIDENCE_DEFECT: ${selected.length === 0 ? "TERMINAL_REVIEW_MODEL_OUTCOME_MISSING" : "TERMINAL_REVIEW_PROVIDER_EVIDENCE_AMBIGUOUS"}`,
+          input.stableReview,
+        );
+        if (isApproval(selected[0]!) && parseable.filter(isApproval).length !== 1) throw new ChapterArtifactEvidenceError("ARTIFACT_EVIDENCE_DEFECT: TERMINAL_REVIEW_PROVIDER_EVIDENCE_AMBIGUOUS_CONFLICTING_APPROVALS", input.stableReview);
+        logicalOperationId = selected[0]!.logicalOperationId;
+        responseContent = selected[0]!.responseContent;
+      }
+    }
+    const evidence = await this.resolveCanonicalTruthEvidence({
+      role: input.role,
+      stage: input.stage,
+      logicalOperationId,
+      provider,
+      model,
+      responseContent,
+      bookDir: input.bookDir,
+      transactionId: input.transactionId,
+      chapterNumber: input.chapterNumber,
+      requireExactResponse: true,
+      expectedInputFingerprint: input.expectedInputFingerprint,
+    });
+    return {
+      transactionId: input.transactionId,
+      logicalOperationId: evidence.logicalOperationId,
+      chapterNumber: input.chapterNumber,
+      role: input.role,
+      stage: input.stage,
+      provider,
+      requestedModel: model,
+      inputFingerprint: evidence.inputFingerprint,
+      artifactRelativePath: `story/runtime/bounded-autonomous/provider-responses/${evidence.logicalOperationId}.json`,
+      artifactSha256: evidence.providerArtifactSha256,
+      responseContentSha256: evidence.responseContentSha256,
+      responseArtifactStatus: "COMPLETE",
+    };
+    } catch (error) {
+      if (error instanceof ChapterArtifactEvidenceError) throw error;
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new ChapterArtifactEvidenceError(`ARTIFACT_EVIDENCE_DEFECT: terminal review Provider evidence resolution failed: ${detail}`, error);
+    }
+  }
+
+  private async usesCanonicalTruthV2(bookDir: string): Promise<boolean> {
+    const state = await resolveTruthCutoverState(bookDir);
+    if (state !== "LEGACY_V1_ONLY") return true;
+    if (!this.config.firstV2Baseline) return false;
+    const chain = await verifyChapterCommitChain({ bookDir });
+    await loadCommittedV2PredecessorAuthority({ bookDir, chapterNumber: chain.latestChapter + 1, firstV2Baseline: this.config.firstV2Baseline });
+    return true;
   }
 
   async runWithAbortSignal<T>(
@@ -868,6 +1262,114 @@ export class PipelineRunner {
     };
   }
 
+  private truthAgentCtxFor(agent: "truth-extractor" | "truth-validator", bookId: string): AgentContext {
+    const { model, client } = this.resolveOverride(agent);
+    return {
+      client,
+      model,
+      projectRoot: this.config.projectRoot,
+      bookId,
+      logger: this.config.logger?.child(agent),
+      onStreamProgress: this.config.onStreamProgress,
+      signal: this.currentAbortSignal(),
+    };
+  }
+
+  private canonicalTruthExecutionIdentity(
+    role: "truth-extractor" | "truth-validator",
+    request: TruthExtractionRequest | TruthValidationRequest,
+  ): CanonicalTruthExecutionIdentity {
+    const { model, client } = this.resolveOverride(role);
+    const provider = client.service ?? client.provider;
+    const options = role === "truth-extractor" ? TRUTH_EXTRACTOR_OPTIONS : TRUTH_VALIDATOR_OPTIONS;
+    const messages = role === "truth-extractor"
+      ? buildTruthExtractorMessages(request as TruthExtractionRequest)
+      : buildTruthValidatorMessages(request as TruthValidationRequest);
+    const fixedTemperature = client.service ? lookupModel(client.service, model)?.temperature : undefined;
+    const temperature = fixedTemperature ?? options.temperature;
+    const providerIdentity = {
+      provider,
+      model,
+      messages,
+      temperature,
+      maxTokens: options.maxTokens,
+      stream: client.stream,
+    };
+    const identity = {
+      ...providerIdentity,
+      webSearch: false,
+      extra: structuredClone(client.defaults.extra ?? {}),
+    };
+    return {
+      ...identity,
+      fullRequestSha256: canonicalSha256(identity),
+      inputFingerprint: createHash("sha256").update(JSON.stringify(providerIdentity), "utf8").digest("hex"),
+    };
+  }
+
+  private providerRequestFromCanonicalExecution(
+    execution: CanonicalTruthExecutionIdentity,
+  ): FinalProviderRequestObservation {
+    return {
+      provider: execution.provider,
+      model: execution.model,
+      messages: execution.messages,
+      temperature: execution.temperature,
+      maxTokens: execution.maxTokens,
+      stream: execution.stream,
+      webSearch: execution.webSearch,
+      extra: execution.extra,
+    };
+  }
+
+  private canonicalTruthExecutionFromObservation(
+    request: FinalProviderRequestObservation,
+  ): CanonicalTruthExecutionIdentity {
+    const providerIdentity = {
+      provider: request.provider,
+      model: request.model,
+      messages: request.messages,
+      temperature: request.temperature,
+      maxTokens: request.maxTokens,
+      stream: request.stream,
+    };
+    const fullIdentity = { ...providerIdentity, webSearch: request.webSearch, extra: request.extra };
+    return {
+      ...fullIdentity,
+      fullRequestSha256: canonicalSha256(fullIdentity),
+      inputFingerprint: createHash("sha256").update(JSON.stringify(providerIdentity), "utf8").digest("hex"),
+    };
+  }
+
+  private providerReferenceFromCanonicalEvidence(input: {
+    readonly bookDir: string;
+    readonly transactionId: string;
+    readonly chapterNumber: number;
+    readonly role: string;
+    readonly stage: string;
+    readonly provider: string;
+    readonly model: string;
+    readonly logicalOperationId: string;
+    readonly inputFingerprint: string;
+    readonly providerArtifactSha256: string;
+    readonly responseContentSha256: string;
+  }): import("../production/chapter-transaction.js").ChapterProviderReference {
+    return {
+      transactionId: input.transactionId,
+      logicalOperationId: input.logicalOperationId,
+      chapterNumber: input.chapterNumber,
+      role: input.role,
+      stage: input.stage,
+      provider: input.provider,
+      requestedModel: input.model,
+      inputFingerprint: input.inputFingerprint,
+      artifactRelativePath: `story/runtime/bounded-autonomous/provider-responses/${input.logicalOperationId}.json`,
+      artifactSha256: input.providerArtifactSha256,
+      responseContentSha256: input.responseContentSha256,
+      responseArtifactStatus: "COMPLETE",
+    };
+  }
+
   public createAgentContext(agent: string, bookId?: string): AgentContext {
     return this.agentCtxFor(agent, bookId);
   }
@@ -981,6 +1483,9 @@ export class PipelineRunner {
    */
   async reviseFoundation(bookId: string, feedback: string): Promise<void> {
     const bookDir = this.state.bookDir(bookId);
+    for (const path of ["story/outline", "story/roles", "story/story_bible.md", "story/volume_outline.md", "story/book_rules.md", "story/character_matrix.md"]) {
+      await safeMutationPath(bookDir, path, true);
+    }
     const storyDir = join(bookDir, "story");
     const isPhase5 = await isNewLayoutBook(bookDir);
 
@@ -1260,6 +1765,7 @@ export class PipelineRunner {
   async writeDraft(bookId: string, context?: string, wordCount?: number): Promise<DraftResult> {
     const releaseLock = await this.state.acquireBookLock(bookId);
     try {
+      await assertLegacyTruthMutationAllowed(this.state.bookDir(bookId));
       await this.state.ensureControlDocuments(bookId);
       const book = await this.state.loadBookConfig(bookId);
       const bookDir = this.state.bookDir(bookId);
@@ -1376,6 +1882,7 @@ export class PipelineRunner {
   }
 
   async planChapter(bookId: string, context?: string): Promise<PlanChapterResult> {
+    await assertLegacyTruthMutationAllowed(this.state.bookDir(bookId));
     await this.state.ensureControlDocuments(bookId);
     const book = await this.state.loadBookConfig(bookId);
     const bookDir = this.state.bookDir(bookId);
@@ -1400,6 +1907,7 @@ export class PipelineRunner {
   }
 
   async composeChapter(bookId: string, context?: string): Promise<ComposeChapterResult> {
+    await assertLegacyTruthMutationAllowed(this.state.bookDir(bookId));
     await this.state.ensureControlDocuments(bookId);
     const book = await this.state.loadBookConfig(bookId);
     const bookDir = this.state.bookDir(bookId);
@@ -1428,6 +1936,7 @@ export class PipelineRunner {
 
   /** Audit the latest (or specified) chapter. Read-only, no lock needed. */
   async auditDraft(bookId: string, chapterNumber?: number): Promise<AuditResult & { readonly chapterNumber: number }> {
+    await assertLegacyTruthMutationAllowed(this.state.bookDir(bookId));
     const book = await this.state.loadBookConfig(bookId);
     const bookDir = this.state.bookDir(bookId);
     const targetChapter = chapterNumber ?? (await this.state.getNextChapterNumber(bookId)) - 1;
@@ -1488,6 +1997,7 @@ export class PipelineRunner {
 
   /** Review an already-persisted chapter without entering the Writer generation path. */
   async reviewExistingChapterBounded(bookId: string, chapterNumber: number): Promise<ExistingChapterReviewResult> {
+    await assertLegacyTruthMutationAllowed(this.state.bookDir(bookId));
     if (!Number.isInteger(chapterNumber) || chapterNumber < 1) {
       return { chapterNumber, status: "FAILED", revisionCount: 0, findings: [], bodyChanged: false, error: "Invalid chapter number" };
     }
@@ -1617,6 +2127,7 @@ export class PipelineRunner {
   async reviseDraft(bookId: string, chapterNumber?: number, mode: ReviseMode = DEFAULT_REVISE_MODE, externalContext?: string, options?: ReviseDraftOptions): Promise<ReviseResult> {
     const releaseLock = await this.state.acquireBookLock(bookId);
     try {
+      await assertLegacyTruthMutationAllowed(this.state.bookDir(bookId));
       const book = await this.state.loadBookConfig(bookId);
       const bookDir = this.state.bookDir(bookId);
       const targetChapter = chapterNumber ?? (await this.state.getNextChapterNumber(bookId)) - 1;
@@ -2059,6 +2570,8 @@ export class PipelineRunner {
   async finalizePendingChapterOffline(plan: FormalPendingChapterRecoveryPlan) {
     const releaseLock = await this.state.acquireBookLock(plan.bookId);
     try {
+      const bookDir = this.state.bookDir(plan.bookId);
+      if (await resolveTruthCutoverState(bookDir) !== "LEGACY_V1_ONLY") throw new Error("V2_CANONICAL_TRUTH_MANUAL_REPAIR_REQUIRED");
       return await finalizePendingChapterOfflinePlan({ projectRoot: this.config.projectRoot, plan });
     } finally {
       await releaseLock();
@@ -2079,6 +2592,8 @@ export class PipelineRunner {
     if (plan.kind !== "FORMAL_BOUNDED_STATE_REBASELINE") throw new Error("STATE_REBASELINE_MODE_MISMATCH");
     const releaseLock = await this.state.acquireBookLock(plan.bookId);
     try {
+      const bookDir = this.state.bookDir(plan.bookId);
+      if (await resolveTruthCutoverState(bookDir) !== "LEGACY_V1_ONLY") throw new Error("V2_CANONICAL_TRUTH_MANUAL_REPAIR_REQUIRED");
       const verified = await resolveFormalPendingChapterRecoveryPlan({
         projectRoot: this.config.projectRoot,
         bookId: plan.bookId,
@@ -2088,7 +2603,6 @@ export class PipelineRunner {
       if (!verified || JSON.stringify(verified) !== JSON.stringify(plan)) throw new Error("STATE_REBASELINE_PLAN_CHANGED");
 
       const book = await this.state.loadBookConfig(plan.bookId);
-      const bookDir = this.state.bookDir(plan.bookId);
       const index = [...await this.state.loadChapterIndex(plan.bookId)];
       const targetIndex = index.findIndex((chapter) => chapter.number === plan.pendingChapterNumber);
       const target = index[targetIndex];
@@ -2288,6 +2802,7 @@ export class PipelineRunner {
     if (plan.terminalReconciliation) throw new Error("PRESERVED_CANDIDATE_TERMINAL_RECONCILIATION_REQUIRED");
     const releaseLock = await this.state.acquireBookLock(plan.bookId);
     try {
+      if (await resolveTruthCutoverState(this.state.bookDir(plan.bookId)) !== "LEGACY_V1_ONLY") throw new Error("V2_CANONICAL_TRUTH_MANUAL_REPAIR_REQUIRED");
       const verified = await resolveFormalPendingChapterRecoveryPlan({
         projectRoot: this.config.projectRoot,
         bookId: plan.bookId,
@@ -2310,6 +2825,7 @@ export class PipelineRunner {
     chapterNumber: number,
     options: { readonly safeReplayStage?: string } = {},
   ): Promise<ResumeAuditFailedChapterResult> {
+    if (await resolveTruthCutoverState(this.state.bookDir(bookId)) !== "LEGACY_V1_ONLY") throw new Error("V2_CANONICAL_TRUTH_MANUAL_REPAIR_REQUIRED");
     const index = await this.state.loadChapterIndex(bookId);
     const chapter = index.find((item) => item.number === chapterNumber);
     if (!chapter || chapter.status !== "audit-failed") {
@@ -2838,6 +3354,9 @@ export class PipelineRunner {
   async repairChapterState(bookId: string, chapterNumber?: number): Promise<ChapterPipelineResult> {
     const releaseLock = await this.state.acquireBookLock(bookId);
     try {
+      if (await resolveTruthCutoverState(this.state.bookDir(bookId)) !== "LEGACY_V1_ONLY") {
+        throw new Error("V2_CANONICAL_TRUTH_MANUAL_REPAIR_REQUIRED");
+      }
       return await this._repairChapterStateLocked(bookId, chapterNumber);
     } finally {
       await releaseLock();
@@ -2847,6 +3366,9 @@ export class PipelineRunner {
   async resyncChapterArtifacts(bookId: string, chapterNumber?: number): Promise<ChapterPipelineResult> {
     const releaseLock = await this.state.acquireBookLock(bookId);
     try {
+      if (await resolveTruthCutoverState(this.state.bookDir(bookId)) !== "LEGACY_V1_ONLY") {
+        throw new Error("V2_CANONICAL_TRUTH_MANUAL_REPAIR_REQUIRED");
+      }
       return await this._resyncChapterArtifactsLocked(bookId, chapterNumber);
     } finally {
       await releaseLock();
@@ -2863,6 +3385,9 @@ export class PipelineRunner {
   }> {
     const releaseLock = await this.state.acquireBookLock(bookId);
     try {
+      if (await resolveTruthCutoverState(this.state.bookDir(bookId)) !== "LEGACY_V1_ONLY") {
+        throw new Error("V2_CANONICAL_TRUTH_MANUAL_REPAIR_REQUIRED");
+      }
       const chapter = await this._resyncChapterArtifactsLocked(bookId, chapterNumber, options);
       const audit = await this.auditDraft(bookId, chapter.chapterNumber);
       return { chapter, audit };
@@ -2881,26 +3406,64 @@ export class PipelineRunner {
     const book = await this.state.loadBookConfig(bookId);
     const bookDir = this.state.bookDir(bookId);
     const transactionEnabled = await isChapterTransactionEnabled(bookDir);
+    let productionAuthority: string | undefined;
+    if (transactionEnabled) {
+      const productionMapBytes = await readFile(join(bookDir, "story", "outline", "book-production-map.json")).catch(() => null);
+      productionAuthority = `pipeline:${createHash("sha256").update(JSON.stringify({
+        bookId, genre: book.genre, language: book.language ?? null, targetChapters: book.targetChapters,
+        chapterWordCount: book.chapterWordCount,
+        productionMapSha256: productionMapBytes ? createHash("sha256").update(productionMapBytes).digest("hex") : null,
+      })).digest("hex")}`;
+      const recovery = await loadRecoverableTruthChapterCommit({ bookDir });
+      if (recovery) {
+        if (preservedReviewPlan) throw new Error("TRANSACTION_BOOK_LEGACY_RECOVERY_FORBIDDEN");
+        const { commit } = recovery;
+        const { profile } = await this.loadGenreProfile(book.genre);
+        if (commit.productionAuthority !== productionAuthority
+          || recovery.firstV2Baseline && this.config.firstV2Baseline
+            && canonicalSha256(recovery.firstV2Baseline) !== canonicalSha256(this.config.firstV2Baseline)
+          || canonicalJson(commit.lengthSpec) !== canonicalJson(buildLengthSpec(wordCount ?? book.chapterWordCount, book.language ?? profile.language))
+          || canonicalJson(recovery.extractionContext.execution) !== canonicalJson(this.canonicalTruthExecutionIdentity("truth-extractor", recovery.extractionContext.request))
+          || canonicalJson(recovery.validationContext.execution) !== canonicalJson(this.canonicalTruthExecutionIdentity("truth-validator", recovery.validationContext.request))) {
+          throw new Error("STAGED_COMMIT_DETERMINISTIC_INPUT_DRIFT");
+        }
+        await finalizeChapterTransaction({ bookDir, transactionId: commit.transactionId });
+        await reconcileChapterProjections({ bookDir });
+        await this.markBookActiveIfNeeded(bookId);
+        const committedRoot = join(bookDir, "story", "commits", `chapter-${String(commit.chapterNumber).padStart(4, "0")}`);
+        const review = JSON.parse(await readFile(join(committedRoot, "review.json"), "utf8")) as import("../production/chapter-transaction.js").ChapterCommitReviewAuthority;
+        const usage = JSON.parse(await readFile(join(committedRoot, "usage.json"), "utf8")) as { totalUsage: TokenUsageSummary; roleUsage: Record<string, RoleTokenUsage> };
+        await this.config.onAutonomousStage?.({ stage: "APPROVED", role: "state-manager", provider: null, model: null, transactionId: commit.transactionId });
+        return {
+          chapterNumber: commit.chapterNumber, title: commit.chapterTitle, wordCount: commit.finalLengthCount,
+          revised: commit.revisionCount > 0,
+          status: commit.boundedReviewStatus === "ACCEPTED_WITH_FINDINGS" ? "accepted-with-findings" : "ready-for-review",
+          tokenUsage: usage.totalUsage, roleUsage: usage.roleUsage,
+          auditResult: { passed: review.status === "APPROVED",
+            overallScore: Math.round(review.reviewerEvidence.reduce((sum, entry) => sum + entry.totalScore, 0) / review.reviewerEvidence.length),
+            issues: this.reviewFindingsAsAuditIssues(review.reviewerEvidence.flatMap((entry) => entry.findings) as ReviewFinding[]),
+            summary: review.status === "APPROVED" ? `Bounded autonomous review ${review.grade} approved.`
+              : `Bounded autonomous review ${review.grade} accepted with deferred non-blocking findings.`,
+          },
+        };
+      }
+    }
     if (transactionEnabled) {
       if (preservedReviewPlan) throw new Error("TRANSACTION_BOOK_LEGACY_RECOVERY_FORBIDDEN");
       const chain = await verifyChapterCommitChain({ bookDir });
       await reconcileChapterProjections({ bookDir });
-      await this.syncNarrativeMemoryIndex(bookId);
-      await this.syncCurrentStateFactHistory(bookId, chain.latestChapter);
+      if (!(await this.usesCanonicalTruthV2(bookDir))) {
+        await this.syncNarrativeMemoryIndex(bookId);
+        await this.syncCurrentStateFactHistory(bookId, chain.latestChapter);
+      }
     }
     const chapterNumber = await this.state.getNextChapterNumber(bookId);
     let chapterTransaction: ChapterTransactionHandle | undefined;
     if (transactionEnabled) {
-      const productionMapBytes = await readFile(join(bookDir, "story", "outline", "book-production-map.json")).catch(() => null);
-      const productionAuthority = `pipeline:${createHash("sha256").update(JSON.stringify({
-        bookId,
-        genre: book.genre,
-        language: book.language ?? null,
-        targetChapters: book.targetChapters,
-        chapterWordCount: book.chapterWordCount,
-        productionMapSha256: productionMapBytes ? createHash("sha256").update(productionMapBytes).digest("hex") : null,
-      })).digest("hex")}`;
-      chapterTransaction = await beginChapterTransaction({ bookDir, bookId, chapterNumber, productionAuthority });
+      chapterTransaction = await beginChapterTransaction({ bookDir, bookId, chapterNumber, productionAuthority: productionAuthority!,
+        truthMode: await this.usesCanonicalTruthV2(bookDir) ? "CANONICAL_V2" : "LEGACY_V1",
+        firstV2Baseline: this.config.firstV2Baseline,
+      });
     }
     const paddedChapter = String(chapterNumber).padStart(4, "0");
     if (preservedReviewPlan && chapterNumber !== preservedReviewPlan.pendingChapterNumber) {
@@ -3028,7 +3591,8 @@ export class PipelineRunner {
       }
       if (!chapterTransaction || chapterTransaction.chapterNumber !== chapterNumber) throw new Error("CHAPTER_TRANSACTION_MUST_EXIST_BEFORE_PREPARING");
     }
-    const semanticAuthorityEnvelope = chapterTransaction
+    const canonicalTruthV2 = chapterTransaction ? await this.usesCanonicalTruthV2(bookDir) : false;
+    const semanticAuthorityEnvelope = chapterTransaction && !canonicalTruthV2
       ? await this.buildTransactionSemanticAuthorityEnvelope(bookDir, chapterTransaction)
       : undefined;
     const settlementRetryBudget = chapterTransaction
@@ -3036,12 +3600,24 @@ export class PipelineRunner {
       : undefined;
     const stageLanguage = await this.resolveBookLanguage(book);
     this.logStage(stageLanguage, { zh: "准备章节输入", en: "preparing chapter inputs" });
+    const predecessorAuthority = canonicalTruthV2
+      ? await loadCommittedV2PredecessorAuthority({
+          bookDir,
+          chapterNumber,
+          ...(this.config.firstV2Baseline ? { firstV2Baseline: this.config.firstV2Baseline } : {}),
+        })
+      : undefined;
+    const authoritativeTruth = predecessorAuthority?.truth;
+    const predecessorChapterBody = predecessorAuthority?.predecessorChapterBody;
+    const immutableRecentChapterBodies = predecessorAuthority?.recentChapterBodies;
     const writeInput = await this.prepareWriteInput(
       book,
       bookDir,
       chapterNumber,
       externalContext,
       chapterTransaction?.transactionId,
+      authoritativeTruth,
+      predecessorChapterBody,
     );
     const reducedControlInput = {
       chapterIntent: writeInput.chapterIntent,
@@ -3049,6 +3625,9 @@ export class PipelineRunner {
       chapterIntentData: writeInput.chapterIntentData,
       contextPackage: writeInput.contextPackage,
       ruleStack: writeInput.ruleStack,
+      ...(authoritativeTruth ? { authoritativeTruth } : {}),
+      ...(predecessorChapterBody !== undefined ? { predecessorChapterBody } : {}),
+      ...(immutableRecentChapterBodies ? { immutableRecentChapterBodies } : {}),
     };
     const { profile: gp } = await this.loadGenreProfile(book.genre);
     const pipelineLang = book.language ?? gp.language;
@@ -3096,6 +3675,7 @@ export class PipelineRunner {
           bookDir,
           chapterNumber,
           ...writeInput,
+          ...(immutableRecentChapterBodies ? { immutableRecentChapterBodies } : {}),
           lengthSpec,
           ...(chapterTransaction ? { deferStateSettlement: true } : {}),
           ...(wordCount ? { wordCountOverride: wordCount } : {}),
@@ -3127,6 +3707,7 @@ export class PipelineRunner {
     let boundedReviewCallbacks: Pick<Parameters<typeof runBoundedReviewCycle>[0], "reviewLogic" | "reviewCommercial" | "revise" | "onStage"> | undefined;
     let recordTransactionReviewResult: ((result: BoundedReviewResult) => Promise<string | undefined>) | undefined;
     let semanticAuditor: ContinuityAuditor | undefined;
+    const terminalRequestOrdinals = new Map<string, number>();
 
     if ((this.config.chapterReviewMode ?? "auto") === "manual") {
       // C4a: write-only checkpoint. Stop right after the draft — skip the
@@ -3154,34 +3735,105 @@ export class PipelineRunner {
       const commercialReader = new CommercialReaderAgent(this.agentCtxFor("commercial-reader", bookId));
       boundedReviewCallbacks = {
         reviewLogic: async (content, candidateSha) => {
-          const review = scoredLogicReviewFromAudit(await auditor.auditChapter(
-            bookDir,
-            content,
-            chapterNumber,
-            book.genre,
-            reducedControlInput,
-          ), {
+          let outcome: LLMOutcomeRecord | undefined;
+          let requestReservation: Awaited<ReturnType<typeof reserveChapterTransactionProviderRequest>> | undefined;
+          const audit = await runWithLLMOutcomeObserver(async (record) => {
+            if (outcome) throw new ChapterArtifactEvidenceError("ARTIFACT_EVIDENCE_DEFECT: TERMINAL_REVIEW_MULTIPLE_MODEL_OUTCOMES", record);
+            outcome = record;
+          }, () => auditor.auditChapter(
+            bookDir, content, chapterNumber, book.genre, {
+              ...reducedControlInput,
+              ...(canonicalTruthV2 && chapterTransaction ? { onFinalProviderRequest: async (request: FinalProviderRequestObservation) => {
+                const key = `${candidateSha}:logic-canon-auditor`;
+                const requestOrdinal = terminalRequestOrdinals.get(key) ?? 0;
+                terminalRequestOrdinals.set(key, requestOrdinal + 1);
+                requestReservation = await reserveChapterTransactionProviderRequest({
+                  bookDir, transactionId: chapterTransaction.transactionId, chapterNumber, candidateSha256: candidateSha,
+                  role: "logic-canon-auditor", stage: "LOGIC_REVIEW", requestOrdinal,
+                  reviewLanguage: pipelineLang, request,
+                });
+              } } : {}),
+            },
+          ));
+          const review = scoredLogicReviewFromAudit(audit, {
             candidateSha,
             provider: logicIdentity.client.service ?? logicIdentity.client.provider,
             model: logicIdentity.model,
           });
-          if (chapterTransaction) await recordChapterTransactionReviewEvidence({
-            bookDir, transactionId: chapterTransaction.transactionId, candidateSha256: candidateSha,
-            reviewerRole: review.reviewerRole, evidence: this.stableChapterTransactionReview(review),
-          });
+          if (chapterTransaction) {
+            const stableReview = this.stableChapterTransactionReview(review);
+            const providerRequest = audit.providerRequest;
+            if (canonicalTruthV2 && (!providerRequest || !providerRequest.reviewLanguage || !requestReservation)) {
+              throw new ChapterArtifactEvidenceError("ARTIFACT_EVIDENCE_DEFECT: TERMINAL_REVIEW_CANDIDATE_REQUEST_BINDING_MISSING", providerRequest);
+            }
+            const providerEvidence = canonicalTruthV2 ? await this.resolveTerminalReviewProviderEvidence({
+              role: "logic-canon-auditor", stage: "LOGIC_REVIEW", outcome,
+              fallbackProvider: logicIdentity.client.service ?? logicIdentity.client.provider,
+              fallbackModel: logicIdentity.model, stableReview,
+              expectedInputFingerprint: providerRequest!.inputFingerprint,
+              reviewLanguage: providerRequest!.reviewLanguage!,
+              bookDir, transactionId: chapterTransaction.transactionId, chapterNumber,
+            }) : undefined;
+            if (providerEvidence && requestReservation) await bindChapterTransactionProviderRequest({
+              bookDir, transactionId: chapterTransaction.transactionId,
+              reservationId: requestReservation.reservationId, providerReference: providerEvidence,
+            });
+            await recordChapterTransactionReviewEvidence({
+              bookDir, transactionId: chapterTransaction.transactionId, candidateSha256: candidateSha,
+              reviewerRole: review.reviewerRole, evidence: stableReview,
+              ...(providerRequest ? { expectedInputFingerprint: providerRequest.inputFingerprint, providerRequest } : {}),
+              ...(providerEvidence ? { providerEvidence } : {}),
+            });
+          }
           return review;
         },
         reviewCommercial: async (content, candidateSha) => {
-          const review = await commercialReader.reviewChapter({
+          let outcome: LLMOutcomeRecord | undefined;
+          let requestReservation: Awaited<ReturnType<typeof reserveChapterTransactionProviderRequest>> | undefined;
+          const review = await runWithLLMOutcomeObserver(async (record) => {
+            if (outcome) throw new ChapterArtifactEvidenceError("ARTIFACT_EVIDENCE_DEFECT: TERMINAL_REVIEW_MULTIPLE_MODEL_OUTCOMES", record);
+            outcome = record;
+          }, () => commercialReader.reviewChapter({
             chapterNumber,
             content,
             candidateSha,
             chapterIntent: reducedControlInput.chapterIntent,
-          });
-          if (chapterTransaction) await recordChapterTransactionReviewEvidence({
-            bookDir, transactionId: chapterTransaction.transactionId, candidateSha256: candidateSha,
-            reviewerRole: review.reviewerRole, evidence: this.stableChapterTransactionReview(review),
-          });
+            ...(canonicalTruthV2 && chapterTransaction ? { onFinalProviderRequest: async (request: FinalProviderRequestObservation) => {
+              const key = `${candidateSha}:commercial-reader`;
+              const requestOrdinal = terminalRequestOrdinals.get(key) ?? 0;
+              terminalRequestOrdinals.set(key, requestOrdinal + 1);
+              requestReservation = await reserveChapterTransactionProviderRequest({
+                bookDir, transactionId: chapterTransaction.transactionId, chapterNumber, candidateSha256: candidateSha,
+                role: "commercial-reader", stage: "READER_REVIEW", requestOrdinal,
+                reviewLanguage: "en", request,
+              });
+            } } : {}),
+          }));
+          if (chapterTransaction) {
+            const stableReview = this.stableChapterTransactionReview(review);
+            const providerRequest = review.providerRequest;
+            if (canonicalTruthV2 && (!providerRequest || !providerRequest.reviewLanguage || !requestReservation)) {
+              throw new ChapterArtifactEvidenceError("ARTIFACT_EVIDENCE_DEFECT: TERMINAL_REVIEW_CANDIDATE_REQUEST_BINDING_MISSING", providerRequest);
+            }
+            const providerEvidence = canonicalTruthV2 ? await this.resolveTerminalReviewProviderEvidence({
+              role: "commercial-reader", stage: "READER_REVIEW", outcome,
+              fallbackProvider: commercialIdentity.client.service ?? commercialIdentity.client.provider,
+              fallbackModel: commercialIdentity.model, stableReview,
+              expectedInputFingerprint: providerRequest!.inputFingerprint,
+              reviewLanguage: providerRequest!.reviewLanguage!,
+              bookDir, transactionId: chapterTransaction.transactionId, chapterNumber,
+            }) : undefined;
+            if (providerEvidence && requestReservation) await bindChapterTransactionProviderRequest({
+              bookDir, transactionId: chapterTransaction.transactionId,
+              reservationId: requestReservation.reservationId, providerReference: providerEvidence,
+            });
+            await recordChapterTransactionReviewEvidence({
+              bookDir, transactionId: chapterTransaction.transactionId, candidateSha256: candidateSha,
+              reviewerRole: review.reviewerRole, evidence: stableReview,
+              ...(providerRequest ? { expectedInputFingerprint: providerRequest.inputFingerprint, providerRequest } : {}),
+              ...(providerEvidence ? { providerEvidence } : {}),
+            });
+          }
           return review;
         },
         revise: async (content, findings, round) => {
@@ -3230,6 +3882,7 @@ export class PipelineRunner {
         ...boundedReviewCallbacks,
       });
       roleUsage = { ...(preservedReviewPlan?.historicalRoleUsage ?? {}) };
+      if (!preservedReviewPlan && writeInput.plannerTokenUsage) roleUsage.planner = writeInput.plannerTokenUsage;
       if (!preservedReviewPlan) roleUsage.writer = output.tokenUsage ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
       for (const [role, usage] of Object.entries(autonomousReviewResult.usageByRole)) {
         roleUsage[role] = PipelineRunner.addUsage(roleUsage[role] ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 }, usage);
@@ -3315,6 +3968,191 @@ export class PipelineRunner {
         };
       }
       if (preservedReviewPlan) preservedTerminalReviewResult = autonomousReviewResult;
+
+      if (chapterTransaction && canonicalTruthV2) {
+        if (!authoritativeTruth || !boundedReviewCallbacks) throw new Error("CANONICAL_TRUTH_V2_AUTHORITY_NOT_LOCKED");
+        const readOptionalAuthority = async (path: string): Promise<string> => {
+          try { return await readFile(path, "utf8"); }
+          catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+            throw error;
+          }
+        };
+        const [committedStoryFrame, committedVolumeMap, committedParentCanon, committedFanficCanon] = await Promise.all([
+          readStoryFrame(bookDir, ""),
+          readVolumeMap(bookDir, ""),
+          readOptionalAuthority(join(bookDir, "story", "parent_canon.md")),
+          readOptionalAuthority(join(bookDir, "story", "fanfic_canon.md")),
+        ]);
+        const canonicalCommittedAuthority = canonicalJson({
+          schemaVersion: "1.0",
+          kind: "CANONICAL_TRUTH_COMMITTED_AUTHORITY",
+          predecessorCommitSha256: chapterTransaction.previousAuthoritySha256,
+          structuredTruth: authoritativeTruth,
+          storyFrame: committedStoryFrame,
+          volumeMap: committedVolumeMap,
+          parentCanon: committedParentCanon,
+          fanficCanon: committedFanficCanon,
+          bookRules: parsedBookRules,
+          chapterIntent: {
+            markdown: writeInput.chapterIntent,
+            memo: writeInput.chapterMemo,
+            intentData: writeInput.chapterIntentData,
+            contextPackage: writeInput.contextPackage,
+            ruleStack: writeInput.ruleStack,
+          },
+        });
+        let truthResult = await this.runCanonicalTruthSettlement({
+          bookDir,
+          transactionId: chapterTransaction.transactionId,
+          attemptId: `attempt-${chapterTransaction.attemptNumber}`,
+          attemptNumber: chapterTransaction.attemptNumber ?? 1,
+          chapterNumber,
+          candidate: finalContent,
+          predecessorCommitSha256: chapterTransaction.previousAuthoritySha256,
+          predecessor: authoritativeTruth,
+          committedAuthority: canonicalCommittedAuthority,
+          chapterMemo: writeInput.chapterMemo?.body,
+        });
+        let canonicalTruthUsage = { ...truthResult.usageByRole };
+        while (truthResult.status === "PROSE_CONTENT_DEFECT") {
+          autonomousReviewResult = await runBoundedReviewCycle({
+            initialContent: finalContent,
+            lengthSpec,
+            ...boundedReviewCallbacks,
+            priorResult: autonomousReviewResult,
+            requiredContentRepairFinding: {
+              findingId: `truth-validator-prose-${autonomousReviewResult.revisionCount + 1}`,
+              severity: "MAJOR",
+              evidence: truthResult.diagnostics.join("; "),
+              impact: "canonical-truth-semantic-validation",
+              requiredOutcome: "Repair the prose defect while preserving committed authority and chapter intent.",
+              repairScope: "local",
+            },
+          });
+          if (autonomousReviewResult.status !== "APPROVED" && autonomousReviewResult.status !== "ACCEPTED_WITH_FINDINGS") {
+            await recordTransactionReviewResult?.(autonomousReviewResult);
+            throw new Error(`CANONICAL_TRUTH_PROSE_REPAIR_${autonomousReviewResult.status}`);
+          }
+          finalContent = autonomousReviewResult.finalContent;
+          finalWordCount = countChapterLength(finalContent, lengthSpec.countingMode);
+          revised = autonomousReviewResult.revisionCount > 0;
+          postReviseCount = revised ? finalWordCount : 0;
+          repairApplied = revised;
+          const refreshedRoleUsage: Record<string, RoleTokenUsage> = { ...(preservedReviewPlan?.historicalRoleUsage ?? {}) };
+          if (!preservedReviewPlan && writeInput.plannerTokenUsage) refreshedRoleUsage.planner = writeInput.plannerTokenUsage;
+          if (!preservedReviewPlan) refreshedRoleUsage.writer = output.tokenUsage ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+          roleUsage = this.mergeRoleUsage(refreshedRoleUsage, autonomousReviewResult.usageByRole);
+          truthResult = await this.runCanonicalTruthSettlement({
+            bookDir,
+            transactionId: chapterTransaction.transactionId,
+            attemptId: `attempt-${chapterTransaction.attemptNumber}`,
+            attemptNumber: chapterTransaction.attemptNumber ?? 1,
+            chapterNumber,
+            candidate: finalContent,
+            predecessorCommitSha256: chapterTransaction.previousAuthoritySha256,
+            predecessor: authoritativeTruth,
+            committedAuthority: canonicalCommittedAuthority,
+            chapterMemo: writeInput.chapterMemo?.body,
+          });
+          canonicalTruthUsage = this.mergeRoleUsage(canonicalTruthUsage, truthResult.usageByRole);
+        }
+        if (truthResult.status !== "PASS") {
+          throw new Error(`CANONICAL_TRUTH_${truthResult.status}${truthResult.repairExhausted ? "_REPAIR_EXHAUSTED" : ""}: ${truthResult.diagnostics.join("; ")}`);
+        }
+        const refreshedTerminalReviews = autonomousReviewResult.bestCandidate.reviews;
+        const refreshedFindings = refreshedTerminalReviews.flatMap((review) => review.findings);
+        auditResult = {
+          passed: autonomousReviewResult.status === "APPROVED",
+          overallScore: refreshedTerminalReviews.length > 0
+            ? Math.round(refreshedTerminalReviews.reduce((sum, review) => sum + review.totalScore, 0) / refreshedTerminalReviews.length)
+            : 0,
+          issues: this.reviewFindingsAsAuditIssues(refreshedFindings),
+          summary: autonomousReviewResult.status === "APPROVED"
+            ? `Bounded autonomous review ${autonomousReviewResult.grade} approved.`
+            : `Bounded autonomous review ${autonomousReviewResult.grade} accepted with deferred non-blocking findings.`,
+        };
+        if (!truthResult.semanticValidation.contextSha256) throw new Error("CANONICAL_TRUTH_VALIDATION_CONTEXT_MISSING");
+        roleUsage = this.mergeRoleUsage(roleUsage, canonicalTruthUsage);
+        totalUsage = Object.values(roleUsage).reduce(
+          (sum, usage) => PipelineRunner.addUsage(sum, usage),
+          { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        );
+        assertBoundedReviewTerminalLength(autonomousReviewResult, finalWordCount, lengthSpec);
+        const logicAuthority = autonomousReviewResult.bestCandidate.reviews.find((review) => review.reviewerRole === "logic-canon-auditor");
+        const commercialAuthority = autonomousReviewResult.bestCandidate.reviews.find((review) => review.reviewerRole === "commercial-reader");
+        if (!logicAuthority?.provider || !logicAuthority.model || !commercialAuthority?.provider || !commercialAuthority.model) {
+          throw new Error("CHAPTER_COMMIT_REQUIRES_FINAL_REVIEWER_IDENTITIES");
+        }
+        const reviewerEvidence = [
+          { ...this.stableChapterTransactionReview(logicAuthority), provider: logicAuthority.provider, model: logicAuthority.model, decision: logicAuthority.decision as "APPROVED" | "APPROVED_WITH_NOTES" },
+          { ...this.stableChapterTransactionReview(commercialAuthority), provider: commercialAuthority.provider, model: commercialAuthority.model, decision: commercialAuthority.decision as "APPROVED" | "APPROVED_WITH_NOTES" },
+        ] as const;
+        await recordTransactionReviewResult?.(autonomousReviewResult);
+        const providerReferences = await collectChapterProviderReferences({
+          bookDir, chapterNumber, transactionId: chapterTransaction.transactionId,
+        });
+        const authoritativeProviderUsage = await deriveChapterProviderUsage({
+          bookDir, transactionId: chapterTransaction.transactionId, references: providerReferences,
+        });
+        roleUsage = { ...authoritativeProviderUsage.roleUsage };
+        totalUsage = authoritativeProviderUsage.totalUsage;
+        await stageTruthChapterCommitV2({
+          bookDir,
+          transactionId: chapterTransaction.transactionId,
+          title: output.title,
+          language: pipelineLang,
+          body: finalContent,
+          lengthSpec,
+          review: {
+            status: autonomousReviewResult.status,
+            grade: autonomousReviewResult.grade,
+            revisionCount: autonomousReviewResult.revisionCount,
+            finalCandidateSha256: createHash("sha256").update(finalContent, "utf8").digest("hex"),
+            findings: autonomousReviewResult.bestCandidate.reviews.flatMap((review) => review.findings).map((finding) => ({ severity: finding.severity })),
+            reviewerEvidence,
+          },
+          usage: authoritativeProviderUsage,
+          providerReferences,
+          completedAt: new Date().toISOString(),
+          ...(this.config.firstV2Baseline ? { firstV2Baseline: this.config.firstV2Baseline } : {}),
+          truth: {
+            contextSha256: truthResult.contextSha256,
+            predecessor: authoritativeTruth,
+            acceptedDelta: truthResult.acceptedDelta,
+            deltaAdmission: truthResult.deltaAdmission,
+            applicationReceipt: truthResult.applicationReceipt,
+            semanticValidation: truthResult.semanticValidation,
+            extractionContext: truthResult.extractionContext,
+            validationContext: truthResult.validationContext,
+            resultingTruth: truthResult.resultingTruth,
+            projections: truthResult.projections,
+            projectionManifest: truthResult.projectionManifest,
+            usageByRole: canonicalTruthUsage,
+            extractorEvidence: truthResult.extractorEvidence,
+            validatorEvidence: { ...truthResult.semanticValidation, contextSha256: truthResult.semanticValidation.contextSha256 },
+          },
+        });
+        await finalizeChapterTransaction({ bookDir, transactionId: chapterTransaction.transactionId });
+        await reconcileChapterProjections({ bookDir });
+        await this.markBookActiveIfNeeded(bookId);
+        await this.config.onAutonomousStage?.({
+          stage: "APPROVED", role: "state-manager", provider: null, model: null,
+          transactionId: chapterTransaction.transactionId,
+        });
+        return {
+          chapterNumber,
+          title: output.title,
+          wordCount: finalWordCount,
+          auditResult,
+          revised,
+          status: autonomousReviewResult.status === "ACCEPTED_WITH_FINDINGS" ? "accepted-with-findings" : "ready-for-review",
+          tokenUsage: totalUsage,
+          ...(roleUsage ? { roleUsage } : {}),
+          autonomousReview: this.projectBoundedReview(autonomousReviewResult),
+          ...(writeInput.contextTrace ? { contextTrace: writeInput.contextTrace } : {}),
+        };
+      }
     } else {
       const auditor = new ContinuityAuditor(this.agentCtxFor("auditor", bookId));
       const reviewResult = await runChapterReviewCycle({
@@ -4722,6 +5560,7 @@ ${matrix}`,
     this.throwIfOperationAborted();
     const releaseLock = await this.state.acquireBookLock(input.bookId);
     try {
+      await assertLegacyTruthMutationAllowed(this.state.bookDir(input.bookId));
       const book = await this.state.loadBookConfig(input.bookId);
       const bookDir = this.state.bookDir(input.bookId);
       const { profile: gp } = await this.loadGenreProfile(book.genre);
@@ -4890,7 +5729,13 @@ ${matrix}`,
   }
 
   private stableChapterTransactionReview(review: ScoredReview): Omit<ScoredReview, "reviewedAt" | "tokenUsage"> {
-    const { reviewedAt: _reviewedAt, tokenUsage: _tokenUsage, ...stable } = review;
+    const {
+      reviewedAt: _reviewedAt,
+      tokenUsage: _tokenUsage,
+      providerRequest: _providerRequest,
+      providerInputFingerprint: _providerInputFingerprint,
+      ...stable
+    } = review as ScoredReview & { readonly providerRequest?: ReviewProviderRequestEvidence; readonly providerInputFingerprint?: string };
     return stable;
   }
 
@@ -4977,10 +5822,8 @@ ${matrix}`,
     b?: { readonly promptTokens: number; readonly completionTokens: number; readonly totalTokens: number; readonly actualCostUsd?: number },
   ): TokenUsageSummary {
     if (!b) return a;
-    const aHasUsage = a.promptTokens > 0 || a.completionTokens > 0 || a.totalTokens > 0;
-    const actualCostUsd = b.actualCostUsd !== undefined && (!aHasUsage || a.actualCostUsd !== undefined)
-      ? (a.actualCostUsd ?? 0) + b.actualCostUsd
-      : undefined;
+    const hasCost = a.actualCostUsd !== undefined || b.actualCostUsd !== undefined;
+    const actualCostUsd = hasCost ? (a.actualCostUsd ?? 0) + (b.actualCostUsd ?? 0) : undefined;
     return {
       promptTokens: a.promptTokens + b.promptTokens,
       completionTokens: a.completionTokens + b.completionTokens,
@@ -5126,15 +5969,23 @@ ${matrix}`,
     chapterNumber: number,
     externalContext?: string,
     transactionId?: string,
-  ): Promise<Pick<WriteChapterInput, "externalContext" | "chapterIntent" | "chapterMemo" | "chapterIntentData" | "contextPackage" | "ruleStack"> & {
+    authoritativeTruth?: StructuredTruthV1,
+    predecessorChapterBody?: string,
+  ): Promise<Pick<WriteChapterInput, "externalContext" | "chapterIntent" | "chapterMemo" | "chapterIntentData" | "contextPackage" | "ruleStack" | "authoritativeTruth" | "predecessorChapterBody"> & {
     readonly contextTrace?: ChapterContextTraceSummary;
+    readonly plannerTokenUsage?: RoleTokenUsage;
   }> {
     const { plan, composed } = await this.createGovernedArtifacts(
       book,
       bookDir,
       chapterNumber,
       externalContext,
-      { reuseExistingIntentWhenContextMissing: transactionId === undefined, ...(transactionId ? { transactionId } : {}) },
+      {
+        reuseExistingIntentWhenContextMissing: transactionId === undefined,
+        ...(transactionId ? { transactionId } : {}),
+        ...(authoritativeTruth ? { authoritativeTruth } : {}),
+        ...(predecessorChapterBody !== undefined ? { predecessorChapterBody } : {}),
+      },
     );
 
     return {
@@ -5144,6 +5995,9 @@ ${matrix}`,
       chapterIntentData: plan.intent,
       contextPackage: composed.contextPackage,
       ruleStack: composed.ruleStack,
+      ...(authoritativeTruth ? { authoritativeTruth } : {}),
+      ...(predecessorChapterBody !== undefined ? { predecessorChapterBody } : {}),
+      ...(plan.tokenUsage ? { plannerTokenUsage: plan.tokenUsage } : {}),
       contextTrace: {
         tracePath: relativeToBookDir(bookDir, composed.tracePath),
         selectedSources: [...composed.trace.selectedSources],
@@ -5657,6 +6511,8 @@ ${matrix}`,
     options?: {
       readonly reuseExistingIntentWhenContextMissing?: boolean;
       readonly transactionId?: string;
+      readonly authoritativeTruth?: StructuredTruthV1;
+      readonly predecessorChapterBody?: string;
     },
   ): Promise<{
     plan: PlanChapterOutput;
@@ -5705,6 +6561,8 @@ ${matrix}`,
         },
       ),
       onContextCompression: this.config.onContextCompression,
+      ...(options?.authoritativeTruth ? { authoritativeTruth: options.authoritativeTruth } : {}),
+      ...(options?.predecessorChapterBody !== undefined ? { predecessorChapterBody: options.predecessorChapterBody } : {}),
     });
 
     return { plan, composed };
@@ -5718,6 +6576,8 @@ ${matrix}`,
     options?: {
       readonly reuseExistingIntentWhenContextMissing?: boolean;
       readonly transactionId?: string;
+      readonly authoritativeTruth?: StructuredTruthV1;
+      readonly predecessorChapterBody?: string;
     },
   ): Promise<PlanChapterOutput> {
     if (
@@ -5741,6 +6601,8 @@ ${matrix}`,
       bookDir,
       chapterNumber,
       externalContext,
+      ...(options?.authoritativeTruth ? { authoritativeTruth: options.authoritativeTruth } : {}),
+      ...(options?.predecessorChapterBody !== undefined ? { predecessorChapterBody: options.predecessorChapterBody } : {}),
     });
     // Persist in the new memo format so subsequent compose/write phases can
     // skip the planner LLM call when no new context is supplied.

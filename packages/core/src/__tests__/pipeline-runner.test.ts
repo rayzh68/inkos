@@ -1,3 +1,71 @@
+
+async function installLegacyBaseline(bookDir: string, truth: StructuredTruthV1) {
+  const tx = await import("../production/chapter-transaction.js");
+  const model = await import("../models/structured-truth.js");
+  const transaction = await tx.beginChapterTransaction({ bookDir, bookId: truth.bookId, chapterNumber: 1, productionAuthority: "synthetic-legacy" });
+  const body = "Legacy predecessor.";
+  const hash = transaction.hash(body);
+  const providerReferences = [];
+  for (const [role, stage] of [["logic-canon-auditor", "LOGIC_REVIEW"], ["commercial-reader", "READER_REVIEW"]]) {
+    const logicalOperationId = `provider-step-${transaction.hash(`legacy:${role}`)}`;
+    const artifactRelativePath = `story/runtime/bounded-autonomous/provider-responses/${logicalOperationId}.json`;
+    const inputFingerprint = transaction.hash(`input:${role}`);
+    const content = `synthetic legacy ${role} review`;
+    const artifact = {
+      schema_version: "1.0", transaction_id: transaction.transactionId, chapter_number: 1,
+      logical_step_id: logicalOperationId, usage_identity: logicalOperationId, role, stage, provider: "fixture-provider",
+      requested_model: "fixture-model", input_fingerprint: inputFingerprint, response_artifact_status: "COMPLETE",
+      content_sha256: transaction.hash(content), response: { content },
+    };
+    const bytes = JSON.stringify(artifact);
+    await mkdir(join(bookDir, "story/runtime/bounded-autonomous/provider-responses"), { recursive: true });
+    await writeFile(join(bookDir, artifactRelativePath), bytes);
+    providerReferences.push({ transactionId: transaction.transactionId, logicalOperationId, chapterNumber: 1,
+      role: role!, stage: stage!, provider: "fixture-provider", requestedModel: "fixture-model", inputFingerprint,
+      artifactRelativePath, artifactSha256: transaction.hash(bytes), responseContentSha256: transaction.hash(content),
+      responseArtifactStatus: "COMPLETE" as const });
+  }
+  const manifest = JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 1, candidateSha256: hash, previousAuthoritySha256: transaction.previousAuthoritySha256 });
+  const review = (reviewerRole: "logic-canon-auditor" | "commercial-reader") => ({
+    reviewerRole, provider: "fixture-provider", model: "fixture-model", totalScore: 90,
+    dimensionScores: { quality: 90 }, decision: "APPROVED" as const, findings: [], reviewedCandidateSha: hash,
+  });
+  await tx.stageChapterCommitCandidate({
+    bookDir, transactionId: transaction.transactionId, title: "Legacy predecessor", body,
+    lengthSpec: { target: 2, softMin: 2, softMax: 2, hardMin: 2, hardMax: 2, countingMode: "en_words" },
+    review: { status: "APPROVED", grade: "A", revisionCount: 0, finalCandidateSha256: hash, findings: [],
+      reviewerEvidence: [review("logic-canon-auditor"), review("commercial-reader")] },
+    stateFiles: { "manifest.json": manifest, "current_state.json": JSON.stringify({ chapter: 1 }) },
+    snapshotFiles: { "state/manifest.json": manifest, "state/current_state.json": JSON.stringify({ chapter: 1 }) },
+    stateValidation: { chapterNumber: 1, finalCandidateSha256: hash, previousAuthoritySha256: transaction.previousAuthoritySha256, passed: true, warnings: [] },
+    usage: {}, providerReferences, completedAt: "2026-09-04T00:00:00.000Z",
+  });
+  await tx.finalizeChapterTransaction({ bookDir, transactionId: transaction.transactionId });
+  const chain = await tx.verifyChapterCommitChain({ bookDir });
+  const commit = chain.commits.at(-1)!;
+  if (commit.kind !== "CHAPTER_COMMIT") throw new Error("Synthetic predecessor must be a verified legacy Commit");
+  const sourceFiles = Object.fromEntries(await Promise.all(commit.stateFiles.map(async (entry) =>
+    [entry.relativePath, await readFile(join(bookDir, "story/commits/chapter-0001/state", entry.relativePath))] as const)));
+  const sourceManifest: import("../models/structured-truth.js").BaselineSourceManifestV1 = {
+    schemaVersion: "1.0", kind: "BASELINE_SOURCE_MANIFEST", bookId: truth.bookId, throughChapter: 1,
+    predecessorCommitSha256: commit.commitSha256, sourceStateTreeSha256: commit.stateTreeSha256,
+    entries: commit.stateFiles.map((entry) => ({ path: entry.relativePath, sha256: entry.sha256, byteLength: entry.bytes })),
+  };
+  const receipt: import("../models/structured-truth.js").BaselineConstructionReceiptV1 = {
+    schemaVersion: "1.0", kind: "BASELINE_CONSTRUCTION_RECEIPT", bookId: truth.bookId, throughChapter: 1,
+    predecessorCommitSha256: commit.commitSha256, baselineSourceManifestSha256: canonicalSha256(sourceManifest),
+    seedVocabularyCatalogSha256: canonicalSha256(truth.vocabulary),
+    method: { kind: "DETERMINISTIC", builderId: "inkos.truth-baseline.builder.v1", builderVersion: "1.0" }, recordBindings: [],
+  };
+  Object.assign(truth, { throughChapter: 1, lineage: { kind: "BASELINE", predecessorCommitSha256: commit.commitSha256,
+    baselineSourceManifestSha256: canonicalSha256(sourceManifest), seedVocabularyCatalogSha256: receipt.seedVocabularyCatalogSha256,
+    baselineMethod: "DETERMINISTIC", baselineConstructionReceiptSha256: canonicalSha256(receipt) } });
+  model.validateBaselineAuthorityV1({ truth, sourceManifest, receipt, sourceFiles, chapterCommit: commit });
+  return { truth, sourceManifest, receipt, previousAuthoritySha256: commit.commitSha256,
+    truthSha256: canonicalSha256(truth), vocabularyCatalogSha256: canonicalSha256(truth.vocabulary),
+    predecessorChapterBody: body, predecessorChapterBodySha256: hash };
+}
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createRequire } from "node:module";
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
@@ -11,8 +79,8 @@ import { ArchitectAgent } from "../agents/architect.js";
 import { PlannerAgent } from "../agents/planner.js";
 import * as ComposerModule from "../agents/composer.js";
 import { WriterAgent, type SettleChapterStateInput, type WriteChapterOutput } from "../agents/writer.js";
-import { ContinuityAuditor, type AuditIssue, type AuditResult } from "../agents/continuity.js";
-import { CommercialReaderAgent } from "../agents/commercial-reader.js";
+import { ContinuityAuditor, parseContinuityAuditResponse, type AuditIssue, type AuditResult } from "../agents/continuity.js";
+import { CommercialReaderAgent, parseCommercialReaderResponse } from "../agents/commercial-reader.js";
 import { ReviserAgent, type ReviseOutput } from "../agents/reviser.js";
 import { ChapterAnalyzerAgent, type AnalyzeChapterOutput } from "../agents/chapter-analyzer.js";
 import { StateValidatorAgent } from "../agents/state-validator.js";
@@ -33,9 +101,22 @@ import {
   saveChapterUserBrief,
 } from "../state/chapter-workspace.js";
 import { correctLegacyPendingChapterArtifactBindings, createAutonomousProviderExecution, deriveAutonomousJobIdentity, resolveFormalPendingChapterRecoveryPlan, runBoundedAutonomousScope, saveAutonomousProductionState, type FormalPreservedBoundedReviewResumePlan } from "../production/bounded-autonomous-controller.js";
-import type { BoundedReviewResult } from "../pipeline/bounded-review.js";
-import { createChapterGenesis, verifyChapterCommit, verifyChapterCommitChain } from "../production/chapter-transaction.js";
+import { scoredLogicReviewFromAudit, type BoundedReviewResult } from "../pipeline/bounded-review.js";
+import {
+  beginChapterTransaction,
+  bindChapterTransactionProviderRequest,
+  createChapterGenesis,
+  recordChapterTransactionCandidate,
+  reserveChapterTransactionProviderRequest,
+  verifyChapterCommit,
+  verifyChapterCommitChain,
+  ChapterArtifactEvidenceError,
+  type FirstV2BaselineContext,
+} from "../production/chapter-transaction.js";
 import { rewriteStructuredStateFromMarkdown } from "../state/state-bootstrap.js";
+import { canonicalJson, canonicalSha256, sha256Utf8 } from "../state/canonical-json.js";
+import { createVocabularyCatalogV1 } from "../state/truth-vocabulary.js";
+import type { StructuredTruthV1 } from "../models/structured-truth.js";
 
 const require = createRequire(import.meta.url);
 const hasNodeSqlite = (() => {
@@ -305,6 +386,7 @@ async function createRunnerFixture(
   runner: PipelineRunner;
   state: StateManager;
   bookId: string;
+  setFirstV2Baseline: (baseline: FirstV2BaselineContext) => void;
 }> {
   const root = await mkdtemp(join(tmpdir(), "inkos-runner-test-"));
   const state = new StateManager(root);
@@ -352,7 +434,7 @@ async function createRunnerFixture(
     })),
   ]);
 
-  const runner = new PipelineRunner({
+  const config = {
     client: {
       provider: "openai",
       apiFormat: "chat",
@@ -366,9 +448,10 @@ async function createRunnerFixture(
     model: "test-model",
     projectRoot: root,
     ...configOverrides,
-  });
+  };
+  const runner = new PipelineRunner(config);
 
-  return { root, runner, state, bookId };
+  return { root, runner, state, bookId, setFirstV2Baseline: (baseline) => { config.firstV2Baseline = baseline; } };
 }
 
 async function seedTransactionPipeline(
@@ -429,6 +512,22 @@ async function seedTransactionPipeline(
   return { bookDir, storyDir, body };
 }
 
+function syntheticFirstV2Truth(bookId: string): StructuredTruthV1 {
+  const truth: StructuredTruthV1 = {
+    schemaVersion: "1.0", kind: "STRUCTURED_TRUTH", bookId, throughChapter: 0,
+    lineage: {
+      kind: "BASELINE", predecessorCommitSha256: "a".repeat(64), baselineSourceManifestSha256: "b".repeat(64),
+      seedVocabularyCatalogSha256: "c".repeat(64), baselineMethod: "DETERMINISTIC", baselineConstructionReceiptSha256: "d".repeat(64),
+    },
+    vocabulary: createVocabularyCatalogV1([]), entities: [], facts: [], relations: [],
+    provenance: {
+      schemaVersion: "1.0", producerKind: "BASELINE", producerId: "inkos.truth-baseline.builder.v1", producerVersion: "1.0",
+      canonicalizationId: "inkos.jcs-ijson.v1", truthSchemaVersion: "1.0", vocabularySchemaVersion: "1.0", coreVocabularyVersion: "1.0",
+    },
+  };
+  return truth;
+}
+
 describe("PipelineRunner", () => {
   beforeEach(() => {
     vi.spyOn(PlannerAgent.prototype, "planChapter").mockImplementation(async (input) => {
@@ -477,6 +576,7 @@ describe("PipelineRunner", () => {
         intentMarkdown,
         plannerInputs: [runtimePath],
         runtimePath,
+        tokenUsage: ZERO_USAGE,
       };
     });
     vi.spyOn(FoundationReviewerAgent.prototype, "review").mockResolvedValue({
@@ -509,6 +609,176 @@ describe("PipelineRunner", () => {
     vi.restoreAllMocks();
   });
 
+  it("rejects conflicting valid current-candidate approvals even when the outcome observer names one", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-terminal-review-conflict-"));
+    const bookDir = join(root, "book");
+    const responseDir = join(bookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
+    await mkdir(responseDir, { recursive: true });
+    await mkdir(join(bookDir, "story", "snapshots", "0", "state"), { recursive: true });
+    await mkdir(join(bookDir, "chapters"), { recursive: true });
+    await writeFile(join(bookDir, "chapters", "index.json"), "[]", "utf8");
+    await writeFile(join(bookDir, "story", "snapshots", "0", "state", "manifest.json"), JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 0 }), "utf8");
+    await createChapterGenesis({ bookDir, bookId: "conflict-book", lastTrustedChapter: 0, trustedSnapshotDir: join(bookDir, "story", "snapshots", "0") });
+    const transaction = await beginChapterTransaction({ bookDir, bookId: "conflict-book", chapterNumber: 1, productionAuthority: "test" });
+    const transactionId = transaction.transactionId;
+    const candidate = "current candidate body";
+    const candidateSha = sha256Utf8(candidate);
+    await recordChapterTransactionCandidate({ bookDir, transactionId, label: "INITIAL", content: candidate, sha256: candidateSha });
+    const raw = JSON.stringify({
+      total_score: 92,
+      dimension_scores: { opening_hook: 92, pacing_tension: 92, emotional_investment: 92, plot_clarity: 92, dialogue_appeal: 92, western_cultural_naturalness: 92, commercial_appeal: 92, ending_hook: 92 },
+      decision: "APPROVED", findings: [],
+    });
+    const ids = ["a".repeat(64), "b".repeat(64)].map((hash) => `provider-step-${hash}`);
+    const routes = [
+      { provider: "custom-a", model: "reader-model-a" },
+      { provider: "custom-b", model: "reader-model-b" },
+    ] as const;
+    for (const [index, logicalOperationId] of ids.entries()) {
+      const route = routes[index]!;
+      const reservation = await reserveChapterTransactionProviderRequest({
+        bookDir, transactionId, chapterNumber: 1, candidateSha256: candidateSha,
+        role: "commercial-reader", stage: "READER_REVIEW", requestOrdinal: index, reviewLanguage: "en",
+        request: { ...route, messages: [{ role: "user", content: `Candidate:\n${candidate}` }], temperature: 0.2, maxTokens: 4096, stream: false, webSearch: false, extra: {} },
+      });
+      const artifact = {
+        schema_version: "1.0", job_id: "conflict", logical_step_id: logicalOperationId, usage_identity: logicalOperationId,
+        transaction_id: transactionId, chapter_number: 1, role: "commercial-reader", stage: "READER_REVIEW",
+        provider: route.provider, requested_model: route.model, input_fingerprint: reservation.providerInputFingerprint,
+        response_artifact_status: "COMPLETE", content_sha256: sha256Utf8(raw), response: { content: raw, usage: ZERO_USAGE },
+      };
+      const bytes = Buffer.from(JSON.stringify(artifact));
+      await writeFile(join(responseDir, `${logicalOperationId}.json`), bytes);
+      await bindChapterTransactionProviderRequest({
+        bookDir, transactionId, reservationId: reservation.reservationId,
+        providerReference: {
+          transactionId, logicalOperationId, chapterNumber: 1, role: "commercial-reader", stage: "READER_REVIEW",
+          provider: route.provider, requestedModel: route.model, inputFingerprint: reservation.providerInputFingerprint,
+          artifactRelativePath: `story/runtime/bounded-autonomous/provider-responses/${logicalOperationId}.json`,
+          artifactSha256: sha256Utf8(bytes.toString()), responseContentSha256: sha256Utf8(raw), responseArtifactStatus: "COMPLETE",
+        },
+      });
+    }
+    const parsed = parseCommercialReaderResponse(raw, { candidateSha, provider: routes[0].provider, model: routes[0].model });
+    const { reviewedAt: _reviewedAt, tokenUsage: _tokenUsage, ...stableReview } = parsed;
+    const runner = new PipelineRunner({
+      client: { provider: "openai", service: routes[0].provider, apiFormat: "chat", stream: false, defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} } } as never,
+      model: routes[0].model, projectRoot: root,
+    });
+    vi.spyOn(runner as never, "pathExists" as never).mockResolvedValue(false as never);
+    const resolve = (runner as unknown as { resolveTerminalReviewProviderEvidence(input: unknown): Promise<unknown> }).resolveTerminalReviewProviderEvidence.bind(runner);
+    try {
+      await expect(resolve({
+        role: "commercial-reader", stage: "READER_REVIEW",
+        outcome: { modelCallId: ids[0], provider: routes[0].provider, model: routes[0].model },
+        fallbackProvider: routes[0].provider, fallbackModel: routes[0].model, stableReview,
+        expectedInputFingerprint: (await reserveChapterTransactionProviderRequest({
+          bookDir, transactionId, chapterNumber: 1, candidateSha256: candidateSha,
+          role: "commercial-reader", stage: "READER_REVIEW", requestOrdinal: 0, reviewLanguage: "en",
+          request: { ...routes[0], messages: [{ role: "user", content: `Candidate:\n${candidate}` }], temperature: 0.2, maxTokens: 4096, stream: false, webSearch: false, extra: {} },
+        })).providerInputFingerprint,
+        reviewLanguage: "en",
+        bookDir, transactionId, chapterNumber: 1,
+      })).rejects.toThrow(/ambiguous|conflicting|multiple/i);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("types custom canonical evidence resolver failures as artifact evidence defects", async () => {
+    const runner = new PipelineRunner({
+      client: { provider: "openai", service: "custom", apiFormat: "chat", stream: false, defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} } } as never,
+      model: "model", projectRoot: "/tmp/inkos-custom-resolver-defect",
+      canonicalTruthEvidenceResolver: async () => { throw new Error("resolver transport record unreadable"); },
+    });
+    const resolve = (runner as unknown as { resolveCanonicalTruthEvidence(input: unknown): Promise<unknown> }).resolveCanonicalTruthEvidence.bind(runner);
+    await expect(resolve({
+      role: "truth-extractor", stage: "TRUTH_EXTRACTION", logicalOperationId: "",
+      provider: "custom", model: "model", responseContent: "{}", bookDir: "/tmp/unused",
+      transactionId: "txn", chapterNumber: 1, expectedInputFingerprint: "a".repeat(64),
+    })).rejects.toBeInstanceOf(ChapterArtifactEvidenceError);
+  });
+
+  it.each([
+    { reviewLanguage: "zh" as const, expectedFallback: "未分类" },
+    { reviewLanguage: "en" as const, expectedFallback: "Uncategorized" },
+  ])("binds $reviewLanguage Logic raw evidence to its exact parse language after a malformed attempt", async ({ reviewLanguage, expectedFallback }) => {
+    const root = await mkdtemp(join(tmpdir(), `inkos-terminal-review-${reviewLanguage}-`));
+    const bookDir = join(root, "book");
+    const responseDir = join(bookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
+    await mkdir(responseDir, { recursive: true });
+    await mkdir(join(bookDir, "story", "snapshots", "0", "state"), { recursive: true });
+    await mkdir(join(bookDir, "chapters"), { recursive: true });
+    await writeFile(join(bookDir, "chapters", "index.json"), "[]", "utf8");
+    await writeFile(join(bookDir, "story", "snapshots", "0", "state", "manifest.json"), JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 0 }), "utf8");
+    await createChapterGenesis({ bookDir, bookId: `language-${reviewLanguage}`, lastTrustedChapter: 0, trustedSnapshotDir: join(bookDir, "story", "snapshots", "0") });
+    const transaction = await beginChapterTransaction({ bookDir, bookId: `language-${reviewLanguage}`, chapterNumber: 1, productionAuthority: "test" });
+    const transactionId = transaction.transactionId;
+    const candidate = `current ${reviewLanguage} candidate`;
+    const candidateSha = sha256Utf8(candidate);
+    await recordChapterTransactionCandidate({ bookDir, transactionId, label: "INITIAL", content: candidate, sha256: candidateSha });
+    const request = {
+      provider: "custom", model: "logic-model",
+      messages: [{ role: "user" as const, content: `${reviewLanguage === "zh" ? "## 待审章节内容" : "## Chapter Content Under Review"}\n${candidate}` }],
+      temperature: 0.3, maxTokens: 4096, stream: false, webSearch: false, extra: {},
+    };
+    const malformed = "not-json";
+    const raw = JSON.stringify({
+      passed: true,
+      overall_score: 92,
+      dimension_scores: { blueprint_transition: 92, causal_logic: 92, canon_continuity: 92, character_motivation: 92, state_inheritance: 92, hooks_disclosure: 92, narrative_clarity: 92 },
+      issues: [{ severity: "warning", description: "verified", suggestion: "retain" }],
+      summary: "approved",
+    });
+    const ids = ["a".repeat(64), "b".repeat(64)].map((hash) => `provider-step-${hash}`);
+    let inputFingerprint = "";
+    for (const [index, logicalOperationId] of ids.entries()) {
+      const responseContent = index === 0 ? malformed : raw;
+      const reservation = await reserveChapterTransactionProviderRequest({
+        bookDir, transactionId, chapterNumber: 1, candidateSha256: candidateSha,
+        role: "logic-canon-auditor", stage: "LOGIC_REVIEW", requestOrdinal: index, reviewLanguage, request,
+      });
+      inputFingerprint = reservation.providerInputFingerprint;
+      const bytes = JSON.stringify({
+        schema_version: "1.0", job_id: "language", logical_step_id: logicalOperationId, usage_identity: logicalOperationId,
+        transaction_id: transactionId, chapter_number: 1, role: "logic-canon-auditor", stage: "LOGIC_REVIEW",
+        provider: "custom", requested_model: "logic-model", input_fingerprint: inputFingerprint,
+        response_artifact_status: "COMPLETE", content_sha256: sha256Utf8(responseContent), response: { content: responseContent },
+      });
+      await writeFile(join(responseDir, `${logicalOperationId}.json`), bytes, "utf8");
+      await bindChapterTransactionProviderRequest({
+        bookDir, transactionId, reservationId: reservation.reservationId,
+        providerReference: {
+          transactionId, logicalOperationId, chapterNumber: 1, role: "logic-canon-auditor", stage: "LOGIC_REVIEW",
+          provider: "custom", requestedModel: "logic-model", inputFingerprint,
+          artifactRelativePath: `story/runtime/bounded-autonomous/provider-responses/${logicalOperationId}.json`,
+          artifactSha256: sha256Utf8(bytes), responseContentSha256: sha256Utf8(responseContent), responseArtifactStatus: "COMPLETE",
+        },
+      });
+    }
+    const parsed = scoredLogicReviewFromAudit(parseContinuityAuditResponse(raw, reviewLanguage), {
+      candidateSha, provider: "custom", model: "logic-model",
+    });
+    const { reviewedAt: _reviewedAt, tokenUsage: _tokenUsage, ...stableReview } = parsed;
+    expect(stableReview.findings).toContainEqual(expect.objectContaining({ impact: expectedFallback }));
+    const runner = new PipelineRunner({
+      client: { provider: "openai", service: "custom", apiFormat: "chat", stream: false, defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} } } as never,
+      model: "logic-model", projectRoot: root,
+    });
+    const resolve = (runner as unknown as { resolveTerminalReviewProviderEvidence(input: unknown): Promise<{ logicalOperationId: string }> }).resolveTerminalReviewProviderEvidence.bind(runner);
+    try {
+      await expect(resolve({
+        role: "logic-canon-auditor", stage: "LOGIC_REVIEW",
+        outcome: { modelCallId: ids[1], provider: "custom", model: "logic-model" },
+        fallbackProvider: "custom", fallbackModel: "logic-model", stableReview,
+        expectedInputFingerprint: inputFingerprint, reviewLanguage,
+        bookDir, transactionId, chapterNumber: 1,
+      })).resolves.toMatchObject({ logicalOperationId: ids[1] });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("blocks revise, repair, and resync for Genesis authority before model or persistence work", async () => {
     const { runner, state, bookId } = await createRunnerFixture();
     const bookDir = state.bookDir(bookId);
@@ -534,11 +804,76 @@ describe("PipelineRunner", () => {
     await expect(readFile(join(bookDir, "chapters", "0001_Legacy.md"), "utf-8")).resolves.toContain("immutable legacy body");
   });
 
-  it("stages a transaction-enabled chapter and promotes one verified commit before cursor advance", async () => {
+  it.each(["fresh", "valid", "missing", "tampered", "wrong-binding", "wrong-candidate", "wrong-transaction", "ambiguous"] as const)("two-P1 N1 cached prose %s: commits omitted-language zh V2 only with exact Provider authority", async (cacheMode) => {
     let artifactBookDir = "";
     const stages: Array<{ stage: string; role: string; model?: string; transactionId?: string }> = [];
-    const { root, runner, state, bookId } = await createRunnerFixture({
+    const { root, runner, state, bookId, setFirstV2Baseline } = await createRunnerFixture({
       boundedAutonomousReview: true,
+      canonicalTruthEvidenceResolver: async ({ role, stage, responseContent, transactionId, chapterNumber, bookDir, provider, model, expectedInputFingerprint }) => {
+        const stableReview = (role === "logic-canon-auditor" || role === "commercial-reader")
+          ? JSON.parse(responseContent) as {
+              readonly dimensionScores: Readonly<Record<string, number>>;
+              readonly decision: string;
+              readonly findings: ReadonlyArray<{
+                readonly findingId: string;
+                readonly severity: string;
+                readonly evidence: string;
+                readonly impact: string;
+                readonly requiredOutcome: string;
+                readonly repairScope?: string;
+              }>;
+              readonly totalScore: number;
+            }
+          : undefined;
+        const rawResponse = role === "logic-canon-auditor" && stableReview
+          ? JSON.stringify({
+              passed: stableReview.decision === "APPROVED" || stableReview.decision === "APPROVED_WITH_NOTES",
+              overall_score: stableReview.totalScore,
+              dimension_scores: stableReview.dimensionScores,
+              issues: stableReview.findings.map((finding) => ({
+                severity: finding.severity === "CRITICAL" ? "critical" : finding.severity === "MAJOR" ? "major" : finding.severity === "MINOR" ? "warning" : "info",
+                category: finding.impact,
+                description: finding.evidence,
+                suggestion: finding.requiredOutcome,
+                ...(finding.repairScope ? { repair_scope: finding.repairScope } : {}),
+              })),
+              summary: "fixture review",
+            })
+          : role === "commercial-reader" && stableReview
+            ? JSON.stringify({
+                reviewer_role: "commercial-reader",
+                total_score: stableReview.totalScore,
+                dimension_scores: stableReview.dimensionScores,
+                decision: stableReview.decision,
+                findings: stableReview.findings.map((finding) => ({
+                  finding_id: finding.findingId,
+                  severity: finding.severity,
+                  evidence: finding.evidence,
+                  impact: finding.impact,
+                  required_outcome: finding.requiredOutcome,
+                })),
+              })
+            : responseContent;
+        const inputFingerprint = expectedInputFingerprint ?? sha256Utf8(`${transactionId}:${stage}:${role}:input`);
+        const logicalOperationId = `provider-step-${sha256Utf8(`${transactionId}:${stage}:${role}:${inputFingerprint}`)}`;
+        const providerUsage = role === "truth-extractor"
+          ? { promptTokens: 2, completionTokens: 3, totalTokens: 5, actualCostUsd: 0.125 }
+          : role === "truth-validator"
+            ? { promptTokens: 1, completionTokens: 1, totalTokens: 2, actualCostUsd: 0 }
+            : ZERO_USAGE;
+        const artifact = {
+          schema_version: "1.0", job_id: "pipeline-test-job", logical_step_id: logicalOperationId, usage_identity: logicalOperationId,
+          transaction_id: transactionId, chapter_number: chapterNumber, role, stage,
+          provider, requested_model: model, input_fingerprint: inputFingerprint,
+          response_artifact_status: "COMPLETE", content_sha256: sha256Utf8(rawResponse),
+          response: { content: rawResponse, usage: providerUsage }, completed_at: "2026-08-28T00:00:00.000Z",
+        };
+        const bytes = Buffer.from(`${JSON.stringify(artifact, null, 2)}\n`, "utf8");
+        const dir = join(bookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, `${logicalOperationId}.json`), bytes);
+        return { logicalOperationId, inputFingerprint, providerArtifactSha256: createHash("sha256").update(bytes).digest("hex"), responseContentSha256: sha256Utf8(rawResponse) };
+      },
       modelOverrides: {
         "chapter-analyzer": "distinct-chapter-analyzer-model",
         "state-validator": "distinct-state-validator-model",
@@ -559,7 +894,7 @@ describe("PipelineRunner", () => {
           transaction_id: event.transactionId, chapter_number: 1, role: event.role, stage: event.stage,
           provider: event.provider, requested_model: event.model, input_fingerprint: inputFingerprint,
           response_artifact_status: "COMPLETE", content_sha256: createHash("sha256").update(content).digest("hex"),
-          response: { content }, completed_at: "2026-08-28T00:00:00.000Z",
+          response: { content, usage: ZERO_USAGE }, completed_at: "2026-08-28T00:00:00.000Z",
         };
         const dir = join(artifactBookDir, "story", "runtime", "bounded-autonomous", "provider-responses");
         await mkdir(dir, { recursive: true });
@@ -569,13 +904,14 @@ describe("PipelineRunner", () => {
     const bookDir = state.bookDir(bookId);
     artifactBookDir = bookDir;
     const storyDir = join(bookDir, "story");
-    const body = englishWords(2200, "chapter");
+    const body = "章".repeat(2200);
+    const repairedBody = "修".repeat(2200);
     const dimensions = {
       blueprint_transition: 92, causal_logic: 92, canon_continuity: 92, character_motivation: 92,
       state_inheritance: 92, hooks_disclosure: 92, narrative_clarity: 92,
     };
     try {
-      await state.saveBookConfig(bookId, { ...(await state.loadBookConfig(bookId)), language: "en", chapterWordCount: 2200 });
+      await state.saveBookConfig(bookId, { ...(await state.loadBookConfig(bookId)), chapterWordCount: 2200 });
       await Promise.all([
         writeFile(join(storyDir, "current_state.md"), createStateCard({ chapter: 0, location: "Gate", protagonistState: "Ready", goal: "Begin", conflict: "Clock" })),
         writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n"),
@@ -595,6 +931,10 @@ describe("PipelineRunner", () => {
           "# Test Book — Volume I Chapter Blueprint Set v1.1", "Closure: the gate opens.",
           "## Chapter 001 — Open the Gate", "Open the gate.",
           "## Chapter 002 — Follow the Clock", "Follow the clock.",
+          ...Array.from({ length: 8 }, (_, index) => [
+            `## Chapter ${String(index + 3).padStart(3, "0")} — Continue the Gate`,
+            `Continue gate pressure in chapter ${index + 3}.`,
+          ]).flat(),
         ].join("\n")),
         writeFile(join(storyDir, "outline", "book-production-map.json"), JSON.stringify({
           schema_version: "1.0", book_id: bookId, authority_book_id: "authority", title: "Test Book", total_chapters: 10,
@@ -604,23 +944,68 @@ describe("PipelineRunner", () => {
       const outlineSelector = vi.spyOn(ComposerModule.ComposerAgent.prototype, "selectOutlineSections");
       const memorySelector = vi.spyOn(ComposerModule.ComposerAgent.prototype, "selectMemoryCandidates");
       await state.snapshotState(bookId, 0);
-      await createChapterGenesis({ bookDir, bookId, lastTrustedChapter: 0, trustedSnapshotDir: join(storyDir, "snapshots", "0"), createdAt: "2026-08-28T00:00:00.000Z" });
-      const writeChapter = vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(createWriterOutput({
-        chapterNumber: 1, title: "Transaction One", content: body, wordCount: 2200,
-        updatedState: createStateCard({ chapter: 1, location: "Gate", protagonistState: "Moving", goal: "Proceed", conflict: "Clock" }),
+      const genesis = await createChapterGenesis({ bookDir, bookId, lastTrustedChapter: 0, trustedSnapshotDir: join(storyDir, "snapshots", "0"), createdAt: "2026-08-28T00:00:00.000Z" });
+      const firstV2Baseline = await installLegacyBaseline(bookDir, syntheticFirstV2Truth(bookId));
+      setFirstV2Baseline(firstV2Baseline);
+      const writeChapter = vi.spyOn(WriterAgent.prototype, "writeChapter").mockImplementation(async (input) => createWriterOutput({
+        chapterNumber: input.chapterNumber, title: `Transaction ${input.chapterNumber}`, content: body, wordCount: 2200,
+        updatedState: createStateCard({ chapter: input.chapterNumber, location: "Gate", protagonistState: "Moving", goal: "Proceed", conflict: "Clock" }),
         updatedHooks: "# Pending Hooks\n",
       }));
-      vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockResolvedValue(createAuditResult({ passed: true, overallScore: 92, dimensionScores: dimensions }));
       const semanticAdjudication = vi.spyOn(ContinuityAuditor.prototype, "adjudicateSemanticAuthority");
-      vi.spyOn(CommercialReaderAgent.prototype, "reviewChapter").mockImplementation(async (input) => ({
-        reviewerRole: "commercial-reader", provider: "openai", model: "test-model", totalScore: 90,
-        dimensionScores: { opening_hook: 90, pacing_tension: 90, emotional_investment: 90, plot_clarity: 90, dialogue_appeal: 90, western_cultural_naturalness: 90, commercial_appeal: 90, ending_hook: 90 },
-        decision: "APPROVED", findings: [], reviewedCandidateSha: input.candidateSha,
-        reviewedAt: "2026-08-28T00:00:00.000Z", tokenUsage: ZERO_USAGE,
-      }));
+      const logicProviderMessages: Array<ReadonlyArray<{ role: string; content: string }>> = [];
+      const readerProviderMessages: Array<ReadonlyArray<{ role: string; content: string }>> = [];
+      let validatorTransportCount = 0;
+      const providerTransport = vi.spyOn(llmProvider, "chatCompletion").mockImplementation(async (_client, _model, messages) => {
+        if (messages.some((message) => message.content.includes("## 待审章节内容"))) {
+          logicProviderMessages.push(structuredClone(messages));
+          return {
+            content: JSON.stringify({
+              passed: true,
+              overall_score: 92,
+              dimension_scores: dimensions,
+              issues: [],
+              summary: "真实中文逻辑审稿通过",
+            }),
+            usage: ZERO_USAGE,
+          };
+        }
+        if (messages[0]?.content.includes("independent commercial reader")) {
+          readerProviderMessages.push(structuredClone(messages));
+          return {
+            content: JSON.stringify({
+              reviewer_role: "commercial-reader",
+              total_score: 90,
+              dimension_scores: { opening_hook: 90, pacing_tension: 90, emotional_investment: 90, plot_clarity: 90, dialogue_appeal: 90, western_cultural_naturalness: 90, commercial_appeal: 90, ending_hook: 90 },
+              decision: "APPROVED",
+              findings: [],
+            }),
+            usage: ZERO_USAGE,
+          };
+        }
+        const isExtractor = messages[0]?.content.includes("sole model-facing Truth Extractor");
+        if (isExtractor) {
+          return {
+            content: JSON.stringify({ schemaVersion: "1.0", kind: "CHAPTER_DELTA_PROPOSAL", status: "READY", operations: [], evidence: [], ambiguities: [] }),
+            usage: { promptTokens: 2, completionTokens: 3, totalTokens: 5, actualCostUsd: 0.125 },
+          };
+        }
+        validatorTransportCount += 1;
+        return {
+          content: validatorTransportCount === 1
+            ? '{"verdict":"PROSE_CONTENT_DEFECT","diagnostics":["repair exact prose"]}'
+            : '{"verdict":"PASS","diagnostics":[]}',
+          usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2, actualCostUsd: 0 },
+        };
+      });
+      if (cacheMode === "fresh" || cacheMode === "valid") {
+        vi.mocked(ReviserAgent.prototype.reviseChapter).mockResolvedValueOnce(createReviseOutput({ revisedContent: repairedBody, wordCount: 2200 }));
+      } else {
+        vi.mocked(ReviserAgent.prototype.reviseChapter).mockRejectedValueOnce(new Error("UNVERIFIED_CACHED_PROSE_REVISER_EFFECT"));
+      }
       const analyzeChapter = vi.spyOn(ChapterAnalyzerAgent.prototype, "analyzeChapter").mockResolvedValue(createAnalyzedOutput({
-        chapterNumber: 1, title: "Transaction One", content: body, wordCount: 2200,
-        updatedState: createStateCard({ chapter: 1, location: "Gate", protagonistState: "Moving", goal: "Proceed", conflict: "Clock" }),
+        chapterNumber: 2, title: "Transaction One", content: body, wordCount: 2200,
+        updatedState: createStateCard({ chapter: 2, location: "Gate", protagonistState: "Moving", goal: "Proceed", conflict: "Clock" }),
         updatedHooks: "# Pending Hooks\n",
         tokenUsage: { promptTokens: 2, completionTokens: 3, totalTokens: 5, actualCostUsd: 0.01 },
       }));
@@ -639,27 +1024,71 @@ describe("PipelineRunner", () => {
           tokenUsage: { promptTokens: 1, completionTokens: 1, totalTokens: 2, actualCostUsd: 0.04 },
         });
       vi.mocked(WriterAgent.prototype.settleChapterState).mockResolvedValue(createWriterOutput({
-        chapterNumber: 1, title: "Transaction One", content: body, wordCount: 2200,
-        updatedState: createStateCard({ chapter: 1, location: "Gate", protagonistState: "Moving", goal: "Proceed", conflict: "Clock" }),
+        chapterNumber: 2, title: "Transaction One", content: body, wordCount: 2200,
+        updatedState: createStateCard({ chapter: 2, location: "Gate", protagonistState: "Moving", goal: "Proceed", conflict: "Clock" }),
         updatedHooks: "# Pending Hooks\n",
         tokenUsage: { promptTokens: 4, completionTokens: 6, totalTokens: 10, actualCostUsd: 0.02 },
       }));
 
+      const realSettlement = runner.runCanonicalTruthSettlement.bind(runner);
+      let replayed = false;
+      const settlement = vi.spyOn(runner, "runCanonicalTruthSettlement").mockImplementation(async (input) => {
+        const result = await realSettlement(input);
+        if (cacheMode === "fresh" || replayed || result.status !== "PROSE_CONTENT_DEFECT") return result;
+        replayed = true;
+        const truthRoot = join(bookDir, "story/runtime/chapter-transactions/chapter-0002/staging/evidence/truth", sha256Utf8(body), "initial");
+        const semantic = JSON.parse(await readFile(join(truthRoot, "semantic-validation.json"), "utf8"));
+        const providerPath = join(bookDir, "story/runtime/bounded-autonomous/provider-responses", `${semantic.logicalOperationId}.json`);
+        if (cacheMode === "missing") await rm(providerPath);
+        if (["tampered", "wrong-transaction", "ambiguous"].includes(cacheMode)) {
+          const provider = JSON.parse(await readFile(providerPath, "utf8"));
+          if (cacheMode === "tampered") provider.response.content = "tampered semantic response";
+          if (cacheMode === "wrong-transaction") provider.transaction_id = "another-transaction";
+          if (cacheMode === "ambiguous") provider.response_artifact_status = "AMBIGUOUS";
+          await writeFile(providerPath, `${JSON.stringify(provider, null, 2)}\n`);
+        }
+        if (cacheMode === "wrong-binding" || cacheMode === "wrong-candidate") {
+          const requestRoot = join(bookDir, "story/runtime/chapter-transactions/chapter-0002/staging/evidence/provider-requests");
+          for (const name of await readdir(join(requestRoot, "reservations"))) {
+            const reservationPath = join(requestRoot, "reservations", name);
+            const reservation = JSON.parse(await readFile(reservationPath, "utf8"));
+            if (reservation.role !== "truth-validator") continue;
+            if (cacheMode === "wrong-candidate") {
+              reservation.candidateSha256 = "e".repeat(64);
+              await writeFile(reservationPath, `${JSON.stringify(reservation, null, 2)}\n`);
+            } else {
+              const bindingPath = join(requestRoot, "bindings", name);
+              const binding = JSON.parse(await readFile(bindingPath, "utf8"));
+              binding.providerReference.inputFingerprint = "f".repeat(64);
+              await writeFile(bindingPath, `${JSON.stringify(binding, null, 2)}\n`);
+            }
+          }
+        }
+        // Replay the actual durable cached defect before public Runner can authorize Reviser.
+        return realSettlement(input);
+      });
+      if (cacheMode !== "fresh" && cacheMode !== "valid") {
+        await expect(runner.writeNextChapter(bookId, 2200)).rejects.toThrow(/ARTIFACT_EVIDENCE_DEFECT/);
+        expect(replayed).toBe(true);
+        expect(vi.mocked(ReviserAgent.prototype.reviseChapter)).not.toHaveBeenCalled();
+        expect(validatorTransportCount).toBe(1);
+        await expect(stat(join(bookDir, "story/commits/chapter-0002"))).rejects.toThrow();
+        return;
+      }
       const result = await runner.writeNextChapter(bookId, 2200);
+      expect(vi.mocked(ReviserAgent.prototype.reviseChapter)).toHaveBeenCalledTimes(1);
       expect(result.status).toBe("ready-for-review");
+      expect(result.auditResult.overallScore).toBe(91);
       expect(writeChapter).toHaveBeenCalledWith(expect.objectContaining({ deferStateSettlement: true }));
-      expect(analyzeChapter).toHaveBeenCalledTimes(1);
+      expect(analyzeChapter).not.toHaveBeenCalled();
       expect(semanticAdjudication).not.toHaveBeenCalled();
-      expect(analyzeChapter).toHaveBeenCalledWith(expect.objectContaining({ chapterContent: body }));
-      const commit = await verifyChapterCommit({ bookDir, chapterNumber: 1 });
+      const commit = await verifyChapterCommit({ bookDir, chapterNumber: 2 });
+      expect(commit.kind).toBe("TRUTH_CHAPTER_COMMIT");
       expect(commit.finalLengthCount).toBe(2200);
       expect(commit.providerReferenceCount).toBeGreaterThanOrEqual(5);
-      const committedUsage = JSON.parse(await readFile(join(bookDir, "story", "commits", "chapter-0001", "usage.json"), "utf-8"));
-      expect(committedUsage.roleUsage).toMatchObject({
-        "final-state-extractor": { promptTokens: 6, completionTokens: 9, totalTokens: 15, actualCostUsd: 0.03 },
-        "state-validator": { promptTokens: 8, completionTokens: 12, totalTokens: 20, actualCostUsd: 0.07 },
-      });
-      expect(committedUsage.totalUsage).toMatchObject({ promptTokens: 14, completionTokens: 21, totalTokens: 35 });
+      expect(providerTransport).toHaveBeenCalledTimes(8);
+      expect(logicProviderMessages).toHaveLength(2);
+      expect(readerProviderMessages).toHaveLength(2);
       expect(stages[0]).toMatchObject({ stage: "PREPARING", transactionId: expect.stringMatching(/^chapter-txn-/u) });
       const preparingModelCallRoles = stages
         .filter((event) => event.stage === "PREPARING" && event.role !== "writer")
@@ -668,25 +1097,64 @@ describe("PipelineRunner", () => {
       expect(vi.mocked(PlannerAgent.prototype.planChapter)).toHaveBeenCalledTimes(1);
       expect(outlineSelector).not.toHaveBeenCalled();
       expect(memorySelector).not.toHaveBeenCalled();
-      expect(stages.filter((event) => event.stage === "SETTLING_STATE").map((event) => event.role)).toEqual(expect.arrayContaining([
-        "final-state-extractor",
-        "state-validator",
-        "final-state-extractor-settlement-repair",
-        "state-validator-settlement-repair",
-      ]));
-      expect(stages.find((event) => event.role === "final-state-extractor")?.model).toBe("distinct-chapter-analyzer-model");
-      expect(stages.find((event) => event.role === "state-validator")?.model).toBe("distinct-state-validator-model");
+      expect(stages.filter((event) => event.stage === "SETTLING_STATE")).toHaveLength(0);
+      expect(stages.filter((event) => event.stage === "TRUTH_EXTRACTION")).toHaveLength(2);
+      expect(stages.filter((event) => event.stage === "TRUTH_VALIDATION")).toHaveLength(2);
+      expect(settlement).toHaveBeenCalledTimes(2);
+      const committedAuthorityBytes = settlement.mock.calls.map((call) => call[0].committedAuthority);
+      expect(committedAuthorityBytes[1]).toBe(committedAuthorityBytes[0]);
+      const committedAuthority = JSON.parse(committedAuthorityBytes[0]!);
+      expect(committedAuthorityBytes[0]).toBe(canonicalJson(committedAuthority));
+      expect(committedAuthority).toMatchObject({
+        kind: "CANONICAL_TRUTH_COMMITTED_AUTHORITY",
+        structuredTruth: firstV2Baseline.truth,
+        storyFrame: expect.stringContaining("Story Frame"),
+        volumeMap: expect.stringContaining("Volume Map"),
+        chapterIntent: expect.any(Object),
+      });
+      expect(vi.mocked(ReviserAgent.prototype.reviseChapter)).toHaveBeenCalledWith(
+        bookDir, body, 2, expect.any(Array), "auto", expect.any(String),
+        expect.objectContaining({ authoritativeTruth: firstV2Baseline.truth, predecessorChapterBody: firstV2Baseline.predecessorChapterBody }),
+      );
       const logicEvidenceDir = join(
-        bookDir, "story", "runtime", "chapter-transactions", "chapter-0001", "staging", "evidence",
+        bookDir, "story", "runtime", "chapter-transactions", "chapter-0002", "staging", "evidence",
         "reviews", commit.finalBodySha256, "logic-canon-auditor",
       );
       const logicEvidenceFiles = await readdir(logicEvidenceDir);
       expect(logicEvidenceFiles).toHaveLength(1);
       await expect(readFile(join(logicEvidenceDir, logicEvidenceFiles[0]!), "utf-8")).resolves.toContain(commit.finalBodySha256);
       await expect(readFile(join(
-        bookDir, "story", "runtime", "chapter-transactions", "chapter-0001", "staging", "evidence", "review-result.json",
+        bookDir, "story", "runtime", "chapter-transactions", "chapter-0002", "staging", "evidence", "review-result.json",
       ), "utf-8")).resolves.toContain('"status": "APPROVED"');
-      expect(await state.getNextChapterNumber(bookId)).toBe(2);
+      expect(await state.getNextChapterNumber(bookId)).toBe(3);
+      const committedBytes = await readFile(join(bookDir, "story", "commits", "chapter-0002", "commit.json"));
+      await expect(runner.repairChapterState(bookId, 2)).rejects.toThrow(/V2_CANONICAL_TRUTH_MANUAL_REPAIR_REQUIRED|TRANSACTION_AUTHORITY_MUTATION_FORBIDDEN/u);
+      await expect(runner.resyncChapterArtifacts(bookId, 2)).rejects.toThrow(/V2_CANONICAL_TRUTH_MANUAL_REPAIR_REQUIRED|TRANSACTION_AUTHORITY_MUTATION_FORBIDDEN/u);
+      await expect(runner.resyncChapterStateAndAudit(bookId, 2)).rejects.toThrow(/V2_CANONICAL_TRUTH_MANUAL_REPAIR_REQUIRED|TRANSACTION_AUTHORITY_MUTATION_FORBIDDEN/u);
+      await expect(readFile(join(bookDir, "story", "commits", "chapter-0002", "commit.json"))).resolves.toEqual(committedBytes);
+      expect(vi.mocked(StateValidatorAgent.prototype.validate)).not.toHaveBeenCalled();
+      expect(vi.mocked(WriterAgent.prototype.settleChapterState)).not.toHaveBeenCalled();
+      const commitRoot = join(bookDir, "story", "commits", "chapter-0002");
+      const logicReservation = JSON.parse(await readFile(join(commitRoot, "logic-review-request-reservation.json"), "utf8"));
+      const readerReservation = JSON.parse(await readFile(join(commitRoot, "commercial-review-request-reservation.json"), "utf8"));
+      expect(logicReservation.reviewLanguage).toBe("zh");
+      expect(logicReservation.request.messages.at(-1)?.content).toContain(`## 待审章节内容\n${repairedBody}`);
+      expect(logicReservation.request.messages).toEqual(logicProviderMessages.at(-1));
+      expect(readerReservation.reviewLanguage).toBe("en");
+      expect(readerReservation.request.messages.at(-1)?.content).toContain(`Candidate:\n${repairedBody}`);
+      expect(readerReservation.request.messages).toEqual(readerProviderMessages.at(-1));
+      const committedUsage = JSON.parse(await readFile(join(commitRoot, "usage.json"), "utf8"));
+      expect(committedUsage.roleUsage["truth-extractor"].actualCostUsd).toBe(0.25);
+      expect(committedUsage.roleUsage["truth-validator"].actualCostUsd).toBe(0);
+
+      settlement.mockResolvedValueOnce({
+        status: "DELTA_EXTRACTION_DEFECT",
+        diagnostics: ["non-prose Truth defect"],
+        usageByRole: {},
+      } as never);
+      await expect(runner.writeNextChapter(bookId, 2200))
+        .rejects.toThrow("CANONICAL_TRUTH_DELTA_EXTRACTION_DEFECT");
+      await expect(stat(join(bookDir, "story", "commits", "chapter-0003"))).rejects.toThrow();
     } finally {
       await rm(root, { recursive: true, force: true });
     }

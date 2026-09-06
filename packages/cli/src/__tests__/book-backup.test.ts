@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -33,6 +33,37 @@ async function setupBook(bookId: string): Promise<string> {
 const fixedClock = (iso: string) => () => new Date(iso);
 
 describe("book backup module", () => {
+  it("preflights backup source junctions before creating any backup", async () => {
+    const bookDir = await setupBook("source-junction");
+    const outside = join(projectRoot, "outside");
+    await mkdir(outside);
+    await writeFile(join(outside, "retained.txt"), "outside");
+    await symlink(outside, join(bookDir, "story/redirect"), "junction");
+    await expect(createBookBackup(projectRoot, "source-junction")).rejects.toThrow("UNSAFE_PATH_COMPONENT");
+    expect(await listBookBackups(projectRoot, "source-junction")).toEqual([]);
+  });
+  it("rejects a junction in backup contents before replacing the legacy destination", async () => {
+    const bookDir = await setupBook("junction-book");
+    const backup = await createBookBackup(projectRoot, "junction-book", { now: fixedClock("2026-07-15T08:12:33Z") });
+    const otherBook = join(projectRoot, "books/other-book");
+    await mkdir(otherBook);
+    await writeFile(join(otherBook, "protected.txt"), "private");
+    await symlink(otherBook, join(backup.path, "story/escape"), "junction");
+    await expect(restoreBookBackup(projectRoot, "junction-book", backup.backupId)).rejects.toThrow("UNSAFE_PATH_COMPONENT");
+    expect(await readFile(join(bookDir, "story/current_state.md"), "utf8")).toBe("原始状态");
+    expect(await readFile(join(otherBook, "protected.txt"), "utf8")).toBe("private");
+    expect(await listBookBackups(projectRoot, "junction-book")).toHaveLength(1);
+  });
+  it("rejects restore before backup or replacement when active canonical cutover evidence is unprovable", async () => {
+    const bookDir = await setupBook("protected-book");
+    const backup = await createBookBackup(projectRoot, "protected-book", { now: fixedClock("2026-07-15T08:12:33Z") });
+    await mkdir(join(bookDir, "story/runtime/chapter-transactions/chapter-0001"), { recursive: true });
+    const transactionPath = join(bookDir, "story/runtime/chapter-transactions/chapter-0001/transaction.json");
+    await writeFile(transactionPath, '{"truthMode":"CANONICAL_V2"}');
+    await expect(restoreBookBackup(projectRoot, "protected-book", backup.backupId)).rejects.toThrow(/TRUTH_CUTOVER|TRUTH_AUTHORITY/);
+    expect(await readFile(transactionPath, "utf8")).toBe('{"truthMode":"CANONICAL_V2"}');
+    expect(await listBookBackups(projectRoot, "protected-book")).toHaveLength(1);
+  });
   it("snapshots the whole book directory into .inkos/backups/<bookId>/<stamp>/", async () => {
     const bookDir = await setupBook("backbook");
 

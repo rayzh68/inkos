@@ -1,5 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { assertLegacyTruthMutationAllowed } from "../interaction/truth-authority.js";
+import { safeMutationPath } from "../utils/path-safety.js";
 import {
   ChapterSummariesStateSchema,
   CurrentStateStateSchema,
@@ -176,6 +178,10 @@ export async function saveRuntimeStateSnapshot(
   bookDir: string,
   snapshot: RuntimeStateSnapshot,
 ): Promise<void> {
+  await assertLegacyTruthMutationAllowed(bookDir);
+  for (const file of ["manifest.json", "current_state.json", "hooks.json", "chapter_summaries.json"]) {
+    await safeMutationPath(bookDir, `story/state/${file}`);
+  }
   const stateDir = join(bookDir, "story", "state");
   await mkdir(stateDir, { recursive: true });
 

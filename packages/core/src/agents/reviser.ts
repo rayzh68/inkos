@@ -3,6 +3,9 @@ import type { GenreProfile } from "../models/genre-profile.js";
 import type { BookRules } from "../models/book-rules.js";
 import type { LengthSpec } from "../models/length-governance.js";
 import type { AuditIssue } from "./continuity.js";
+import type { StructuredTruthV1 } from "../models/structured-truth.js";
+import { validateStructuredTruthV1 } from "../models/structured-truth.js";
+import { canonicalJson } from "../state/canonical-json.js";
 import type { ChapterIntent, ChapterMemo, ContextPackage, RuleStack } from "../models/input-governance.js";
 import { readGenreProfile, readBookLanguage, readBookRules } from "./rules-reader.js";
 import { countChapterLength } from "../utils/length-metrics.js";
@@ -124,24 +127,43 @@ export class ReviserAgent extends BaseAgent {
       ruleStack?: RuleStack;
       lengthSpec?: LengthSpec;
       baselineChapter?: number;
+      authoritativeTruth?: StructuredTruthV1;
+      predecessorChapterBody?: string;
     },
   ): Promise<ReviseOutput> {
+    const canonicalTruthV2 = options?.authoritativeTruth !== undefined || options?.predecessorChapterBody !== undefined;
+    if (canonicalTruthV2) {
+      if (!options?.authoritativeTruth || options.predecessorChapterBody === undefined) {
+        throw new Error("V2 Reviser requires verified committed truth and immutable predecessor chapter prose");
+      }
+      validateStructuredTruthV1(options.authoritativeTruth);
+      if (options.authoritativeTruth.throughChapter !== chapterNumber - 1) {
+        throw new Error("V2 Reviser truth authority must be the immediate committed predecessor");
+      }
+      if (!options.predecessorChapterBody.trim() && options.authoritativeTruth.throughChapter !== 0) {
+        throw new Error("V2 Reviser requires immutable predecessor chapter prose after the opening chapter");
+      }
+    }
     const baselineStoryDir = options?.baselineChapter === undefined
       ? join(bookDir, "story")
       : join(bookDir, "story", "snapshots", String(options.baselineChapter));
     const [currentState, ledger, hooks, styleGuideRaw, volumeOutline, storyBible, characterMatrix, chapterSummaries, parentCanon, fanficCanon] = await Promise.all([
-      options?.baselineChapter === undefined
+      canonicalTruthV2
+        ? Promise.resolve(canonicalJson(options!.authoritativeTruth!))
+        : options?.baselineChapter === undefined
         ? readCurrentStateWithFallback(bookDir, "(文件不存在)")
         : this.readFileSafe(join(baselineStoryDir, "current_state.md")),
-      this.readFileSafe(join(baselineStoryDir, "particle_ledger.md")),
-      this.readFileSafe(join(baselineStoryDir, "pending_hooks.md")),
+      canonicalTruthV2 ? Promise.resolve("") : this.readFileSafe(join(baselineStoryDir, "particle_ledger.md")),
+      canonicalTruthV2 ? Promise.resolve("") : this.readFileSafe(join(baselineStoryDir, "pending_hooks.md")),
       this.readFileSafe(join(bookDir, "story/style_guide.md")),
       readVolumeMap(bookDir, "(文件不存在)"),
       readStoryFrame(bookDir, "(文件不存在)"),
-      options?.baselineChapter === undefined
+      canonicalTruthV2
+        ? Promise.resolve("")
+        : options?.baselineChapter === undefined
         ? readCharacterContext(bookDir, "(文件不存在)")
         : this.readSnapshotCharacterContext(bookDir, baselineStoryDir),
-      this.readFileSafe(join(baselineStoryDir, "chapter_summaries.md")),
+      canonicalTruthV2 ? Promise.resolve("") : this.readFileSafe(join(baselineStoryDir, "chapter_summaries.md")),
       this.readFileSafe(join(bookDir, "story/parent_canon.md")),
       this.readFileSafe(join(bookDir, "story/fanfic_canon.md")),
     ]);
@@ -265,6 +287,9 @@ export class ReviserAgent extends BaseAgent {
     const styleGuideBlock = reducedControlBlock.length === 0
       ? `\n## 文风指南\n${styleGuide}`
       : "";
+    const committedTruthBlock = canonicalTruthV2
+      ? `\n## Verified committed V2 truth authority\n${canonicalJson(options!.authoritativeTruth!)}\n\n## Immutable committed predecessor chapter prose\n${options!.predecessorChapterBody || "(opening chapter — exact empty predecessor)"}\n`
+      : "";
 
     const userPrompt = `请修正第${chapterNumber}章。
 
@@ -274,7 +299,7 @@ ${issueList}
 ## 当前状态卡
 ${currentState}
 ${ledgerBlock}
-${sanitizeNarrativeEvidenceBlock(hookDebtBlock, resolvedLanguage) ?? ""}${sanitizeNarrativeEvidenceBlock(hooksBlock, resolvedLanguage) ?? ""}${sanitizeNarrativeEvidenceBlock(volumeSummariesBlock, resolvedLanguage) ?? ""}${reducedControlBlock || outlineBlock}${bibleBlock}${matrixBlock}${sanitizeNarrativeEvidenceBlock(summariesBlock, resolvedLanguage) ?? ""}${canonBlock}${fanficCanonBlock}${styleGuideBlock}${lengthGuidanceBlock}
+${sanitizeNarrativeEvidenceBlock(hookDebtBlock, resolvedLanguage) ?? ""}${sanitizeNarrativeEvidenceBlock(hooksBlock, resolvedLanguage) ?? ""}${sanitizeNarrativeEvidenceBlock(volumeSummariesBlock, resolvedLanguage) ?? ""}${reducedControlBlock || outlineBlock}${bibleBlock}${matrixBlock}${sanitizeNarrativeEvidenceBlock(summariesBlock, resolvedLanguage) ?? ""}${committedTruthBlock}${canonBlock}${fanficCanonBlock}${styleGuideBlock}${lengthGuidanceBlock}
 
 ## 待修正章节
 ${chapterContent}`;

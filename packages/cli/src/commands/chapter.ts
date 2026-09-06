@@ -1,6 +1,6 @@
 import { Command } from "commander";
 import { createInterface } from "node:readline";
-import { deleteLatestChapter, StateManager, syncChapterWordCounts } from "@actalk/inkos-core";
+import { assertLegacyTruthMutationAllowed, deleteLatestChapter, StateManager, syncChapterWordCounts } from "@actalk/inkos-core";
 import {
   formatChapterDeleteCancelled,
   formatChapterDeleteConfirm,
@@ -26,6 +26,7 @@ chapterCommand
       const root = findProjectRoot();
       const bookId = await resolveBookId(bookIdArg, root);
       const state = new StateManager(root);
+      await assertLegacyTruthMutationAllowed(state.bookDir(bookId));
       const book = await state.loadBookConfig(bookId);
       const language = resolveCliLanguage(book.language);
 
@@ -69,6 +70,7 @@ chapterCommand
       const root = findProjectRoot();
       const bookId = await resolveBookId(bookIdArg, root);
       const state = new StateManager(root);
+      await assertLegacyTruthMutationAllowed(state.bookDir(bookId));
       const book = await state.loadBookConfig(bookId);
       const language = resolveCliLanguage(book.language);
       const requestedChapter = opts.chapter === undefined ? undefined : parseInt(opts.chapter, 10);

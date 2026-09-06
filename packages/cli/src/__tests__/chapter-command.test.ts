@@ -71,6 +71,22 @@ async function setupBook(params: {
   return bookDir;
 }
 
+describe("chapter canonical admission", () => {
+  it.each(["sync", "delete"])("rejects %s before legacy work when cutover evidence cannot be verified", async (action) => {
+    const bookDir = await setupBook({ bookId: "guard-book", chapters: [{ file: "0001_Test.md", content: "原文。" }], index: [chapterEntry(1, "Test", 3)], snapshotChapters: [0] });
+    await mkdir(join(bookDir, "story/runtime/chapter-transactions/chapter-0001"), { recursive: true });
+    await writeFile(join(bookDir, "story/runtime/chapter-transactions/chapter-0001/transaction.json"), '{"truthMode":"CANONICAL_V2"}');
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("EXIT_1"); }) as never);
+    try {
+      const { chapterCommand } = await import("../commands/chapter.js");
+      await expect(chapterCommand.parseAsync(["node", "chapter", action, "guard-book", "--json", ...(action === "delete" ? ["--force"] : [])], { from: "node" })).rejects.toThrow("EXIT_1");
+      expect(logMock).toHaveBeenCalledWith(expect.stringMatching(/TRUTH_CUTOVER|TRUTH_AUTHORITY/));
+      expect(await readFile(join(bookDir, "chapters/0001_Test.md"), "utf8")).toBe("原文。");
+      expect(await readFile(join(bookDir, "story/current_state.md"), "utf8")).toBe("state after latest");
+    } finally { exit.mockRestore(); }
+  });
+});
+
 describe("inkos chapter sync", () => {
   beforeEach(() => {
     vi.clearAllMocks();

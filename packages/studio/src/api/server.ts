@@ -7,6 +7,7 @@ import { gzipSync } from "node:zlib";
 import { randomUUID } from "node:crypto";
 import {
   StateManager,
+  assertTruthMutationAllowed,
   PipelineRunner,
   createLLMClient,
   createLogger,
@@ -6323,12 +6324,18 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     if (RUNTIME_DIAGNOSTIC_FILE_RE.test(file)) {
       return c.json({ error: "Runtime diagnostic files are read-only" }, 400);
     }
-    const { content } = await c.req.json<{ content: string }>();
-    const { writeFile: writeFileFs, mkdir: mkdirFs } = await import("node:fs/promises");
-    const { dirname: dirnameFs } = await import("node:path");
-    await mkdirFs(dirnameFs(resolved), { recursive: true });
-    await writeFileFs(resolved, content, "utf-8");
-    return c.json({ ok: true });
+    const releaseLock = await state.acquireBookLock(id);
+    try {
+      await assertTruthMutationAllowed({ bookDir, relativePath: `story/${file}` });
+      const { content } = await c.req.json<{ content: string }>();
+      const { writeFile: writeFileFs, mkdir: mkdirFs } = await import("node:fs/promises");
+      const { dirname: dirnameFs } = await import("node:path");
+      await mkdirFs(dirnameFs(resolved), { recursive: true });
+      await writeFileFs(resolved, content, "utf-8");
+      return c.json({ ok: true });
+    } catch (error) {
+      return c.json({ error: String(error) }, 409);
+    } finally { await releaseLock(); }
   });
 
   // =============================================

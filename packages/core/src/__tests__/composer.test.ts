@@ -6,6 +6,8 @@ import { join } from "node:path";
 import type { BookConfig } from "../models/book.js";
 import type { PlanChapterOutput } from "../agents/planner.js";
 import { ComposerAgent, composeGovernedChapter } from "../agents/composer.js";
+import type { StructuredTruthV1 } from "../models/structured-truth.js";
+import { createVocabularyCatalogV1 } from "../state/truth-vocabulary.js";
 
 const require = createRequire(import.meta.url);
 const hasNodeSqlite = (() => {
@@ -1376,5 +1378,23 @@ describe("ComposerAgent", () => {
     });
 
     expect(result.contextPackage.selectedContext.map((entry) => entry.source)).toContain("runtime/hook_debt#black-ring");
+  });
+
+  it("uses supplied committed StructuredTruth as authority instead of live current_state Markdown", async () => {
+    const truth: StructuredTruthV1 = {
+      schemaVersion: "1.0", kind: "STRUCTURED_TRUTH", bookId: book.id, throughChapter: 3,
+      lineage: { kind: "BASELINE", predecessorCommitSha256: "a".repeat(64), baselineSourceManifestSha256: "b".repeat(64), seedVocabularyCatalogSha256: "c".repeat(64), baselineMethod: "DETERMINISTIC", baselineConstructionReceiptSha256: "d".repeat(64) },
+      vocabulary: createVocabularyCatalogV1([]), entities: [], facts: [], relations: [],
+      provenance: { schemaVersion: "1.0", producerKind: "BASELINE", producerId: "inkos.truth-baseline.builder.v1", producerVersion: "1.0", canonicalizationId: "inkos.jcs-ijson.v1", truthSchemaVersion: "1.0", vocabularySchemaVersion: "1.0", coreVocabularyVersion: "1.0" },
+    };
+    await writeFile(join(storyDir, "current_state.md"), "POISONED LIVE MARKDOWN", "utf8");
+    await writeFile(join(storyDir, "pending_hooks.md"), "POISONED LIVE HOOKS", "utf8");
+    await writeFile(join(storyDir, "chapter_summaries.md"), "POISONED LIVE SUMMARIES", "utf8");
+    const result = await composeGovernedChapter({ book, bookDir, chapterNumber: 4, plan, authoritativeTruth: truth });
+    const authority = result.contextPackage.selectedContext.find((entry) => entry.source === "authority/committed-v2/state/truth.json");
+    expect(authority?.excerpt).toContain('"kind":"STRUCTURED_TRUTH"');
+    expect(result.trace.contextTiers.protectedSources).toContain("authority/committed-v2/state/truth.json");
+    expect(result.contextPackage.selectedContext.some((entry) => entry.excerpt?.includes("POISONED LIVE MARKDOWN") === true)).toBe(false);
+    expect(result.contextPackage.selectedContext.some((entry) => /story\/(current_state|pending_hooks|chapter_summaries)\.md/iu.test(entry.source))).toBe(false);
   });
 });

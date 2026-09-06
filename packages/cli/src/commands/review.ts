@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { StateManager, formatLengthCount, readGenreProfile, resolveLengthCountingMode } from "@actalk/inkos-core";
+import { assertLegacyTruthMutationAllowed, StateManager, formatLengthCount, readGenreProfile, resolveLengthCountingMode } from "@actalk/inkos-core";
 import { findProjectRoot, resolveBookId, log, logError } from "../utils.js";
 
 export const reviewCommand = new Command("review")
@@ -116,6 +116,7 @@ reviewCommand
       const bookId = await resolveBookId(bookIdArg, root);
 
       const state = new StateManager(root);
+      await assertLegacyTruthMutationAllowed(state.bookDir(bookId));
       const index = [...(await state.loadChapterIndex(bookId))];
       const idx = index.findIndex((ch) => ch.number === chapterNum);
       if (idx === -1) {
@@ -154,7 +155,7 @@ reviewCommand
       const root = findProjectRoot();
       const bookId = await resolveBookId(bookIdArg, root);
       const state = new StateManager(root);
-
+      await assertLegacyTruthMutationAllowed(state.bookDir(bookId));
       const index = [...(await state.loadChapterIndex(bookId))];
       let count = 0;
       const now = new Date().toISOString();
@@ -198,6 +199,7 @@ reviewCommand
       const bookId = await resolveBookId(bookIdArg, root);
 
       const state = new StateManager(root);
+      await assertLegacyTruthMutationAllowed(state.bookDir(bookId));
       const index = await state.loadChapterIndex(bookId);
       const idx = index.findIndex((ch) => ch.number === chapterNum);
       if (idx === -1) {

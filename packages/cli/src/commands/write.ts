@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { assertChapterAuthorityMutationAllowed, PipelineRunner, StateManager, resolveChapterReviewMode } from "@actalk/inkos-core";
+import { assertLegacyTruthMutationAllowed, assertChapterAuthorityMutationAllowed, PipelineRunner, StateManager, resolveChapterReviewMode } from "@actalk/inkos-core";
 import { readdir, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -173,6 +173,7 @@ writeCommand
       notifyLanguage = resolveCliLanguage(book.language);
       notifyBookName = book.title ?? bookId;
       const bookDir = state.bookDir(bookId);
+      await assertLegacyTruthMutationAllowed(bookDir);
       await assertChapterAuthorityMutationAllowed({ bookDir, chapterNumber: chapter });
       const chaptersDir = join(bookDir, "chapters");
       const restoreFrom = chapter - 1;

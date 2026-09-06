@@ -1,16 +1,58 @@
 import {
   access,
+  link,
   mkdir,
   mkdtemp,
+  open,
+  readFile,
   rename,
   rm,
   writeFile,
 } from "node:fs/promises";
-import { dirname, isAbsolute, join, normalize, sep } from "node:path";
+import { randomUUID } from "node:crypto";
+import { basename, dirname, isAbsolute, join, normalize, sep } from "node:path";
+import { safeMutationPath } from "./path-safety.js";
 
 export interface AtomicFileWrite {
   readonly relativePath: string;
   readonly content: string | Uint8Array;
+}
+
+/** Publish complete bytes once; true owns publication, false is an identical replay. */
+export async function publishImmutableFile(target: string, content: string | Uint8Array): Promise<boolean> {
+  const bytes = Buffer.from(content);
+  await safeMutationPath(dirname(target), basename(target));
+  await mkdir(dirname(target), { recursive: true });
+  await safeMutationPath(dirname(target), basename(target));
+  const temporary = join(dirname(target), `.immutable-${randomUUID()}.tmp`);
+  const handle = await open(temporary, "wx");
+  try {
+    try {
+      await handle.writeFile(bytes);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await safeMutationPath(dirname(target), basename(target));
+    try {
+      await link(temporary, target);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      await safeMutationPath(dirname(target), basename(target));
+      let existing: Buffer;
+      try {
+        existing = await readFile(target);
+      } catch (cause) {
+        throw new Error(`IMMUTABLE_CONFLICT: unreadable target ${target}`, { cause });
+      }
+      if (!existing.equals(bytes)) throw new Error(`IMMUTABLE_CONFLICT: ${target}`);
+      return false;
+    }
+    return true;
+  } finally {
+    // This path belongs only to this invocation, never to another publisher.
+    await rm(temporary, { force: true });
+  }
 }
 
 export interface AtomicFileSet {
@@ -45,6 +87,11 @@ async function exists(path: string): Promise<boolean> {
 
 export async function commitAtomicFileSet(input: AtomicFileSet): Promise<void> {
   const renameFile = input.renameFile ?? rename;
+  // Validate original spelling and every existing component before staging or
+  // moving any member of the set (normalization must not hide unsafe aliases).
+  for (const relativePath of [...input.writes.map((entry) => entry.relativePath), ...(input.deletes ?? [])]) {
+    await safeMutationPath(input.rootDir, relativePath);
+  }
   const writes = input.writes.map((entry) => ({
     ...entry,
     relativePath: safeRelativePath(entry.relativePath),
@@ -74,8 +121,9 @@ export async function commitAtomicFileSet(input: AtomicFileSet): Promise<void> {
     }
 
     for (const relativePath of touchedPaths) {
-      const target = join(input.rootDir, relativePath);
+      const target = await safeMutationPath(input.rootDir, relativePath);
       await mkdir(dirname(target), { recursive: true });
+      await safeMutationPath(input.rootDir, relativePath);
       if (!(await exists(target))) continue;
 
       const backup = join(backupDir, relativePath);
@@ -85,19 +133,20 @@ export async function commitAtomicFileSet(input: AtomicFileSet): Promise<void> {
     }
 
     for (const entry of writes) {
-      const target = join(input.rootDir, entry.relativePath);
+      const target = await safeMutationPath(input.rootDir, entry.relativePath);
       await renameFile(join(stagedDir, entry.relativePath), target);
       committedTargets.push(target);
     }
   } catch (error) {
     const rollbackErrors: unknown[] = [];
     for (const target of committedTargets.reverse()) {
-      await rm(target, { recursive: true, force: true }).catch((rollbackError) => {
+      await safeMutationPath(dirname(target), basename(target)).then(() => rm(target, { recursive: true, force: true })).catch((rollbackError) => {
         rollbackErrors.push(rollbackError);
       });
     }
     for (const entry of backups.reverse()) {
       try {
+        await safeMutationPath(dirname(entry.target), basename(entry.target));
         await rm(entry.target, { recursive: true, force: true });
         await mkdir(dirname(entry.target), { recursive: true });
         await renameFile(entry.backup, entry.target);
