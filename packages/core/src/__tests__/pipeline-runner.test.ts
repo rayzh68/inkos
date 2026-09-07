@@ -104,6 +104,8 @@ import { correctLegacyPendingChapterArtifactBindings, createAutonomousProviderEx
 import { scoredLogicReviewFromAudit, type BoundedReviewResult } from "../pipeline/bounded-review.js";
 import {
   beginChapterTransaction,
+  inspectChapterAuthority,
+  loadCommittedTruthForWriter,
   bindChapterTransactionProviderRequest,
   createChapterGenesis,
   recordChapterTransactionCandidate,
@@ -529,6 +531,32 @@ function syntheticFirstV2Truth(bookId: string): StructuredTruthV1 {
 }
 
 describe("PipelineRunner", () => {
+  it("normal autonomous first-V2 cutover binds fresh authority before the first model stage", async () => {
+    let firstModelRole: string | undefined;
+    const { root, runner, state, bookId } = await createRunnerFixture({
+      boundedAutonomousReview: true,
+      firstV2Cutover: { legacyRuntimeSnapshot: JSON.stringify({ nextChapter: 2, providerAttemptHistory: [] }) },
+      onAutonomousStage: async (event) => {
+        if (event.provider !== null) {
+          firstModelRole = event.role;
+          throw new Error("TEST_STOP_BEFORE_MODEL");
+        }
+      },
+    });
+    try {
+      const { bookDir } = await seedTransactionPipeline(state, bookId);
+      await installLegacyBaseline(bookDir, syntheticFirstV2Truth(bookId));
+      const old = await beginChapterTransaction({ bookDir, bookId, chapterNumber: 2, productionAuthority: "old-legacy-authority" });
+      await expect(runner.writeNextChapter(bookId)).rejects.toThrow("TEST_STOP_BEFORE_MODEL");
+      const authority = await inspectChapterAuthority({ bookDir });
+      expect(authority.activeTransactionId).not.toBe(old.transactionId);
+      const record = JSON.parse(await readFile(join(bookDir, "story/runtime/chapter-transactions/chapter-0002/attempts/attempt-0002/transaction.json"), "utf8"));
+      expect(record).toMatchObject({ truthMode: "CANONICAL_V2", chapterNumber: 2 });
+      expect(firstModelRole).toBe("planner");
+      expect(await loadCommittedTruthForWriter({ bookDir, chapterNumber: 2 })).toMatchObject({ throughChapter: 1 });
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   beforeEach(() => {
     vi.spyOn(PlannerAgent.prototype, "planChapter").mockImplementation(async (input) => {
       const chapterNumber = input.chapterNumber;

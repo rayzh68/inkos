@@ -23,6 +23,8 @@ import { scoredLogicReviewFromAudit, type ScoredReview } from "../pipeline/bound
 import type { LLMMessage } from "../llm/provider.js";
 import { safeMutationPath } from "../utils/path-safety.js";
 import { withChapterTransactionPublicationGuard } from "./bounded-autonomous-controller.js";
+import type { AutonomousRunProgress } from "./bounded-autonomous-controller.js";
+import { buildFirstV2Baseline } from "./first-v2-baseline.js";
 
 export type ChapterAuthorityState = "NOT_STARTED" | "STAGING" | "COMMITTED";
 export type ChapterCommitReviewStatus = "APPROVED" | "ACCEPTED_WITH_FINDINGS";
@@ -580,6 +582,66 @@ export async function beginChapterTransaction(input: {
   readonly firstV2Baseline?: FirstV2BaselineContext;
 }): Promise<ChapterTransactionHandle> {
   return withChapterTransactionPublicationGuard(input.bookDir, () => beginChapterTransactionUnderGuard(input));
+}
+
+async function buildCommittedLegacyBaseline(bookDir: string, chain: Awaited<ReturnType<typeof verifyChapterCommitChain>>) {
+  const latest = chain.commits.at(-1);
+  if (latest?.kind !== "CHAPTER_COMMIT") throw new Error("FIRST_V2_REQUIRES_VERIFIED_LEGACY_COMMIT");
+  const root = commitRoot(bookDir, latest.chapterNumber);
+  const sourceFiles = Object.fromEntries((await listFiles(join(root, "state"))).map((file) => [file.relativePath, file.content]));
+  return buildFirstV2Baseline({ chapterCommit: latest, sourceFiles, predecessorChapterBody: await readFile(join(root, "chapter.md"), "utf8") });
+}
+
+/** Called under the existing book/job lock, before any production model admission. */
+export async function prepareFirstV2Cutover(input: {
+  readonly bookDir: string;
+  readonly bookId: string;
+  readonly productionAuthority: string;
+  readonly runtimeSnapshot?: string;
+}): Promise<ChapterTransactionHandle | undefined> {
+  const chain = await verifyChapterCommitChain({ bookDir: input.bookDir });
+  if (chain.bookId !== input.bookId) throw new Error("FIRST_V2_CUTOVER_BOOK_MISMATCH");
+  if (chain.commits.length === 0 || chain.commits.some((commit) => commit.kind === "TRUTH_CHAPTER_COMMIT")) return undefined;
+  const chapterNumber = chain.latestChapter + 1;
+  const durableBaseline = await loadDurableFirstV2BaselineFromVerifiedChain(input.bookDir, chapterNumber, chain).catch((error: unknown) => {
+    if (error instanceof Error && error.message === "FIRST_V2_BASELINE_TRANSACTION_MISSING") return undefined;
+    throw error;
+  });
+  if (durableBaseline) return beginChapterTransaction({ bookDir: input.bookDir, bookId: input.bookId, chapterNumber,
+    productionAuthority: input.productionAuthority, truthMode: "CANONICAL_V2", firstV2Baseline: durableBaseline });
+  const firstV2Baseline = await buildCommittedLegacyBaseline(input.bookDir, chain);
+  const request = { ...input, chapterNumber, truthMode: "CANONICAL_V2" as const, firstV2Baseline };
+  const attempts = await listChapterTransactions(input.bookDir, chapterNumber).catch(async (error: unknown) => {
+    if (!(error instanceof Error) || error.message !== "FIRST_V2_BASELINE_TRANSACTION_MISSING") throw error;
+    const orphan = await verifyRecoverableBaselineOrphan(request);
+    return listChapterTransactions(input.bookDir, chapterNumber, orphan.root);
+  });
+  const active = attempts.filter((attempt) => !attempt.abandoned);
+  if (active.length > 1) throw new Error("MULTIPLE_ACTIVE_CHAPTER_ATTEMPTS");
+  for (const attempt of attempts) {
+    if (attempt.abandoned && attempt.terminal?.outcome === "ABANDONED" && !(await exists(join(attempt.root, "abandonment.json")))) {
+      await abandonChapterTransactionAttempt({ ...input, chapterNumber, transactionId: attempt.record.transactionId,
+        runtimeSnapshot: await readFile(join(attempt.root, "runtime-at-abandon.json"), "utf8") });
+    }
+  }
+  const old = active[0];
+  if (old && old.record.truthMode !== "CANONICAL_V2") {
+    if (old.terminal) throw new Error("FIRST_V2_LEGACY_TERMINAL_ALREADY_SELECTED");
+    const snapshot = input.runtimeSnapshot ?? await readFile(join(input.bookDir, "story/runtime/bounded-autonomous/production-state.json"), "utf8");
+    const runtime = JSON.parse(snapshot) as Partial<AutonomousRunProgress>;
+    if (runtime.nextChapter !== chapterNumber || !Array.isArray(runtime.providerAttemptHistory)) throw new Error("FIRST_V2_LEGACY_PROVIDER_HISTORY_MISSING");
+    const history = runtime.providerAttemptHistory.filter((entry) => entry.chapterNumber === chapterNumber || entry.transactionId === old.record.transactionId);
+    if (history.some((entry) => entry.chapterNumber !== chapterNumber || entry.transactionId !== old.record.transactionId || entry.classification !== "SUCCESS"
+      || !entry.transportStarted || !entry.transportReturned)) throw new Error("FIRST_V2_LEGACY_PROVIDER_OUTCOME_UNRESOLVED");
+    const references = await collectProviderReferences(input.bookDir, chapterNumber, old.record.transactionId);
+    if (references.length !== new Set(history.map((entry) => entry.logicalStepId)).size
+      || references.some((reference) => !history.some((entry) => entry.logicalStepId === reference.logicalOperationId
+        && entry.role === reference.role && entry.provider === reference.provider && entry.requestedModel === reference.requestedModel))) {
+      throw new Error("FIRST_V2_LEGACY_PROVIDER_HISTORY_MISMATCH");
+    }
+    await abandonChapterTransactionAttempt({ ...input, chapterNumber, transactionId: old.record.transactionId, runtimeSnapshot: snapshot });
+  }
+  return beginChapterTransaction(request);
 }
 
 async function beginChapterTransactionUnderGuard(input: Parameters<typeof beginChapterTransaction>[0]): Promise<ChapterTransactionHandle> {
@@ -3295,7 +3357,7 @@ export async function stageTruthChapterCommitV2(input: {
 }
 
 /** Read-only recovery observation; never authorizes ordinary work on a selected attempt. */
-export async function loadRecoverableTruthChapterCommit(input: { readonly bookDir: string }): Promise<{
+export async function loadRecoverableTruthChapterCommit(input: { readonly bookDir: string; readonly pendingChapterNumber?: number }): Promise<{
   readonly root: string;
   readonly commit: TruthChapterCommitV2;
   readonly extractionContext: CanonicalTruthExtractionContextRecord;
@@ -3303,18 +3365,30 @@ export async function loadRecoverableTruthChapterCommit(input: { readonly bookDi
   readonly firstV2Baseline?: FirstV2BaselineContext;
 } | null> {
   const chain = await verifyChapterCommitChain(input);
-  const attempts = (await listChapterTransactions(input.bookDir, chain.latestChapter + 1)).filter((attempt) => !attempt.abandoned);
+  const latest = chain.commits.at(-1);
+  // The runtime chapter is a routing hint only. A promoted target is recoverable
+  // solely through its verified Commit and matching retained terminal claim.
+  const promoted = input.pendingChapterNumber === chain.latestChapter && latest?.kind === "TRUTH_CHAPTER_COMMIT" ? latest : undefined;
+  const predecessorChain = promoted ? { ...chain, commits: chain.commits.slice(0, -1), latestChapter: promoted.chapterNumber - 1,
+    latestAuthoritySha256: promoted.previousAuthoritySha256 } : chain;
+  const attempts = (await listChapterTransactions(input.bookDir, predecessorChain.latestChapter + 1)).filter((attempt) => !attempt.abandoned);
   if (attempts.length > 1) throw new Error("MULTIPLE_ACTIVE_CHAPTER_ATTEMPTS");
   const transaction = attempts[0];
   if (!transaction || transaction.record.truthMode !== "CANONICAL_V2") return null;
-  const root = join(transaction.root, "staging", "bundle");
+  await loadActiveCanonicalTruthTransactionFromVerifiedChain(input.bookDir, predecessorChain);
+  if (promoted && (transaction.terminal?.outcome !== "COMMIT_SELECTED"
+    || transaction.record.transactionId !== promoted.transactionId || transaction.terminal.commitSha256 !== promoted.commitSha256
+    || transaction.terminal.commitKind !== promoted.kind)) throw new Error("SELECTED_COMMIT_RECOVERY_IDENTITY_MISMATCH");
+  const source = join(transaction.root, "staging", "bundle");
+  const root = promoted && !(await exists(source)) ? commitRoot(input.bookDir, promoted.chapterNumber) : source;
   if (!(await exists(root))) {
     if (transaction.terminal?.outcome === "COMMIT_SELECTED") throw new Error("SELECTED_COMMIT_RECOVERY_SOURCE_MISSING");
     return null;
   }
   const commit = await verifyBundle(root, transaction.record.chapterNumber, input.bookDir);
   if (commit.kind !== "TRUTH_CHAPTER_COMMIT" || commit.transactionId !== transaction.record.transactionId
-    || commit.bookId !== chain.bookId || commit.previousAuthoritySha256 !== chain.latestAuthoritySha256
+    || commit.bookId !== chain.bookId || commit.previousAuthoritySha256 !== predecessorChain.latestAuthoritySha256
+    || promoted && commit.commitSha256 !== promoted.commitSha256
     || transaction.terminal?.outcome === "COMMIT_SELECTED" &&
       (transaction.terminal.commitSha256 !== commit.commitSha256 || transaction.terminal.commitKind !== commit.kind)) {
     throw new Error("SELECTED_COMMIT_RECOVERY_IDENTITY_MISMATCH");
@@ -3965,9 +4039,18 @@ export async function verifyChapterCommitChain(input: { readonly bookDir: string
   return { bookId: genesis.bookId, latestChapter: expected - 1, latestAuthoritySha256: previous, commits, genesis };
 }
 
-export async function inspectChapterAuthority(input: { readonly bookDir: string }): Promise<{ readonly bookId: string; readonly state: ChapterAuthorityState; readonly latestChapter: number; readonly nextChapter: number; readonly latestAuthoritySha256: string; readonly activeTransactionId?: string }> {
+export async function inspectChapterAuthority(input: { readonly bookDir: string; readonly allowRecoverableFirstV2Baseline?: boolean }): Promise<{ readonly bookId: string; readonly state: ChapterAuthorityState; readonly latestChapter: number; readonly nextChapter: number; readonly latestAuthoritySha256: string; readonly activeTransactionId?: string }> {
   const chain = await verifyChapterCommitChain(input);
-  return inspectChapterAuthorityFromVerifiedChain(input, chain);
+  return inspectChapterAuthorityFromVerifiedChain(input, chain).catch(async (error: unknown) => {
+    // Read-only Studio admission may recognize only the exact existing Package B
+    // publication gap. Actual publication remains behind the book/job lock.
+    if (!input.allowRecoverableFirstV2Baseline || !(error instanceof Error) || error.message !== "FIRST_V2_BASELINE_TRANSACTION_MISSING") throw error;
+    const firstV2Baseline = await buildCommittedLegacyBaseline(input.bookDir, chain);
+    await verifyRecoverableBaselineOrphan({ bookDir: input.bookDir, bookId: chain.bookId, chapterNumber: chain.latestChapter + 1,
+      productionAuthority: "read-only-orphan-verification", truthMode: "CANONICAL_V2", firstV2Baseline });
+    return { bookId: chain.bookId, state: "COMMITTED" as const, latestChapter: chain.latestChapter,
+      nextChapter: chain.latestChapter + 1, latestAuthoritySha256: chain.latestAuthoritySha256 };
+  });
 }
 
 // Private observations live only in their calling read-only phase. Public

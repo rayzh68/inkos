@@ -2763,15 +2763,16 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const bookDir = state.bookDir(bookId);
     const transactionEnabled = await isChapterTransactionEnabled(bookDir);
     if (transactionEnabled) await reconcileChapterProjections({ bookDir });
-    const [map, book, chapters, nextChapter, runtime, safeConfig, productionModels, transactionAuthority] = await Promise.all([
+    const transactionAuthority = transactionEnabled
+      ? await inspectChapterAuthority({ bookDir, allowRecoverableFirstV2Baseline: true }) : null;
+    const [map, book, chapters, nextChapter, runtime, safeConfig, productionModels] = await Promise.all([
       requireBookProductionMap(root, bookId),
       state.loadBookConfig(bookId),
       state.loadChapterIndex(bookId),
-      state.getNextChapterNumber(bookId),
+      transactionAuthority ? Promise.resolve(transactionAuthority.nextChapter) : state.getNextChapterNumber(bookId),
       loadAutonomousRuntime(root, bookId),
       loadSafeAutonomousConfig(root),
       loadProductionRoleModels(),
-      transactionEnabled ? inspectChapterAuthority({ bookDir }) : null,
     ]);
     const pending = chapters.find((chapter) => chapter.status === "audit-failed");
     const recoveryChapter = pending?.number ?? runtime?.nextChapter;
@@ -3020,6 +3021,10 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         modelOverrides: formalRoleRouting.modelOverrides,
         chapterReviewMode: "auto",
         boundedAutonomousReview: true,
+        ...(admission.chapterTransaction ? { firstV2Cutover: {
+          legacyRuntimeSnapshot: persistedRuntime ? JSON.stringify(persistedRuntime) : undefined,
+          resumeChapterNumber: persistedRuntime?.chapterNumber ?? persistedRuntime?.nextChapter,
+        } } : {}),
         onAutonomousStage: async (event) => {
           if (event.provider !== null && event.model !== null) {
             autonomousJobs.assertStageAdmission(bookId);
@@ -3121,7 +3126,9 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     void runBoundedAutonomousScope({
       map: productionMap,
       mode,
-      getNextChapter: () => state.getNextChapterNumber(bookId),
+      getNextChapter: async () => admission.chapterTransaction
+        ? (await inspectChapterAuthority({ bookDir: state.bookDir(bookId), allowRecoverableFirstV2Baseline: true })).nextChapter
+        : state.getNextChapterNumber(bookId),
       verifyChapterStartAuthority: (chapterNumber) => assertChapterWriterStartAllowed({ bookDir: state.bookDir(bookId), chapterNumber }),
       ...(admittedOfflineFinalizationPlan?.pendingChapterNumber !== undefined
         ? { pendingChapterNumber: admittedOfflineFinalizationPlan.pendingChapterNumber }
@@ -3194,6 +3201,10 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         if (durableClaim) await refreshAutonomousJobClaim(root, bookId, durableClaim);
         await saveAutonomousRuntime(root, bookId, {
           ...progress,
+          // Successful terminal return precedes this verified next-chapter
+          // projection. Do not retain the recovered chapter as a future hint.
+          ...(admission.chapterTransaction && progress.status === "RUNNING" && progress.completedThisRun > 0 && progress.chapterNumber === undefined
+            ? { chapterNumber: progress.nextChapter } : {}),
           updatedAt: new Date().toISOString(),
           budget: AUTONOMOUS_BUDGET_NOT_CONFIGURED,
           lastError: null,

@@ -119,6 +119,7 @@ import {
   chapterTransactionStagingBookDir,
   finalizeChapterTransaction,
   isChapterTransactionEnabled,
+  prepareFirstV2Cutover,
   loadCommittedV2PredecessorAuthority,
   reconcileChapterProjections,
   recordChapterTransactionCandidate,
@@ -350,6 +351,8 @@ export interface PipelineConfig {
   }>;
   /** Explicitly verified synthetic/first-cutover baseline; never derived from Markdown. */
   readonly firstV2Baseline?: FirstV2BaselineContext;
+  /** Normal Studio production opt-in; captured legacy runtime is evidence only. */
+  readonly firstV2Cutover?: { readonly legacyRuntimeSnapshot?: string; readonly resumeChapterNumber?: number };
   readonly onAutonomousStage?: (event: {
     readonly stage: "PREPARING" | "WRITING" | "LOGIC_REVIEW" | "READER_REVIEW" | "REVISING_1" | "RESCUE_REVISING_2" | "TRUTH_EXTRACTION" | "TRUTH_EXTRACTION_REPAIR" | "TRUTH_VALIDATION" | "SETTLING_STATE" | "STATE_REBASELINE_SETTLEMENT" | "STATE_REBASELINE_VALIDATION" | "APPROVED";
     readonly role: string;
@@ -602,6 +605,7 @@ export interface InitBookOptions {
 export class PipelineRunner {
   private readonly state: StateManager;
   private readonly config: PipelineConfig;
+  private firstV2ResumeHintConsumed = false;
   private readonly agentClients = new Map<string, LLMClient>();
   private readonly operationContext = new AsyncLocalStorage<{
     readonly signal?: AbortSignal;
@@ -3414,7 +3418,15 @@ export class PipelineRunner {
         chapterWordCount: book.chapterWordCount,
         productionMapSha256: productionMapBytes ? createHash("sha256").update(productionMapBytes).digest("hex") : null,
       })).digest("hex")}`;
-      const recovery = await loadRecoverableTruthChapterCommit({ bookDir });
+      const recovery = await loadRecoverableTruthChapterCommit({ bookDir,
+        ...(!this.firstV2ResumeHintConsumed && this.config.firstV2Cutover?.resumeChapterNumber !== undefined
+          ? { pendingChapterNumber: this.config.firstV2Cutover.resumeChapterNumber } : {}),
+      }).catch((error: unknown) => {
+        // This exact publication gap is verified and recovered by the existing
+        // first-V2 preparation below; all selected-Commit defects remain fatal.
+        if (this.config.firstV2Cutover && error instanceof Error && error.message === "FIRST_V2_BASELINE_TRANSACTION_MISSING") return null;
+        throw error;
+      });
       if (recovery) {
         if (preservedReviewPlan) throw new Error("TRANSACTION_BOOK_LEGACY_RECOVERY_FORBIDDEN");
         const { commit } = recovery;
@@ -3430,6 +3442,7 @@ export class PipelineRunner {
         await finalizeChapterTransaction({ bookDir, transactionId: commit.transactionId });
         await reconcileChapterProjections({ bookDir });
         await this.markBookActiveIfNeeded(bookId);
+        this.firstV2ResumeHintConsumed = true;
         const committedRoot = join(bookDir, "story", "commits", `chapter-${String(commit.chapterNumber).padStart(4, "0")}`);
         const review = JSON.parse(await readFile(join(committedRoot, "review.json"), "utf8")) as import("../production/chapter-transaction.js").ChapterCommitReviewAuthority;
         const usage = JSON.parse(await readFile(join(committedRoot, "usage.json"), "utf8")) as { totalUsage: TokenUsageSummary; roleUsage: Record<string, RoleTokenUsage> };
@@ -3446,6 +3459,11 @@ export class PipelineRunner {
               : `Bounded autonomous review ${review.grade} accepted with deferred non-blocking findings.`,
           },
         };
+      }
+      this.firstV2ResumeHintConsumed = true;
+      if (this.config.firstV2Cutover) {
+        await prepareFirstV2Cutover({ bookDir, bookId, productionAuthority,
+          runtimeSnapshot: this.config.firstV2Cutover.legacyRuntimeSnapshot });
       }
     }
     if (transactionEnabled) {
