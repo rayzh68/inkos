@@ -72,7 +72,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { StructuredTruthV1 } from "../models/structured-truth.js";
-import type { LLMMessage } from "../llm/provider.js";
+import { estimateTextTokens, type LLMMessage } from "../llm/provider.js";
 import { canonicalJson, canonicalSha256, sha256Utf8 } from "../state/canonical-json.js";
 import { createVocabularyCatalogV1 } from "../state/truth-vocabulary.js";
 import * as AdmissionModule from "../state/chapter-delta-admission.js";
@@ -370,6 +370,102 @@ async function beginTruthTransaction(
 }
 
 describe("canonical truth transaction", () => {
+  it("admits deduplicated settlement requests on a fresh synthetic transaction and replays without new calls", async () => {
+    const bookDir = await mkdtemp(join(tmpdir(), "inkos-settlement-dedup-fresh-")); roots.push(bookDir);
+    const seed = { ...emptyTruth(), bookId: "settlement-fresh-book" };
+    const candidate = "Ada opens the gate.";
+    const { transaction } = await beginTruthTransaction(bookDir, seed, candidate);
+    const predecessor = await loadCommittedTruthForWriter({ bookDir, chapterNumber: 2 });
+    const memo = "Keep the gate's origin unexplained.";
+    const committedAuthority = canonicalJson({ schemaVersion: "1.0", kind: "CANONICAL_TRUTH_COMMITTED_AUTHORITY",
+      structuredTruth: predecessor, storyFrame: "Complete frame.", volumeMap: "Complete map.",
+      chapterIntent: { memo: { body: memo }, markdown: `Intent before. ${memo} Intent after.`,
+        contextPackage: { selectedContext: [{ source: "truth", reason: "state", excerpt: canonicalJson(predecessor) }] } } });
+    let calls = 0;
+    const reservations: Awaited<ReturnType<typeof reserveChapterTransactionProviderRequest>>[] = [];
+    const reserve = async (role: "truth-extractor" | "truth-validator", execution: CanonicalTruthExecutionIdentity) => {
+      const reservation = await reserveChapterTransactionProviderRequest({ bookDir, transactionId: transaction.transactionId,
+        chapterNumber: 2, candidateSha256: sha256Utf8(candidate), role,
+        stage: role === "truth-extractor" ? "TRUTH_EXTRACTION" : "TRUTH_VALIDATION", requestOrdinal: 0,
+        request: { provider: execution.provider, model: execution.model, messages: execution.messages,
+          temperature: execution.temperature, maxTokens: execution.maxTokens, stream: execution.stream,
+          webSearch: execution.webSearch, extra: execution.extra } });
+      expect(reservation.fullRequestSha256).toBe(execution.fullRequestSha256);
+      expect(reservation.providerInputFingerprint).toBe(execution.inputFingerprint);
+      reservations.push(reservation);
+      calls++;
+    };
+    const pass = '{"verdict":"PASS","diagnostics":[]}';
+    const input = { bookDir, transactionId: transaction.transactionId, attemptId: "attempt-1", attemptNumber: 1, chapterNumber: 2,
+      candidate, candidateSha256: sha256Utf8(candidate), predecessorCommitSha256: transaction.previousAuthoritySha256,
+      predecessor, committedAuthority, chapterMemo: memo,
+      extractor: async (_request: TruthExtractionRequest, execution: CanonicalTruthExecutionIdentity) => {
+        await reserve("truth-extractor", execution);
+        return { rawProposal: readyProposal(), logicalOperationId: "dedup-extraction", inputFingerprint: execution.inputFingerprint,
+          providerArtifactSha256: SHA_C, responseContentSha256: sha256Utf8(readyProposal()), usage: USAGE };
+      },
+      validator: async (_request: TruthValidationRequest, execution: CanonicalTruthExecutionIdentity) => {
+        await reserve("truth-validator", execution);
+        return { verdict: "PASS", diagnostics: [], rawResponse: pass, logicalOperationId: "dedup-validation",
+          inputFingerprint: execution.inputFingerprint, providerArtifactSha256: SHA_D, responseContentSha256: sha256Utf8(pass), usage: USAGE };
+      } };
+    const result = await runCanonicalTruthTransaction(input);
+    expect(result.status).toBe("PASS");
+    if (result.status !== "PASS") throw new Error("fresh settlement did not pass");
+    expect(calls).toBe(2);
+    for (const context of [result.extractionContext, result.validationContext]) {
+      // The durable request remains complete; only the exact transport messages are projected.
+      expect(context.request.committedAuthority).toBe(committedAuthority);
+      const user = context.execution.messages.find((message) => message.role === "user")!.content;
+      expect(user).not.toContain(committedAuthority);
+      expect(user).toContain('"reference":"Verified predecessor StructuredTruthV1"');
+      const authorityText = user.split("## Verified committed authority\n\n")[1]!.split("\n\n## ")[0]!;
+      expect(JSON.parse(authorityText).chapterIntent.memo.body).toBe(memo);
+      const { contextSha256, ...unsigned } = context;
+      expect(contextSha256).toBe(canonicalSha256(unsigned));
+    }
+    expect(result.extractionContext.request.vocabularyCatalogJson).toBe(canonicalJson(predecessor.vocabulary));
+    expect(result.extractionContext.execution.messages.reduce((sum, message) => sum + estimateTextTokens(message.content), 0)).toBeLessThan(103000);
+    expect(125952 - result.validationContext.execution.messages.reduce((sum, message) => sum + estimateTextTokens(message.content), 0)).toBeGreaterThanOrEqual(8000);
+    expect(reservations).toHaveLength(2);
+    await expect(runCanonicalTruthTransaction(input)).resolves.toMatchObject({ status: "PASS", contextSha256: result.contextSha256 });
+    expect(calls).toBe(2);
+  });
+
+  it("rejects old duplicated frozen extraction messages without rewriting their immutable context", async () => {
+    const bookDir = await mkdtemp(join(tmpdir(), "inkos-settlement-dedup-old-context-")); roots.push(bookDir);
+    const candidate = "Ada opens the gate.";
+    const { transaction } = await beginTruthTransaction(bookDir);
+    const predecessor = await loadCommittedTruthForWriter({ bookDir, chapterNumber: 2 });
+    const committedAuthority = canonicalJson({ schemaVersion: "1.0", kind: "CANONICAL_TRUTH_COMMITTED_AUTHORITY",
+      structuredTruth: predecessor, chapterIntent: { memo: { body: "Persisted memo" }, markdown: "Persisted memo" } });
+    const input = { bookDir, transactionId: transaction.transactionId, attemptId: "attempt-1", attemptNumber: 1, chapterNumber: 2,
+      candidate, candidateSha256: sha256Utf8(candidate), predecessorCommitSha256: transaction.previousAuthoritySha256,
+      predecessor, committedAuthority, chapterMemo: "Persisted memo",
+      extractor: async () => { throw new Error("SYNTHETIC_STOP_AFTER_CONTEXT_FREEZE"); },
+      validator: async () => { throw new Error("VALIDATOR_MUST_NOT_RUN"); } };
+    await expect(runCanonicalTruthTransaction(input)).rejects.toThrow("SYNTHETIC_STOP_AFTER_CONTEXT_FREEZE");
+    const path = join(bookDir, "story/runtime/chapter-transactions/chapter-0002/staging/evidence/truth", sha256Utf8(candidate), "initial/extraction-context.json");
+    const context = JSON.parse(await readFile(path, "utf8"));
+    const request = context.request as TruthExtractionRequest;
+    // Reconstruct the pre-fix initial user message, including all three duplicated payloads.
+    const oldUser = [
+      `transactionId=${request.transactionId}`, `attemptId=${request.attemptId}`, `chapterNumber=${request.chapterNumber}`,
+      `candidateSha256=${request.candidateSha256}`, `predecessorTruthSha256=${request.predecessorTruthSha256}`,
+      `predecessorCommitSha256=${request.predecessorCommitSha256}`, `vocabularyCatalogSha256=${request.vocabularyCatalogSha256}`,
+      "extractionKind=INITIAL", "repairOrdinal=0", "## Exact approved candidate", request.candidate,
+      "## Verified predecessor StructuredTruthV1", request.predecessorTruthJson, "## Verified vocabulary catalog", request.vocabularyCatalogJson,
+      "## Verified committed authority", request.committedAuthority, "## Non-authorizing chapter memo", request.chapterMemo,
+    ].join("\n\n");
+    expect(oldUser).not.toBe(context.execution.messages[1].content);
+    const { contextSha256: _newSha, ...unsigned } = context;
+    unsigned.execution = frozenExecution("truth-extractor", [context.execution.messages[0], { role: "user", content: oldUser }]);
+    const oldBytes = canonicalJson({ ...unsigned, contextSha256: canonicalSha256(unsigned) }) + "\n";
+    await writeFile(path, oldBytes);
+    await expect(runCanonicalTruthTransaction(input)).rejects.toThrow(/immutable|context|conflict/i);
+    expect(await readFile(path, "utf8")).toBe(oldBytes);
+  });
+
   it("rejects a legacy transaction before canonical extraction even when its reviews pass", async () => {
     const bookDir = await mkdtemp(join(tmpdir(), "inkos-canonical-mode-")); roots.push(bookDir);
     const candidate = "Ada opens the gate.";

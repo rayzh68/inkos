@@ -3,6 +3,7 @@ import { BaseAgent, type AgentContext } from "./base.js";
 import type { TokenUsage } from "./writer.js";
 import type { LLMMessage } from "../llm/provider.js";
 import type { FinalProviderRequestObservation } from "../agent/worker-agent.js";
+import { projectTruthSettlementContext } from "./truth-settlement-context.js";
 
 export type TruthValidationVerdict = "PASS" | "DELTA_EXTRACTION_DEFECT" | "PROSE_CONTENT_DEFECT" | "AUTHORITY_AMBIGUITY";
 
@@ -43,6 +44,7 @@ export const TRUTH_VALIDATOR_OPTIONS = { temperature: 0.1, maxTokens: 2_048 } as
 
 /** The exact immutable message preimage used by the Truth Validator transport. */
 export function buildTruthValidatorMessages(input: TruthValidationRequest): readonly LLMMessage[] {
+  const context = projectTruthSettlementContext(input);
   return [
     {
       role: "system",
@@ -71,7 +73,7 @@ export function buildTruthValidatorMessages(input: TruthValidationRequest): read
         "## Deterministically resulting StructuredTruthV1",
         input.resultingTruthJson,
         "## Verified committed authority",
-        input.committedAuthority,
+        context.committedAuthority,
       ].join("\n\n"),
     },
   ];
