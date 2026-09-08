@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isValidProviderUsage } from "../llm/usage.js";
 import { publishImmutableFile } from "../utils/atomic-file-set.js";
 import { access, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -375,9 +376,7 @@ function addUsage(left: RoleTokenUsage, right: RoleTokenUsage): RoleTokenUsage {
 }
 
 function assertUsage(usage: RoleTokenUsage, label: string): void {
-  if (![usage.promptTokens, usage.completionTokens, usage.totalTokens].every((value) => Number.isSafeInteger(value) && value >= 0)
-    || usage.totalTokens !== usage.promptTokens + usage.completionTokens
-    || (usage.actualCostUsd !== undefined && (!Number.isFinite(usage.actualCostUsd) || usage.actualCostUsd < 0))) {
+  if (!isValidProviderUsage(usage)) {
     throw new Error(`${label} usage is invalid`);
   }
 }

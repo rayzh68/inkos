@@ -1,4 +1,5 @@
 import type { LLMConfig } from "../models/project.js";
+import { isValidProviderUsage, normalizeProviderUsage } from "./usage.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -1284,11 +1285,11 @@ async function chatCompletionViaCustomAnthropicCompatible(
     }
     return {
       content,
-      usage: {
-        promptTokens: json?.usage?.input_tokens ?? 0,
-        completionTokens: json?.usage?.output_tokens ?? 0,
-        totalTokens: (json?.usage?.input_tokens ?? 0) + (json?.usage?.output_tokens ?? 0),
-      },
+      usage: normalizeProviderUsage({
+        promptTokens: json?.usage?.input_tokens === undefined ? 0 : json.usage.input_tokens,
+        completionTokens: json?.usage?.output_tokens === undefined ? 0 : json.usage.output_tokens,
+        totalTokens: json?.usage?.total_tokens,
+      }),
     };
   }
 
@@ -1299,6 +1300,7 @@ async function chatCompletionViaCustomAnthropicCompatible(
   let content = "";
   let usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
   let sawMessageStop = false;
+  let reportedTotal: unknown;
   const monitor = createStreamMonitor(onStreamProgress);
 
   try {
@@ -1313,7 +1315,8 @@ async function chatCompletionViaCustomAnthropicCompatible(
         if (!event.data) continue;
         const json = JSON.parse(event.data);
         if (json.type === "message_start" && json.message?.usage) {
-          usage.promptTokens = json.message.usage.input_tokens ?? usage.promptTokens;
+          if (json.message.usage.input_tokens !== undefined) usage.promptTokens = json.message.usage.input_tokens;
+          if (json.message.usage.total_tokens !== undefined) reportedTotal = json.message.usage.total_tokens;
         }
         if (json.type === "content_block_delta" && json.delta?.type === "text_delta" && typeof json.delta.text === "string") {
           content += json.delta.text;
@@ -1321,11 +1324,11 @@ async function chatCompletionViaCustomAnthropicCompatible(
           onTextDelta?.(json.delta.text);
         }
         if (json.type === "message_delta" && json.usage) {
-          usage.completionTokens = json.usage.output_tokens ?? usage.completionTokens;
+          if (json.usage.output_tokens !== undefined) usage.completionTokens = json.usage.output_tokens;
+          if (json.usage.total_tokens !== undefined) reportedTotal = json.usage.total_tokens;
         }
         if (json.type === "message_stop") {
           sawMessageStop = true;
-          usage.totalTokens = usage.promptTokens + usage.completionTokens;
         }
       }
     }
@@ -1340,10 +1343,8 @@ async function chatCompletionViaCustomAnthropicCompatible(
     // Anthropic 协议的正常结束必须有 message_stop；没有就是流被中途掐断
     throw new PartialResponseError(content, new Error("stream closed without message_stop"));
   }
-  if (!usage.totalTokens) {
-    usage.totalTokens = usage.promptTokens + usage.completionTokens;
-  }
-  return { content, usage };
+  return { content, usage: normalizeProviderUsage({ promptTokens: usage.promptTokens,
+    completionTokens: usage.completionTokens, totalTokens: reportedTotal }) };
 }
 
 async function chatCompletionViaCustomOpenAICompatible(
@@ -1407,11 +1408,11 @@ async function chatCompletionViaCustomOpenAICompatible(
       }
       return {
         content,
-        usage: {
-          promptTokens: json?.usage?.input_tokens ?? 0,
-          completionTokens: json?.usage?.output_tokens ?? 0,
-          totalTokens: json?.usage?.total_tokens ?? 0,
-        },
+        usage: normalizeProviderUsage({
+          promptTokens: json?.usage?.input_tokens === undefined ? 0 : json.usage.input_tokens,
+          completionTokens: json?.usage?.output_tokens === undefined ? 0 : json.usage.output_tokens,
+          totalTokens: json?.usage?.total_tokens,
+        }),
       };
     }
 
@@ -1444,11 +1445,11 @@ async function chatCompletionViaCustomOpenAICompatible(
           if (json.type === "response.completed" || json.type === "response.incomplete") {
             sawResponseTerminal = true;
             if (json.type === "response.incomplete") sawResponseIncomplete = true;
-            usage = {
-              promptTokens: json.response?.usage?.input_tokens ?? 0,
-              completionTokens: json.response?.usage?.output_tokens ?? 0,
-              totalTokens: json.response?.usage?.total_tokens ?? 0,
-            };
+            usage = normalizeProviderUsage({
+              promptTokens: json.response?.usage?.input_tokens === undefined ? 0 : json.response.usage.input_tokens,
+              completionTokens: json.response?.usage?.output_tokens === undefined ? 0 : json.response.usage.output_tokens,
+              totalTokens: json.response?.usage?.total_tokens,
+            });
             if (!content) {
               content = extractResponsesContent(json.response);
             }
@@ -1536,11 +1537,11 @@ async function chatCompletionViaCustomOpenAICompatible(
     }
     return {
       content,
-      usage: {
-        promptTokens: json?.usage?.prompt_tokens ?? 0,
-        completionTokens: json?.usage?.completion_tokens ?? 0,
-        totalTokens: json?.usage?.total_tokens ?? 0,
-      },
+      usage: normalizeProviderUsage({
+        promptTokens: json?.usage?.prompt_tokens === undefined ? 0 : json.usage.prompt_tokens,
+        completionTokens: json?.usage?.completion_tokens === undefined ? 0 : json.usage.completion_tokens,
+        totalTokens: json?.usage?.total_tokens,
+      }),
     };
   }
 
@@ -1551,6 +1552,7 @@ async function chatCompletionViaCustomOpenAICompatible(
   let content = "";
   let reasoningContent = "";
   let usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+  let reportedTotal: unknown;
   // OpenAI 协议的正常结束必须出现 [DONE] 哨兵或带 finish_reason 的 chunk。
   // 网关掐断长连接时流会"干净地"关闭但没有任何终止信号——那是截断，不是完成。
   let sawTerminal = false;
@@ -1595,11 +1597,12 @@ async function chatCompletionViaCustomOpenAICompatible(
           }
         }
         if (json?.usage) {
-          usage = {
-            promptTokens: json.usage.prompt_tokens ?? usage.promptTokens,
-            completionTokens: json.usage.completion_tokens ?? usage.completionTokens,
-            totalTokens: json.usage.total_tokens ?? usage.totalTokens,
-          };
+          if (json.usage.total_tokens !== undefined) reportedTotal = json.usage.total_tokens;
+          usage = normalizeProviderUsage({
+            promptTokens: json.usage.prompt_tokens === undefined ? usage.promptTokens : json.usage.prompt_tokens,
+            completionTokens: json.usage.completion_tokens === undefined ? usage.completionTokens : json.usage.completion_tokens,
+            totalTokens: reportedTotal,
+          });
         }
       }
     }
@@ -1681,6 +1684,7 @@ export async function chatCompletion(
     });
     executionIdentity = prepared.identity;
     if (prepared.cachedResponse) {
+      if (!isValidProviderUsage(prepared.cachedResponse.usage)) throw new Error("Provider response usage is invalid");
       const observer = llmOutcomeObserverStorage.getStore();
       if (observer) {
         await observer({
@@ -1792,6 +1796,8 @@ export async function chatCompletion(
     await executionPolicy.markTransportReturned?.(executionIdentity);
     await executionPolicy.persistSuccess(executionIdentity, response);
   }
+  // Validate only after recording returned transport evidence, outside retry/failure classification.
+  if (!isValidProviderUsage(response.usage)) throw new Error("Provider response usage is invalid");
   const observer = llmOutcomeObserverStorage.getStore();
   if (observer) {
     await observer({
@@ -1888,11 +1894,11 @@ async function chatCompletionViaPiAi(
     }
     return {
       content,
-      usage: {
+      usage: normalizeProviderUsage({
         promptTokens: response.usage.input,
         completionTokens: response.usage.output,
         totalTokens: response.usage.totalTokens,
-      },
+      }),
     };
   }
 
@@ -1901,6 +1907,7 @@ async function chatCompletionViaPiAi(
   const monitor = createStreamMonitor(onStreamProgress);
   let inputTokens = 0;
   let outputTokens = 0;
+  let reportedTotal: number | undefined;
   let sawDone = false;
   let stoppedAtOutputLimit = false;
 
@@ -1922,6 +1929,7 @@ async function chatCompletionViaPiAi(
         const msg = event.type === "done" ? event.message : event.error;
         inputTokens = msg.usage.input;
         outputTokens = msg.usage.output;
+        reportedTotal = msg.usage.totalTokens;
         if (event.type === "done") {
           sawDone = true;
           stoppedAtOutputLimit = msg.stopReason === "length";
@@ -1968,10 +1976,10 @@ async function chatCompletionViaPiAi(
 
   return {
     content,
-    usage: {
+    usage: normalizeProviderUsage({
       promptTokens: inputTokens,
       completionTokens: outputTokens,
-      totalTokens: inputTokens + outputTokens,
-    },
+      totalTokens: reportedTotal,
+    }),
   };
 }

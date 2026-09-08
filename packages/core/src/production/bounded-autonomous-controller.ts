@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { isValidProviderUsage } from "../llm/usage.js";
 import { execFile } from "node:child_process";
 import { mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
@@ -1023,9 +1024,7 @@ function parseRecoveryUsage(value: unknown, label: string): Record<string, Recov
       throw new Error(`OFFLINE_FINALIZATION_PROVENANCE_INVALID:${label}:${role}`);
     }
     const usage = raw as Partial<RecoveryUsage>;
-    if (![usage.promptTokens, usage.completionTokens, usage.totalTokens].every((token) => Number.isInteger(token) && token! >= 0)
-      || usage.totalTokens !== usage.promptTokens! + usage.completionTokens!
-      || (usage.actualCostUsd !== undefined && (!Number.isFinite(usage.actualCostUsd) || usage.actualCostUsd < 0))) {
+    if (!isValidProviderUsage(usage)) {
       throw new Error(`OFFLINE_FINALIZATION_PROVENANCE_INVALID:${label}:${role}`);
     }
     result[role] = {

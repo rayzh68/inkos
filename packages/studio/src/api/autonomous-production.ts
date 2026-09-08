@@ -5,6 +5,7 @@ import {
   loadBookProductionMap,
   loadAutonomousProductionState,
   projectAutonomousEconomics,
+  isValidProviderUsage,
   resolveProductionScope,
   resolveFormalPendingChapterRecoveryPlan,
   saveAutonomousProductionState,
@@ -261,13 +262,9 @@ export function createCurrentTransactionUsageLoader(): CurrentTransactionUsageLo
         return;
       }
       const usage = artifact.response?.usage;
-      const tokenValues = usage ? [usage.promptTokens, usage.completionTokens, usage.totalTokens] : [];
       const invalidShape = artifact.logical_step_id !== file.slice(0, -5)
         || !artifact.role
-        || tokenValues.length !== 3
-        || tokenValues.some((value) => typeof value !== "number" || !Number.isFinite(value) || value < 0)
-        || (usage?.actualCostUsd !== undefined
-          && (typeof usage.actualCostUsd !== "number" || !Number.isFinite(usage.actualCostUsd) || usage.actualCostUsd < 0));
+        || !isValidProviderUsage(usage);
       if (invalidShape) {
         target.integrityWarnings.add(`PROVIDER_USAGE_ARTIFACT_INVALID:${file}`);
         target.inspectedLogicalStepIds.add(file.slice(0, -5));
@@ -508,6 +505,7 @@ export function projectAutonomousProductionView(params: {
           role,
           promptTokens: usage.promptTokens,
           completionTokens: usage.completionTokens,
+          totalTokens: usage.totalTokens,
           ...(usage.actualCostUsd !== undefined ? { actualCostUsd: usage.actualCostUsd } : {}),
           ...(calculatedCostUsd !== undefined
             ? { calculatedCostUsd, conservativeCostUsd: calculatedCostUsd }
@@ -533,6 +531,7 @@ export function projectAutonomousProductionView(params: {
         role: "legacy-total",
         promptTokens: chapter.tokenUsage.promptTokens,
         completionTokens: chapter.tokenUsage.completionTokens,
+        totalTokens: chapter.tokenUsage.totalTokens,
         ...(chapter.tokenUsage.actualCostUsd !== undefined ? { actualCostUsd: chapter.tokenUsage.actualCostUsd } : {}),
         ...(calculatedCostUsd !== undefined
           ? { calculatedCostUsd, conservativeCostUsd }

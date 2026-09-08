@@ -658,6 +658,7 @@ describe("chapter transaction convergence", () => {
       providerExtractorRawResponse?: string;
       extractorProviderUsage?: { promptTokens: number; completionTokens: number; totalTokens: number };
       providerActualCostUsd?: number;
+      reportedTotalTokens?: number;
       logicReviewLanguage?: "zh" | "en";
       omitTerminalRequestAuthorities?: boolean;
       productionAuthority?: string;
@@ -692,11 +693,11 @@ describe("chapter transaction convergence", () => {
     const providerResponseUsage = (role: string) => ({
       ...(role === "truth-extractor" && options.extractorProviderUsage
         ? options.extractorProviderUsage
-        : { promptTokens: 2, completionTokens: 3, totalTokens: 5 }),
+        : { promptTokens: 2, completionTokens: 3, totalTokens: options.reportedTotalTokens ?? 5 }),
       ...(options.providerActualCostUsd !== undefined ? { actualCostUsd: options.providerActualCostUsd } : {}),
     });
     const committedUsage = () => ({
-      promptTokens: 2, completionTokens: 3, totalTokens: 5,
+      promptTokens: 2, completionTokens: 3, totalTokens: options.reportedTotalTokens ?? 5,
       ...(options.providerActualCostUsd !== undefined ? { actualCostUsd: options.providerActualCostUsd } : {}),
     });
     const providerReferences: ChapterProviderReference[] = [];
@@ -945,7 +946,7 @@ describe("chapter transaction convergence", () => {
       },
       usage: {
         totalUsage: {
-          promptTokens: 10, completionTokens: 15, totalTokens: 25,
+          promptTokens: 10, completionTokens: 15, totalTokens: (options.reportedTotalTokens ?? 5) * 5,
           ...(options.providerActualCostUsd !== undefined ? { actualCostUsd: options.providerActualCostUsd * operations.length } : {}),
         },
         roleUsage: {
@@ -2689,6 +2690,24 @@ describe("chapter transaction convergence", () => {
     await writeFile(join(providerDir, `provider-step-${"a".repeat(64)}.json`), "{", "utf8");
     await expect(collectChapterProviderReferences({ bookDir, chapterNumber: 5, transactionId: transaction.transactionId }))
       .rejects.toBeInstanceOf(ChapterArtifactEvidenceError);
+  });
+
+  it("commits and verifies surplus reported totals without changing Provider evidence", async () => {
+    const { bookDir } = await fixture(3);
+    const { transaction, stageInput } = await stageV2Passing(bookDir, 5, { reportedTotalTokens: 8, providerActualCostUsd: 0.125 });
+    const before = await Promise.all(stageInput.providerReferences.map((reference) => readFile(join(bookDir, reference.artifactRelativePath))));
+    await finalizeChapterTransaction({ bookDir, transactionId: transaction.transactionId });
+    const chain = await verifyChapterCommitChain({ bookDir });
+    expect(chain.latestChapter).toBe(5);
+    const usage = JSON.parse(await readFile(join(bookDir, "story/commits/chapter-0005/usage.json"), "utf8"));
+    expect(usage.totalUsage).toEqual({ promptTokens: 10, completionTokens: 15, totalTokens: 40, actualCostUsd: 0.625 });
+    expect(usage.roleUsage["truth-validator"].totalTokens).toBe(8);
+    expect(await Promise.all(stageInput.providerReferences.map((reference) => readFile(join(bookDir, reference.artifactRelativePath))))).toEqual(before);
+  });
+
+  it("rejects Provider totals below classified usage at Commit staging", async () => {
+    const { bookDir } = await fixture(3);
+    await expect(stageV2Passing(bookDir, 5, { reportedTotalTokens: 4 })).rejects.toThrow(/usage is invalid/i);
   });
 
   it("derives every durable transaction role and exact optional cost from Provider artifacts", async () => {

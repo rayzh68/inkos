@@ -28,6 +28,13 @@ const catalog = [
 ];
 
 describe("autonomous production Studio projection", () => {
+  it.each(["role", "fallback"])("preserves provider totals and actual cost in %s historical projection", (kind) => {
+    const usage = { promptTokens: 100, completionTokens: 20, totalTokens: 125, actualCostUsd: 0.4 };
+    const view = projectAutonomousProductionView({ map, targetChapters: 156, nextChapter: 2, runtime: null, active: false,
+      chapters: [{ number: 1, status: "approved", ...(kind === "role" ? { roleUsage: { writer: usage } } : { tokenUsage: usage }) }],
+      config: { defaultModel: "gpt", modelOverrides: { auditor: "deepseek", "commercial-reader": "gemini" } }, catalog });
+    expect(view.economics.historicalBook).toMatchObject({ promptTokens: 100, completionTokens: 20, totalTokens: 125, costUsd: 0.4 });
+  });
   it("keeps current-attempt telemetry available and reports a malformed artifact warning", async () => {
     const root = await mkdtemp(join(tmpdir(), "inkos-usage-integrity-"));
     try {
@@ -50,6 +57,10 @@ describe("autonomous production Studio projection", () => {
         logical_step_id: "bad-tokens", role: "writer",
         response: { usage: { promptTokens: "bad", completionTokens: -1, totalTokens: 2 } },
       }));
+      for (const [name, totalTokens] of [["below-sum", 14], ["fractional", 15.5]] as const) {
+        await writeFile(join(dir, `${name}.json`), JSON.stringify({ transaction_id: "chapter-txn-test", response_artifact_status: "COMPLETE",
+          logical_step_id: name, role: "reviewer", response: { usage: { promptTokens: 10, completionTokens: 5, totalTokens } } }));
+      }
       const usage = await loadCurrentTransactionUsage(root, "book", "chapter-txn-test");
       expect(usage.records).toHaveLength(1);
       expect(usage.records[0]).toMatchObject({ identity: logicalStepId, totalTokens: 15 });
@@ -57,6 +68,8 @@ describe("autonomous production Studio projection", () => {
         "PROVIDER_USAGE_ARTIFACT_INVALID:broken.json",
         "PROVIDER_USAGE_ARTIFACT_INVALID:wrong-name.json",
         "PROVIDER_USAGE_ARTIFACT_INVALID:bad-tokens.json",
+        "PROVIDER_USAGE_ARTIFACT_INVALID:below-sum.json",
+        "PROVIDER_USAGE_ARTIFACT_INVALID:fractional.json",
       ]));
     } finally {
       await rm(root, { recursive: true, force: true });

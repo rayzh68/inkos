@@ -143,6 +143,68 @@ function makeClient(temperature = 0.7, extra: Partial<LLMClient> = {}): LLMClien
   };
 }
 
+describe("provider reported usage contract", () => {
+  it.each(["chat", "responses", "anthropic"] as const)("preserves or derives native %s totals in both transport modes", async (apiFormat) => {
+    for (const stream of [false, true]) for (const total of [125, undefined]) {
+      const usage = apiFormat === "chat" ? { prompt_tokens: 100, completion_tokens: 20, total_tokens: total, cost: 0.4 }
+        : { input_tokens: 100, output_tokens: 20, total_tokens: total, cost: 0.4 };
+      const payload = apiFormat === "chat" ? { choices: [{ message: { content: "answer" } }], usage }
+        : apiFormat === "responses" ? { output: [{ type: "message", content: [{ type: "output_text", text: "answer" }] }], usage }
+        : { content: [{ type: "text", text: "answer" }], usage };
+      const events = apiFormat === "chat" ? [{ choices: [{ delta: { content: "answer" }, finish_reason: "stop" }], usage }]
+        : apiFormat === "responses" ? [{ type: "response.output_text.delta", delta: "answer" }, { type: "response.completed", response: payload }]
+        : [{ type: "message_start", message: { usage: { input_tokens: 100 } } }, { type: "content_block_delta", delta: { type: "text_delta", text: "answer" } },
+          { type: "message_delta", usage }, { type: "message_stop" }];
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(stream ? events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") : JSON.stringify(payload), { status: 200 })));
+      try {
+        const result = await chatCompletion(makeClient(0.7, { service: "custom", apiFormat: apiFormat === "responses" ? "responses" : "chat", stream,
+          provider: apiFormat === "anthropic" ? "anthropic" : "openai",
+          _piModel: { ...MOCK_PI_MODEL, api: apiFormat === "anthropic" ? "anthropic-messages" : MOCK_PI_MODEL.api,
+            baseUrl: "https://transport.invalid/v1" } }), "test-model", [{ role: "user", content: "ping" }]);
+        // A generic upstream cost field supplies no proof of USD units or actual-cost authority.
+        expect(result.usage).toEqual({ promptTokens: 100, completionTokens: 20, totalTokens: total === undefined ? 120 : 125 });
+      } finally { vi.unstubAllGlobals(); }
+    }
+  });
+  it.each([119, null, -1, 1.5, "125"])("rejects explicit malformed total %s after durable success without retry", async (totalTokens) => {
+    const msg = { ...makeAssistantMessage("answer"), usage: { ...MOCK_USAGE, input: 100, output: 20, totalTokens } };
+    mockCompleteSimple.mockResolvedValue(msg);
+    const persisted: unknown[] = [];
+    const identity = { logicalStepId: "usage-step", provider: "openai", model: "test-model", attemptNumber: 1,
+      inputFingerprint: "a".repeat(64), role: "reviewer", stage: "REVIEW" };
+    const events: string[] = [];
+    await expect(runWithLLMCallExecutionPolicy({ prepare: async () => ({ identity }),
+      markTransportStarted: async () => { events.push("started"); }, markTransportReturned: async () => { events.push("returned"); },
+      persistSuccess: async (_identity, response) => { events.push("success"); persisted.push(response); },
+      persistFailure: async () => { events.push("failure"); },
+    }, () => chatCompletion(makeClient(0.7, { stream: false }), "test-model", [{ role: "user", content: "ping" }]))).rejects.toThrow("Provider response usage is invalid");
+    expect(events).toEqual(["started", "returned", "success"]);
+    expect(persisted).toEqual([{ content: "answer", usage: { promptTokens: 100, completionTokens: 20, totalTokens } }]);
+  });
+  it.each([true, false])("preserves Pi total and never treats catalog cost as actual (stream=%s)", async (stream) => {
+    const msg = { ...makeAssistantMessage("answer"), usage: { ...MOCK_USAGE, totalTokens: 23,
+      cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, total: 3 } } };
+    mockStreamSimple.mockReturnValue(makeEventStream([
+      { type: "text_delta", delta: "answer", partial: msg }, { type: "done", message: msg },
+    ]));
+    mockCompleteSimple.mockResolvedValue(msg);
+    const result = await chatCompletion(makeClient(0.7, { stream }), "test-model", [{ role: "user", content: "ping" }]);
+    expect(result.usage).toEqual({ promptTokens: 11, completionTokens: 7, totalTokens: 23 });
+  });
+  it.each([125, 119])("revalidates cached total %i without transport or persistence", async (totalTokens) => {
+    const events: string[] = [];
+    const cachedResponse = { content: "retained", usage: { promptTokens: 100, completionTokens: 20, totalTokens, actualCostUsd: 0.4 } };
+    const result = runWithLLMCallExecutionPolicy({
+      prepare: async () => ({ identity: { logicalStepId: "cached", provider: "openai", model: "test-model", attemptNumber: 1,
+        inputFingerprint: "b".repeat(64), role: "reviewer", stage: "REVIEW" }, cachedResponse }),
+      markTransportStarted: async () => { events.push("transport"); }, persistSuccess: async () => { events.push("persist"); },
+    }, () => chatCompletion(makeClient(), "test-model", [{ role: "user", content: "ping" }]));
+    if (totalTokens === 125) await expect(result).resolves.toEqual(cachedResponse);
+    else await expect(result).rejects.toThrow("Provider response usage is invalid");
+    expect(events).toEqual([]);
+  });
+});
+
 async function captureError(task: Promise<unknown>): Promise<Error> {
   try {
     await task;

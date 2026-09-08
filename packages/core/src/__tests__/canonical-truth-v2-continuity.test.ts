@@ -122,7 +122,7 @@ function baselineTruth(bookId: string): StructuredTruthV1 {
 }
 
 describe("synthetic canonical V2 continuity", () => {
-  it("replays completed stages after BookRules authority failure with no new transports", async () => {
+  it.each([2, 3])("replays completed stages after BookRules authority failure with no new transports (reported total %i)", async (reportedTotal) => {
     const root = await mkdtemp(join(tmpdir(), "inkos-bookrules-replay-")); roots.push(root);
     const state = new StateManager(root);
     const bookId = "island-authority";
@@ -173,7 +173,7 @@ describe("synthetic canonical V2 continuity", () => {
         "commercial-reader": JSON.stringify({ total_score: 92, dimension_scores: { opening_hook: 92, pacing_tension: 92, emotional_investment: 92, plot_clarity: 92, dialogue_appeal: 92, western_cultural_naturalness: 92, commercial_appeal: 92, ending_hook: 92 }, decision: "APPROVED", findings: [] }),
       };
       if (!responses[stage.role]) throw new Error(`Unexpected transport: ${stage.role}`);
-      return new Response(JSON.stringify({ choices: [{ message: { content: responses[stage.role] } }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }), { status: 200, headers: { "Content-Type": "application/json" } });
+      return new Response(JSON.stringify({ choices: [{ message: { content: responses[stage.role] } }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: reportedTotal } }), { status: 200, headers: { "Content-Type": "application/json" } });
     }));
     const run = () => {
       const runner = new PipelineRunner({ client, model: "scripted", projectRoot: root, boundedAutonomousReview: true, firstV2Baseline,

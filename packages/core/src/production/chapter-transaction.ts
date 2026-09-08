@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { isValidProviderUsage } from "../llm/usage.js";
 import { access, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import type { LengthSpec } from "../models/length-governance.js";
@@ -1771,11 +1772,7 @@ interface ProviderUsageAuthority {
 
 function validateProviderUsage(value: unknown, label: string): ProviderUsageAuthority {
   const usage = value as Partial<ProviderUsageAuthority> | null;
-  if (!usage || !Number.isSafeInteger(usage.promptTokens) || usage.promptTokens! < 0
-    || !Number.isSafeInteger(usage.completionTokens) || usage.completionTokens! < 0
-    || !Number.isSafeInteger(usage.totalTokens) || usage.totalTokens! < 0
-    || usage.totalTokens !== usage.promptTokens! + usage.completionTokens!
-    || (usage.actualCostUsd !== undefined && (!Number.isFinite(usage.actualCostUsd) || usage.actualCostUsd < 0))) {
+  if (!isValidProviderUsage(usage)) {
     throw new Error(`${label} Provider response usage is invalid`);
   }
   return {
