@@ -12,6 +12,7 @@ import {
   buildSemanticAuthorityEnvelope,
 } from "../agents/semantic-authority.js";
 import { createHash } from "node:crypto";
+import { beginChapterTransaction, createChapterGenesis, recordChapterTransactionCandidate, reserveChapterTransactionProviderRequest } from "../production/chapter-transaction.js";
 
 const ZERO_USAGE = {
   promptTokens: 0,
@@ -47,6 +48,7 @@ describe("ContinuityAuditor", () => {
     ]);
     const truth = committedTruthForAudit();
     const immutablePredecessorBody = "IMMUTABLE COMMITTED PREDECESSOR PROSE";
+    const memoBody = "EXACT MEMO BODY\nKeep the gate closed until Ada arrives.";
     const auditor = new ContinuityAuditor({ client: { provider: "openai", apiFormat: "chat", stream: false, defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} } }, model: "test-model", projectRoot: root });
     let exactFinalMessages: ReadonlyArray<{ role: "system" | "user" | "assistant"; content: string }> = [];
     const chat = vi.spyOn(auditor as unknown as { chat: (...args: any[]) => Promise<unknown> }, "chat").mockImplementation(async (
@@ -58,7 +60,7 @@ describe("ContinuityAuditor", () => {
         : message);
       options.onFinalProviderRequest?.({
         provider: "openai", model: "test-model", messages: exactFinalMessages,
-        temperature: 0.3, maxTokens: 4096, stream: false,
+        temperature: 0.3, maxTokens: 4096, stream: false, webSearch: false, extra: {},
       });
       return { content: JSON.stringify({ passed: true, issues: [], summary: "ok" }), usage: ZERO_USAGE };
     });
@@ -66,10 +68,30 @@ describe("ContinuityAuditor", () => {
       const result = await auditor.auditChapter(bookDir, "Ada opens the gate.", 1, "other", {
         authoritativeTruth: truth,
         predecessorChapterBody: immutablePredecessorBody,
+        chapterMemo: { chapter: 1, goal: "Open the gate", body: memoBody, isGoldenOpening: false, threadRefs: [] },
+        chapterIntent: `Author intent stays intact\n${memoBody}\nEnd intent`,
+        contextPackage: {
+          chapter: 1,
+          selectedContext: [
+            { source: "committed-truth", reason: "Immutable authority", excerpt: canonicalJson(truth) },
+            { source: "chapter-memo", reason: "Chapter plan", excerpt: memoBody },
+            { source: "story-frame", reason: "Global anchors", excerpt: "STORY FRAME EXACT EXCERPT" },
+            { source: "volume-map", reason: "Volume authority", excerpt: "VOLUME MAP EXACT EXCERPT" },
+          ],
+        },
+        ruleStack: { layers: [], sections: { hard: ["current_state"], soft: [], diagnostic: [] }, overrideEdges: [], activeOverrides: [] },
       });
       const messages = chat.mock.calls[0]?.[0] as ReadonlyArray<{ role: string; content: string }>;
       const prompt = messages.map((message) => message.content).join("\n");
       expect(prompt).toContain(canonicalJson(truth));
+      expect.soft(prompt.split(canonicalJson(truth)).length - 1).toBe(1);
+      expect.soft(prompt.split(memoBody).length - 1).toBe(1);
+      expect(messages[1]!.content.split("## Chapter Content Under Review\n")[1]).toBe("Ada opens the gate.");
+      expect(prompt).toContain("Author intent stays intact");
+      expect(prompt).toContain("End intent");
+      expect(prompt).toContain("STORY FRAME EXACT EXCERPT");
+      expect(prompt).toContain("VOLUME MAP EXACT EXCERPT");
+      expect(messages[0]!.content).toContain("Ongoing authority contract");
       expect(prompt).toContain(immutablePredecessorBody);
       expect(prompt).not.toContain(poison);
       expect(result.providerRequest?.messages).toEqual(exactFinalMessages);
@@ -81,6 +103,20 @@ describe("ContinuityAuditor", () => {
         }), "utf8").digest("hex"),
       );
       expect(result.providerRequest).toMatchObject({ reviewLanguage: "en" });
+      // Exercise the unchanged reservation authority with the actual deduplicated
+      // auditor output, in a new synthetic attempt (never the real attempt).
+      const snapshotDir = join(storyDir, "snapshots", "0");
+      await mkdir(snapshotDir, { recursive: true });
+      await writeFile(join(snapshotDir, "baseline.txt"), "synthetic genesis");
+      await createChapterGenesis({ bookDir, bookId: "audit-v2", lastTrustedChapter: 0, trustedSnapshotDir: snapshotDir });
+      const transaction = await beginChapterTransaction({ bookDir, bookId: "audit-v2", chapterNumber: 1, productionAuthority: "synthetic-test" });
+      const candidateSha256 = createHash("sha256").update("Ada opens the gate.").digest("hex");
+      await recordChapterTransactionCandidate({ bookDir, transactionId: transaction.transactionId, label: "INITIAL", content: "Ada opens the gate.", sha256: candidateSha256 });
+      const input = { bookDir, transactionId: transaction.transactionId, chapterNumber: 1, candidateSha256,
+        role: "logic-canon-auditor", stage: "LOGIC_REVIEW", requestOrdinal: 0, reviewLanguage: "en" as const, request: result.providerRequest! };
+      const reservation = await reserveChapterTransactionProviderRequest(input);
+      expect(reservation.requestOrdinal).toBe(0);
+      await expect(reserveChapterTransactionProviderRequest(input)).resolves.toEqual(reservation);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
