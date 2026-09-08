@@ -44,6 +44,39 @@ export const BookRulesSchema = z.object({
 
 export type BookRules = z.infer<typeof BookRulesSchema>;
 
+/** Project runtime rules into committed authority without changing runtime/parser semantics. */
+export function projectBookRulesForCanonicalAuthority(rules: BookRules) {
+  return {
+    version: rules.version,
+    ...(rules.protagonist !== undefined ? { protagonist: {
+      name: rules.protagonist.name,
+      personalityLock: [...rules.protagonist.personalityLock],
+      behavioralConstraints: [...rules.protagonist.behavioralConstraints],
+    } } : {}),
+    ...(rules.genreLock !== undefined ? { genreLock: {
+      primary: rules.genreLock.primary,
+      forbidden: [...rules.genreLock.forbidden],
+    } } : {}),
+    ...(rules.narrativePerson !== undefined ? { narrativePerson: rules.narrativePerson } : {}),
+    ...(rules.numericalSystemOverrides !== undefined ? { numericalSystemOverrides: {
+      ...(rules.numericalSystemOverrides.hardCap !== undefined ? { hardCap: rules.numericalSystemOverrides.hardCap } : {}),
+      resourceTypes: [...rules.numericalSystemOverrides.resourceTypes],
+    } } : {}),
+    ...(rules.eraConstraints !== undefined ? { eraConstraints: {
+      enabled: rules.eraConstraints.enabled,
+      ...(rules.eraConstraints.period !== undefined ? { period: rules.eraConstraints.period } : {}),
+      ...(rules.eraConstraints.region !== undefined ? { region: rules.eraConstraints.region } : {}),
+    } } : {}),
+    prohibitions: [...rules.prohibitions],
+    chapterTypesOverride: [...rules.chapterTypesOverride],
+    fatigueWordsOverride: [...rules.fatigueWordsOverride],
+    additionalAuditDimensions: [...rules.additionalAuditDimensions],
+    enableFullCastTracking: rules.enableFullCastTracking,
+    ...(rules.fanficMode !== undefined ? { fanficMode: rules.fanficMode } : {}),
+    allowedDeviations: [...rules.allowedDeviations],
+  };
+}
+
 export interface ParsedBookRules {
   readonly rules: BookRules;
   readonly body: string;
