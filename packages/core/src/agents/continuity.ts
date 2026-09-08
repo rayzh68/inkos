@@ -817,9 +817,16 @@ overall_score 评分校准：
         ? `\n## Chapter Memo (for memo drift checks)\nGoal: ${options.chapterMemo.goal}\n\n${options.chapterMemo.body}\n`
         : `\n## 章节备忘（用于 memo 偏离检测）\ngoal：${options.chapterMemo.goal}\n\n${options.chapterMemo.body}\n`
       : "";
-    const reducedControlBlock = options?.chapterIntent && options.contextPackage && options.ruleStack
+    const rawReducedControlBlock = options?.chapterIntent && options.contextPackage && options.ruleStack
       ? this.buildReducedControlBlock(options.chapterIntent, options.contextPackage, options.ruleStack, resolvedLanguage)
       : "";
+    // Keep the complete memo in its dedicated section. Replace only exact body
+    // duplicates in compiled control inputs; never transform either prose body.
+    const reducedControlBlock = options?.chapterMemo?.body
+      ? rawReducedControlBlock.split(options.chapterMemo.body).join(isEnglish
+        ? "[See complete Chapter Memo below.]"
+        : "[见下方完整章节备忘。]")
+      : rawReducedControlBlock;
     const styleGuideBlock = reducedControlBlock.length === 0
       ? isEnglish
         ? `\n## Style Guide\n${styleGuide}`
@@ -832,13 +839,21 @@ overall_score 评分校准：
         : `\n## 上一章全文（用于衔接检查）\n${previousChapter}\n`
       : "";
 
+    const rawSupplementalContext = `${ledgerBlock}\n${hooksBlock}${volumeSummariesBlock}${subplotBlock}${emotionalBlock}${matrixBlock}${summariesBlock}${canonBlock}${fanficCanonBlock}${reducedControlBlock}`;
+    // V2 supplies the same complete truth through several legacy-shaped slots
+    // and Selected Context. Preserve one full authority in Current State Card,
+    // with explicit references from the duplicate slots, not lossy projections.
+    const supplementalContext = authoritativeTruthJson && currentState.includes(authoritativeTruthJson)
+      ? rawSupplementalContext.split(authoritativeTruthJson).join(isEnglish
+        ? "[See complete StructuredTruth in Current State Card above.]"
+        : "[见上方当前状态卡中的完整 StructuredTruth。]")
+      : rawSupplementalContext;
     const userPrompt = isEnglish
       ? `Review chapter ${chapterNumber}.
 
 ## Current State Card
 ${currentState}
-${ledgerBlock}
-${hooksBlock}${volumeSummariesBlock}${subplotBlock}${emotionalBlock}${matrixBlock}${summariesBlock}${canonBlock}${fanficCanonBlock}${reducedControlBlock}${memoBlock}${prevChapterBlock}${styleGuideBlock}
+${supplementalContext}${memoBlock}${prevChapterBlock}${styleGuideBlock}
 
 ## Chapter Content Under Review
 ${chapterContent}`
@@ -846,8 +861,7 @@ ${chapterContent}`
 
 ## 当前状态卡
 ${currentState}
-${ledgerBlock}
-${hooksBlock}${volumeSummariesBlock}${subplotBlock}${emotionalBlock}${matrixBlock}${summariesBlock}${canonBlock}${fanficCanonBlock}${reducedControlBlock}${memoBlock}${prevChapterBlock}${styleGuideBlock}
+${supplementalContext}${memoBlock}${prevChapterBlock}${styleGuideBlock}
 
 ## 待审章节内容
 ${chapterContent}`;
