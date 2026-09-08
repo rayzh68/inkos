@@ -4,6 +4,11 @@ import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StateManager } from "../state/manager.js";
+import * as chapterTransactions from "../production/chapter-transaction.js";
+import * as baselineBuilder from "../production/first-v2-baseline.js";
+import { PipelineRunner } from "../pipeline/runner.js";
+import { createAutonomousPipelineActions, runBoundedAutonomousScope } from "../production/bounded-autonomous-controller.js";
+import { parseBookProductionMap } from "../production/book-production-map.js";
 import {
   beginChapterTransaction,
   abandonChapterTransactionAttempt,
@@ -75,9 +80,10 @@ describe("chapter transaction convergence", () => {
     await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
   });
 
-  async function fixture(lastTrustedChapter = 4) {
-    const bookDir = await mkdtemp(join(tmpdir(), "inkos-chapter-txn-"));
-    roots.push(bookDir);
+  async function fixture(lastTrustedChapter = 4, nestedBook = false) {
+    const root = await mkdtemp(join(tmpdir(), "inkos-chapter-txn-"));
+    roots.push(root);
+    const bookDir = nestedBook ? join(root, "books", "book-a") : root;
     await mkdir(join(bookDir, "story", "snapshots", "4", "state"), { recursive: true });
     await mkdir(join(bookDir, "chapters"), { recursive: true });
     for (const chapter of [1, 2, 3, 4]) await writeFile(join(bookDir, "chapters", `${String(chapter).padStart(4, "0")}_Legacy.md`), `legacy ${chapter}`, "utf-8");
@@ -95,7 +101,7 @@ describe("chapter transaction convergence", () => {
       trustedSnapshotDir: join(bookDir, "story", "snapshots", String(lastTrustedChapter)),
       createdAt: "2026-08-28T00:00:00.000Z",
     });
-    return { bookDir, genesis };
+    return { root, bookDir, genesis };
   }
 
   it("centralizes Genesis and committed chapter denial and fails closed on corrupt cutover evidence", async () => {
@@ -362,6 +368,105 @@ describe("chapter transaction convergence", () => {
     baseline.truthSha256 = canonicalSha256(baseline.truth);
   }
 
+  it("automatic first-V2 cutover retires legacy staging and binds only committed source bytes", async () => {
+    const { bookDir } = await fixture(3);
+    await hostBaseline(bookDir);
+    const old = await beginChapterTransaction({ bookDir, bookId: "book-a", chapterNumber: 5, productionAuthority: "blueprint:v1" });
+    const candidate = join(bookDir, "story/runtime/chapter-transactions/chapter-0005/old-candidate.txt");
+    await writeFile(candidate, "uncommitted material must stay history");
+    const request = { bookDir, bookId: "book-a", productionAuthority: "blueprint:v1", runtimeSnapshot: JSON.stringify({ nextChapter: 5, providerAttemptHistory: [] }) };
+    const transaction = await chapterTransactions.prepareFirstV2Cutover(request);
+    expect(transaction).toMatchObject({ chapterNumber: 5, truthMode: "CANONICAL_V2", attemptNumber: 2 });
+    expect(transaction!.transactionId).not.toBe(old.transactionId);
+    expect(await readFile(candidate, "utf8")).toBe("uncommitted material must stay history");
+    const baseline = JSON.parse(await readFile(join(bookDir, "story/runtime/chapter-transactions/chapter-0005/attempts/attempt-0002/first-v2-baseline.json"), "utf8"));
+    expect(baseline.sourceManifest.entries.map((entry: { path: string }) => entry.path)).toEqual(["current_state.json", "current_state.md", "manifest.json"]);
+    expect(baseline.truth).toMatchObject({ throughChapter: 4, entities: [], facts: [], relations: [] });
+    expect(await chapterTransactions.prepareFirstV2Cutover(request)).toMatchObject({ transactionId: transaction!.transactionId });
+    expect(await loadCommittedTruthForWriter({ bookDir, chapterNumber: 5 })).toEqual(baseline.truth);
+  });
+
+  it("automatic first-V2 cutover fails closed for missing or unresolved Provider history", async () => {
+    const { bookDir } = await fixture(3);
+    await hostBaseline(bookDir);
+    const old = await stagePassing(bookDir, 5);
+    const request = { bookDir, bookId: "book-a", productionAuthority: "blueprint:v1" };
+    await expect(chapterTransactions.prepareFirstV2Cutover({ ...request, runtimeSnapshot: "{}" })).rejects.toThrow(/PROVIDER|HISTORY/);
+    await expect(chapterTransactions.prepareFirstV2Cutover({ ...request, runtimeSnapshot: JSON.stringify({ nextChapter: 5, providerAttemptHistory: [{ transactionId: old.transactionId, chapterNumber: 5, logicalStepId: "unresolved", transportStarted: true, transportReturned: false }] }) })).rejects.toThrow(/PROVIDER|HISTORY/);
+    expect(await inspectChapterAuthority({ bookDir })).toMatchObject({ activeTransactionId: old.transactionId });
+  });
+
+  it("automatic first-V2 cutover resumes after terminal abandonment before its descriptive marker", async () => {
+    const { bookDir } = await fixture(3);
+    await hostBaseline(bookDir);
+    const old = await beginChapterTransaction({ bookDir, bookId: "book-a", chapterNumber: 5, productionAuthority: "blueprint:v1" });
+    await abandonChapterTransactionAttempt({ bookDir, bookId: "book-a", chapterNumber: 5, transactionId: old.transactionId, runtimeSnapshot: "original snapshot" });
+    await rm(join(bookDir, "story/runtime/chapter-transactions/chapter-0005/abandonment.json"));
+    const next = await chapterTransactions.prepareFirstV2Cutover({ bookDir, bookId: "book-a", productionAuthority: "blueprint:v1", runtimeSnapshot: "different current runtime" });
+    expect(next).toMatchObject({ truthMode: "CANONICAL_V2", attemptNumber: 2 });
+    expect(await readFile(join(bookDir, "story/runtime/chapter-transactions/chapter-0005/runtime-at-abandon.json"), "utf8")).toBe("original snapshot");
+    expect(JSON.parse(await readFile(join(bookDir, "story/runtime/chapter-transactions/chapter-0005/abandonment.json"), "utf8"))).toMatchObject({ transactionId: old.transactionId });
+  });
+
+  it("automatic first-V2 cutover verifies exact orphan authority for Studio admission and recovers the same transaction", async () => {
+    const { bookDir } = await fixture(3);
+    await hostBaseline(bookDir);
+    const request = { bookDir, bookId: "book-a", productionAuthority: "blueprint:v1" };
+    const first = await chapterTransactions.prepareFirstV2Cutover(request);
+    const root = join(bookDir, "story/runtime/chapter-transactions/chapter-0005");
+    const baseline = await readFile(join(root, "first-v2-baseline.json"));
+    await rm(join(root, "transaction.json"));
+    await expect(inspectChapterAuthority({ bookDir })).rejects.toThrow("FIRST_V2_BASELINE_TRANSACTION_MISSING");
+    expect(await inspectChapterAuthority({ bookDir, allowRecoverableFirstV2Baseline: true })).toMatchObject({ state: "COMMITTED", nextChapter: 5 });
+    const recovered = await chapterTransactions.prepareFirstV2Cutover(request);
+    expect(recovered).toMatchObject({ transactionId: first!.transactionId });
+    expect(await readFile(join(root, "first-v2-baseline.json"))).toEqual(baseline);
+    await rm(join(root, "transaction.json"));
+    await writeFile(join(root, "first-v2-baseline.json"), "{}");
+    await expect(inspectChapterAuthority({ bookDir, allowRecoverableFirstV2Baseline: true })).rejects.toThrow(/ORPHAN|BASELINE/);
+  });
+
+  it("automatic first-V2 cutover preserves completed Provider history and never reuses old settlement", async () => {
+    const { bookDir } = await fixture(3);
+    await hostBaseline(bookDir);
+    const old = await stagePassing(bookDir, 5);
+    const references = await collectChapterProviderReferences({ bookDir, chapterNumber: 5, transactionId: old.transactionId });
+    const before = await Promise.all(references.map((reference) => readFile(join(bookDir, reference.artifactRelativePath))));
+    const providerAttemptHistory = references.map((reference, index) => ({
+      transportAttemptId: `old-transport-${index}`, logicalStepId: reference.logicalOperationId, transactionId: old.transactionId,
+      chapterNumber: 5, role: reference.role, provider: reference.provider, requestedModel: reference.requestedModel,
+      attempt: 1, classification: "SUCCESS", transportStarted: true, transportReturned: true, recordedAt: "2026-09-04T00:00:00.000Z",
+    }));
+    const runtimeSnapshot = JSON.stringify({ nextChapter: 5, status: "PAUSED_PIPELINE_ERROR", phase: "SETTLING_STATE", role: "state-validator-settlement-repair", providerAttemptHistory });
+    const next = await chapterTransactions.prepareFirstV2Cutover({ bookDir, bookId: "book-a", productionAuthority: "blueprint:v1", runtimeSnapshot });
+    expect(next).toMatchObject({ truthMode: "CANONICAL_V2", attemptNumber: 2, completedOperations: [] });
+    expect(await Promise.all(references.map((reference) => readFile(join(bookDir, reference.artifactRelativePath))))).toEqual(before);
+    expect(await readFile(join(bookDir, "story/runtime/chapter-transactions/chapter-0005/runtime-at-abandon.json"), "utf8")).toBe(runtimeSnapshot);
+  });
+
+  it("automatic first-V2 cutover reuses an already validated durable baseline without reconstructing it", async () => {
+    const { bookDir } = await fixture(3);
+    const firstV2Baseline = await hostBaseline(bookDir);
+    const request = { bookDir, bookId: "book-a", chapterNumber: 5, productionAuthority: "blueprint:v1", truthMode: "CANONICAL_V2" as const, firstV2Baseline };
+    const first = await beginChapterTransaction(request);
+    expect(await chapterTransactions.prepareFirstV2Cutover(request)).toMatchObject({ transactionId: first.transactionId });
+  });
+
+  it("automatic first-V2 cutover leaves Genesis-only books on their existing admission path", async () => {
+    const { bookDir } = await fixture();
+    expect(await chapterTransactions.prepareFirstV2Cutover({ bookDir, bookId: "book-a", productionAuthority: "blueprint:v1" })).toBeUndefined();
+    expect(await inspectChapterAuthority({ bookDir })).toMatchObject({ state: "NOT_STARTED", nextChapter: 5 });
+  });
+
+  it("automatic first-V2 cutover rejects mismatching current-transaction history even under another chapter", async () => {
+    const { bookDir } = await fixture(3);
+    await hostBaseline(bookDir);
+    const old = await beginChapterTransaction({ bookDir, bookId: "book-a", chapterNumber: 5, productionAuthority: "blueprint:v1" });
+    const runtimeSnapshot = JSON.stringify({ nextChapter: 5, providerAttemptHistory: [{ transactionId: old.transactionId, chapterNumber: 4, logicalStepId: "bad-history", transportStarted: true, transportReturned: false }] });
+    await expect(chapterTransactions.prepareFirstV2Cutover({ bookDir, bookId: "book-a", productionAuthority: "blueprint:v1", runtimeSnapshot })).rejects.toThrow(/PROVIDER|HISTORY/);
+    expect(await inspectChapterAuthority({ bookDir })).toMatchObject({ activeTransactionId: old.transactionId });
+  });
+
   it.each(["forged truth", "wrong predecessor", "wrong source", "wrong book", "wrong chapter"] as const)(
     "first-V2 host authority rejects %s despite verified true and rehashed caller evidence", async (attack) => {
       const { bookDir } = await fixture(3);
@@ -555,12 +660,14 @@ describe("chapter transaction convergence", () => {
       providerActualCostUsd?: number;
       logicReviewLanguage?: "zh" | "en";
       omitTerminalRequestAuthorities?: boolean;
+      productionAuthority?: string;
+      lengthSpec?: Parameters<typeof stageTruthChapterCommitV2>[0]["lengthSpec"];
     } = {},
   ) {
     const firstV2Baseline = chapterNumber === 5 ? await hostBaseline(bookDir) : undefined;
     const chain = await verifyChapterCommitChain({ bookDir });
     const predecessor = firstV2Baseline?.truth ?? await loadCommittedTruthForWriter({ bookDir, chapterNumber });
-    const transaction = await beginChapterTransaction({ bookDir, bookId: "book-a", chapterNumber, productionAuthority: "blueprint:v2", truthMode: "CANONICAL_V2", firstV2Baseline });
+    const transaction = await beginChapterTransaction({ bookDir, bookId: "book-a", chapterNumber, productionAuthority: options.productionAuthority ?? "blueprint:v2", truthMode: "CANONICAL_V2", firstV2Baseline });
     const candidate = body;
     const rawProposal = JSON.stringify({ schemaVersion: "1.0", kind: "CHAPTER_DELTA_PROPOSAL", status: "READY", operations: [], evidence: [], ambiguities: [] });
     const extractionRequest = {
@@ -830,7 +937,7 @@ describe("chapter transaction convergence", () => {
       });
     }
     const stageInput = {
-      bookDir, transactionId: transaction.transactionId, title: `Chapter ${chapterNumber}`, language: logicReviewLanguage, body: candidate, lengthSpec,
+      bookDir, transactionId: transaction.transactionId, title: `Chapter ${chapterNumber}`, language: logicReviewLanguage, body: candidate, lengthSpec: options.lengthSpec ?? lengthSpec,
       ...(firstV2Baseline ? { firstV2Baseline } : {}),
       review: {
         status: "APPROVED", grade: "A", revisionCount: 0, finalCandidateSha256: sha256Utf8(candidate), findings: [],
@@ -880,6 +987,119 @@ describe("chapter transaction convergence", () => {
     await writeFile(join(committedRoot, "first-v2-baseline.json"), "{}");
     await rehashAttackerControlledPayload(committedRoot);
     await expect(verifyChapterCommitChain({ bookDir })).rejects.toThrow();
+  });
+
+  async function selectedCommitRunnerFixture(target: "missing" | "copied" | "promoted", statusFirst = false) {
+    const { root, bookDir } = await fixture(3, true);
+    const book = { id: "book-a", title: "Recovery", platform: "tomato" as const, genre: "xuanhuan", language: "en" as const,
+      status: "active" as const, targetChapters: 6, chapterWordCount: 2200, createdAt: "2026-09-04T00:00:00.000Z", updatedAt: "2026-09-04T00:00:00.000Z" };
+    await new StateManager(root).saveBookConfig("book-a", book);
+    const productionAuthority = `pipeline:${sha256Utf8(JSON.stringify({ bookId: book.id, genre: book.genre, language: book.language,
+      targetChapters: book.targetChapters, chapterWordCount: book.chapterWordCount, productionMapSha256: null }))}`;
+    const { transaction } = await stageV2Passing(bookDir, 5, { productionAuthority,
+      lengthSpec: { target: 2200, softMin: 1900, softMax: 2500, hardMin: 1600, hardMax: 2800, countingMode: "en_words" },
+    });
+    await expect(finalizeChapterTransaction({ bookDir, transactionId: transaction.transactionId,
+      beforePromote: () => { throw new Error("TEST_SELECTED_BEFORE_PROMOTION"); },
+    })).rejects.toThrow("TEST_SELECTED_BEFORE_PROMOTION");
+    const attemptRoot = join(bookDir, "story/runtime/chapter-transactions/chapter-0005");
+    const source = join(attemptRoot, "staging/bundle");
+    const commitRoot = join(bookDir, "story/commits/chapter-0005");
+    const selectedCommitBytes = await readFile(join(source, "commit.json"));
+    const selectedCommit = JSON.parse(selectedCommitBytes.toString("utf8"));
+    if (target === "copied") await cp(source, commitRoot, { recursive: true });
+    if (target === "promoted") await rename(source, commitRoot);
+    const runtimePath = join(bookDir, "story/runtime/bounded-autonomous/production-state.json");
+    await writeFile(runtimePath, JSON.stringify({ nextChapter: 5, chapterNumber: 5 }));
+    if (statusFirst) await reconcileChapterProjections({ bookDir });
+    const persistedRuntime = JSON.parse(await readFile(runtimePath, "utf8"));
+    if (statusFirst) expect(persistedRuntime).toMatchObject({ nextChapter: 6, chapterNumber: 5 });
+    let modelEffects = 0;
+    const runner = new PipelineRunner({ projectRoot: root, model: "writer-model", boundedAutonomousReview: true,
+      modelOverrides: { "truth-extractor": "extractor-model", "truth-validator": "validator-model" },
+      client: { provider: "openai", service: "test-provider", apiFormat: "chat", stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} } } as never,
+      // Mirror the server capture separately covered by its actual GET/Start test.
+      firstV2Cutover: { resumeChapterNumber: persistedRuntime.chapterNumber ?? persistedRuntime.nextChapter, legacyRuntimeSnapshot: JSON.stringify(persistedRuntime) },
+      onAutonomousStage: async (event) => { if (event.provider !== null) { modelEffects += 1; throw new Error("UNEXPECTED_RECOVERY_MODEL_EFFECT"); } },
+    });
+    return { runner, root, bookDir, attemptRoot, source, commitRoot, selectedCommit, selectedCommitBytes, modelEffects: () => modelEffects };
+  }
+
+  it.each(["missing", "copied", "promoted"] as const)("first-V2 COMMIT_SELECTED Runner recovery finalizes exact authority with target %s", async (target) => {
+    const fixture = await selectedCommitRunnerFixture(target);
+    const begin = vi.spyOn(chapterTransactions, "beginChapterTransaction");
+    const buildBaseline = vi.spyOn(baselineBuilder, "buildFirstV2Baseline");
+    try {
+      if (target === "missing") await expect(assertChapterWriterStartAllowed({ bookDir: fixture.bookDir, chapterNumber: 6 })).rejects.toThrow();
+      if (target === "promoted") {
+        const state = new StateManager(fixture.root);
+        const actions = await createAutonomousPipelineActions({ bookId: "book-a", state, pipeline: fixture.runner });
+        const completedChapterIds: number[] = [];
+        const progress = await runBoundedAutonomousScope({
+          map: parseBookProductionMap({ schema_version: "1.0", book_id: "book-a", authority_book_id: "authority", title: "Recovery",
+            total_chapters: 6, volumes: [{ volume_id: "volume-001", volume_number: 1, title: "One", start_chapter: 1, end_chapter: 6, chapter_count: 6 }] }),
+          mode: "full-book", getNextChapter: () => state.getNextChapterNumber("book-a"),
+          verifyChapterStartAuthority: (chapterNumber) => assertChapterWriterStartAllowed({ bookDir: fixture.bookDir, chapterNumber }),
+          runChapter: async () => { const result = await actions.runChapter(2200); completedChapterIds.push(result.chapterNumber); return result; },
+          shouldStop: () => completedChapterIds.length > 0, persistProgress: async () => {},
+        });
+        expect(completedChapterIds).toEqual([5]);
+        expect(progress).toMatchObject({ status: "PAUSED_BY_USER", nextChapter: 6, completedThisRun: 1 });
+        expect((await state.loadChapterIndex("book-a")).filter((chapter) => chapter.number >= 5)).toMatchObject([{ number: 5, status: "approved" }]);
+      } else {
+        await expect(fixture.runner.writeNextChapter("book-a", 2200)).resolves.toMatchObject({ chapterNumber: 5, status: "ready-for-review" });
+      }
+      expect(fixture.modelEffects()).toBe(0);
+      expect(begin).not.toHaveBeenCalled();
+      expect(buildBaseline).not.toHaveBeenCalled();
+      const committed = await verifyChapterCommit({ bookDir: fixture.bookDir, chapterNumber: 5 });
+      expect(committed).toMatchObject({ transactionId: fixture.selectedCommit.transactionId, commitSha256: fixture.selectedCommit.commitSha256 });
+      expect(await readFile(join(fixture.commitRoot, "commit.json"))).toEqual(fixture.selectedCommitBytes);
+      await expect(assertChapterWriterStartAllowed({ bookDir: fixture.bookDir, chapterNumber: 6 })).resolves.toBeUndefined();
+      begin.mockImplementationOnce(async (input) => {
+        expect(input.chapterNumber).toBe(6);
+        throw new Error("TEST_NEXT_CHAPTER_ADMISSION");
+      });
+      await expect(fixture.runner.writeNextChapter("book-a", 2200)).rejects.toThrow("TEST_NEXT_CHAPTER_ADMISSION");
+      expect(fixture.modelEffects()).toBe(0);
+    } finally { begin.mockRestore(); buildBaseline.mockRestore(); }
+  });
+
+  it.each(["clean", "source", "baseline"] as const)("first-V2 status projection before Start preserves selected recovery for %s evidence", async (attack) => {
+    const fixture = await selectedCommitRunnerFixture("copied", true);
+    if (attack === "source") await writeFile(join(fixture.source, "chapter.md"), "tampered retained source prose");
+    if (attack === "baseline") await writeFile(join(fixture.attemptRoot, "first-v2-baseline.json"), "{}");
+    const begin = vi.spyOn(chapterTransactions, "beginChapterTransaction");
+    const buildBaseline = vi.spyOn(baselineBuilder, "buildFirstV2Baseline");
+    try {
+      const result = fixture.runner.writeNextChapter("book-a", 2200);
+      if (attack === "clean") {
+        await expect(result).resolves.toMatchObject({ chapterNumber: 5, status: "ready-for-review" });
+        expect(await readFile(join(fixture.commitRoot, "commit.json"))).toEqual(fixture.selectedCommitBytes);
+      } else await expect(result).rejects.toThrow(/BASELINE|hash|prose|integrity mismatch/i);
+      expect(fixture.modelEffects()).toBe(0);
+      expect(begin).not.toHaveBeenCalled();
+      expect(buildBaseline).not.toHaveBeenCalled();
+    } finally { begin.mockRestore(); buildBaseline.mockRestore(); }
+  });
+
+  it.each(["transaction", "baseline", "target"] as const)("first-V2 COMMIT_SELECTED Runner recovery rejects tampered %s before any model effect", async (attack) => {
+    const fixture = await selectedCommitRunnerFixture(attack === "target" ? "promoted" : "missing");
+    if (attack === "transaction") {
+      const path = join(fixture.attemptRoot, "transaction.json");
+      const transaction = JSON.parse(await readFile(path, "utf8"));
+      await writeFile(path, JSON.stringify({ ...transaction, transactionId: "tampered-selected-transaction" }));
+    } else if (attack === "baseline") await writeFile(join(fixture.attemptRoot, "first-v2-baseline.json"), "{}");
+    else await writeFile(join(fixture.commitRoot, "chapter.md"), "tampered target prose");
+    const begin = vi.spyOn(chapterTransactions, "beginChapterTransaction");
+    const buildBaseline = vi.spyOn(baselineBuilder, "buildFirstV2Baseline");
+    try {
+      await expect(fixture.runner.writeNextChapter("book-a", 2200)).rejects.toThrow(/IDENTITY|BASELINE|hash|prose|integrity mismatch/i);
+      expect(fixture.modelEffects()).toBe(0);
+      expect(begin).not.toHaveBeenCalled();
+      expect(buildBaseline).not.toHaveBeenCalled();
+    } finally { begin.mockRestore(); buildBaseline.mockRestore(); }
   });
 
   it("consolidated K3 reuses staged timestamp while rejecting changed deterministic inputs", async () => {

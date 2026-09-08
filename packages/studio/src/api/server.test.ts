@@ -6699,6 +6699,132 @@ describe("createStudioServer daemon lifecycle", () => {
     expect(createLLMClientMock).not.toHaveBeenCalled();
   });
 
+  it.each([{ orphan: false, statusFirst: false }, { orphan: true, statusFirst: false }, { orphan: false, statusFirst: true }])("one Studio start reaches real canonical admission from legacy staging (baseline publication crash=$orphan, status-first=$statusFirst)", async ({ orphan, statusFirst }) => {
+    const core = await vi.importActual<typeof import("@actalk/inkos-core")>("@actalk/inkos-core");
+    const transactions = await import("../../../core/src/production/chapter-transaction.js");
+    const bookId = "demo-book";
+    const bookDir = join(root, "books", bookId);
+    const storyDir = join(bookDir, "story");
+    const state = new core.StateManager(root);
+    const now = "2026-09-04T00:00:00.000Z";
+    const book = { id: bookId, title: "Demo", platform: "tomato" as const, genre: "xuanhuan", status: "active" as const,
+      language: "en" as const, targetChapters: 2, chapterWordCount: 2200, createdAt: now, updatedAt: now };
+    await state.saveBookConfig(bookId, book);
+    await mkdir(join(storyDir, "snapshots/0"), { recursive: true });
+    await mkdir(join(storyDir, "outline"), { recursive: true });
+    await mkdir(join(bookDir, "chapters"), { recursive: true });
+    await writeFile(join(bookDir, "chapters/index.json"), "[]");
+    await writeFile(join(storyDir, "snapshots/0/current_state.md"), "state zero");
+    await writeFile(join(storyDir, "outline/book-production-map.json"), JSON.stringify({
+      schema_version: "1.0", book_id: bookId, authority_book_id: "authority", title: "Demo", total_chapters: 2,
+      volumes: [{ volume_id: "volume-001", volume_number: 1, title: "One", start_chapter: 1, end_chapter: 2, chapter_count: 2 }],
+    }));
+    await writeFile(join(storyDir, "outline/story_frame.md"), "# Story Frame — Final Locked Projection\nLocked projection authority.\n## Product promise\nOpen the gate.\n## Two-level dramatic question\nThe clock and gate collide.\n## World anchor\nA witnessed gate.\n### Volume I — One (Chapters 1–2 center)\nOpen the gate.");
+    await writeFile(join(storyDir, "outline/volume_map.md"), "# Volume Map and Complete Chapter Blueprint Authority\n# PROJECTED VOLUME 1\nStatus: locked.\n# Demo — Volume I Chapter Blueprint Set v1.1\nClosure: gate opens.\n## Chapter 001 — Gate\nOpen the gate.\n## Chapter 002 — Key\nFind the key.");
+    await core.createChapterGenesis({ bookDir, bookId, lastTrustedChapter: 0, trustedSnapshotDir: join(storyDir, "snapshots/0") });
+    const legacy = await core.beginChapterTransaction({ bookDir, bookId, chapterNumber: 1, productionAuthority: "legacy" });
+    const body = "Legacy predecessor.";
+    const bodySha = legacy.hash(body);
+    const refs = [];
+    await mkdir(join(storyDir, "runtime/bounded-autonomous/provider-responses"), { recursive: true });
+    for (const [role, stage] of [["logic-canon-auditor", "LOGIC_REVIEW"], ["commercial-reader", "READER_REVIEW"]] as const) {
+      const logicalOperationId = `provider-step-${legacy.hash(role)}`;
+      const content = `legacy ${role}`;
+      const artifactRelativePath = `story/runtime/bounded-autonomous/provider-responses/${logicalOperationId}.json`;
+      const inputFingerprint = legacy.hash(`input:${role}`);
+      const bytes = JSON.stringify({ schema_version: "1.0", transaction_id: legacy.transactionId, chapter_number: 1,
+        logical_step_id: logicalOperationId, usage_identity: logicalOperationId, role, stage, provider: "fixture", requested_model: "fixture-model",
+        input_fingerprint: inputFingerprint, response_artifact_status: "COMPLETE", content_sha256: legacy.hash(content), response: { content } });
+      await writeFile(join(bookDir, artifactRelativePath), bytes);
+      refs.push({ transactionId: legacy.transactionId, logicalOperationId, chapterNumber: 1, role, stage, provider: "fixture", requestedModel: "fixture-model",
+        inputFingerprint, artifactRelativePath, artifactSha256: legacy.hash(bytes), responseContentSha256: legacy.hash(content), responseArtifactStatus: "COMPLETE" as const });
+    }
+    const manifest = JSON.stringify({ schemaVersion: 2, lastAppliedChapter: 1, candidateSha256: bodySha, previousAuthoritySha256: legacy.previousAuthoritySha256 });
+    const reviewer = (reviewerRole: "logic-canon-auditor" | "commercial-reader") => ({ reviewerRole, provider: "fixture", model: "fixture-model", totalScore: 90,
+      dimensionScores: { quality: 90 }, decision: "APPROVED" as const, findings: [], reviewedCandidateSha: bodySha });
+    await core.stageChapterCommitCandidate({ bookDir, transactionId: legacy.transactionId, title: "Legacy", body,
+      lengthSpec: { target: 2, softMin: 2, softMax: 2, hardMin: 2, hardMax: 2, countingMode: "en_words" },
+      review: { status: "APPROVED", grade: "A", revisionCount: 0, finalCandidateSha256: bodySha, findings: [], reviewerEvidence: [reviewer("logic-canon-auditor"), reviewer("commercial-reader")] },
+      stateFiles: { "manifest.json": manifest, "current_state.json": '{"chapter":1}', "current_state.md": "committed state" },
+      snapshotFiles: { "state/manifest.json": manifest, "state/current_state.json": '{"chapter":1}', "current_state.md": "committed state" },
+      stateValidation: { chapterNumber: 1, finalCandidateSha256: bodySha, previousAuthoritySha256: legacy.previousAuthoritySha256, passed: true }, usage: {}, providerReferences: refs, completedAt: now });
+    await core.finalizeChapterTransaction({ bookDir, transactionId: legacy.transactionId });
+    const old = await core.beginChapterTransaction({ bookDir, bookId, chapterNumber: 2, productionAuthority: "old-legacy" });
+    const runtimePath = join(storyDir, "runtime/bounded-autonomous/production-state.json");
+    const legacySnapshot = JSON.stringify({ jobId: "old-job", status: "PAUSED_PIPELINE_ERROR", mode: "full-book", nextChapter: 2,
+      chapterNumber: statusFirst ? 1 : 2, phase: "SETTLING_STATE", activeRole: "state-validator-settlement-repair", providerAttemptHistory: [] });
+    await writeFile(runtimePath, legacySnapshot);
+    const canonicalRoot = join(storyDir, "runtime/chapter-transactions/chapter-0002/attempts/attempt-0002");
+    let orphanBytes: Buffer | undefined;
+    if (orphan) {
+      await transactions.prepareFirstV2Cutover({ bookDir, bookId, productionAuthority: "before-crash", runtimeSnapshot: legacySnapshot });
+      orphanBytes = await readFile(join(canonicalRoot, "first-v2-baseline.json"));
+      await rm(join(canonicalRoot, "transaction.json"));
+    }
+    loadBookConfigMock.mockImplementation(() => state.loadBookConfig(bookId));
+    loadChapterIndexMock.mockImplementation(() => state.loadChapterIndex(bookId));
+    saveChapterIndexMock.mockImplementation((_bookId, chapters) => state.saveChapterIndex(bookId, chapters));
+    getNextChapterNumberMock.mockImplementation(() => state.getNextChapterNumber(bookId));
+    const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf8"));
+    raw.llm = { ...raw.llm, service: "openrouter", defaultModel: "openai/gpt", model: "openai/gpt", services: [{ service: "openrouter" }] };
+    raw.productionRoles = { production: "openai/gpt", review: "deepseek/chat", reader: "google/gemini" };
+    await writeFile(join(root, "inkos.json"), JSON.stringify(raw));
+    loadSecretsMock.mockResolvedValue({ services: { openrouter: { apiKey: "test-only" } } });
+    probeModelsFromUpstreamMock.mockResolvedValue(["openai/gpt", "deepseek/chat", "google/gemini"].map((id) => ({ id, name: id, contextWindow: 128_000, maxOutputTokens: 16_000, inputPrice: "0.000001", outputPrice: "0.000004", inputModalities: ["text"], outputModalities: ["text"] })));
+    let reachedModelBoundary = false;
+    let resolveRunnerSettled!: () => void;
+    const runnerSettled = new Promise<void>((resolve) => { resolveRunnerSettled = resolve; });
+    let returnedRecovery = false;
+    let stopAfterRecovery!: () => Promise<void>;
+    writeNextChapterMock.mockImplementation(async () => {
+      const config = pipelineConfigs.at(-1) as ConstructorParameters<typeof core.PipelineRunner>[0];
+      if (statusFirst && !returnedRecovery) {
+        expect(config.firstV2Cutover?.resumeChapterNumber).toBe(1);
+        returnedRecovery = true;
+        await stopAfterRecovery();
+        return { chapterNumber: 1, status: "ready-for-review" };
+      }
+      if (statusFirst) expect(config.firstV2Cutover?.resumeChapterNumber).toBe(2);
+      const runner = new core.PipelineRunner({ ...config,
+        client: { provider: "openai", apiFormat: "chat", stream: false, defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} } } as never,
+        onAutonomousStage: async (event) => { if (event.provider !== null) { reachedModelBoundary = true; throw new Error("TEST_STOP_BEFORE_MODEL"); } },
+      });
+      try { return await runner.writeNextChapter(bookId); }
+      finally { resolveRunnerSettled(); }
+    });
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+    stopAfterRecovery = async () => { expect((await app.request("http://localhost/api/v1/books/demo-book/autonomous-production/stop", { method: "POST" })).status).toBe(200); };
+    if (statusFirst) {
+      expect((await app.request("http://localhost/api/v1/books/demo-book/autonomous-production")).status).toBe(200);
+      expect(JSON.parse(await readFile(runtimePath, "utf8"))).toMatchObject({ nextChapter: 2, chapterNumber: 1 });
+    }
+    const response = await app.request("http://localhost/api/v1/books/demo-book/autonomous-production/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: '{"mode":"full-book"}' });
+    expect(response.status).toBe(202);
+    if (statusFirst) {
+      await vi.waitFor(async () => {
+        expect(JSON.parse(await readFile(runtimePath, "utf8"))).toMatchObject({ status: "PAUSED_BY_USER", nextChapter: 2, chapterNumber: 2, completedThisRun: 1 });
+        await expect(access(join(storyDir, "runtime/bounded-autonomous/active-job.json"))).rejects.toMatchObject({ code: "ENOENT" });
+      });
+      expect((await app.request("http://localhost/api/v1/books/demo-book/autonomous-production/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: '{"mode":"full-book"}' })).status).toBe(202);
+    }
+    await runnerSettled;
+    await vi.waitFor(async () => {
+      const runtime = JSON.parse(await readFile(runtimePath, "utf8"));
+      expect(runtime.status).toBe("PAUSED_PIPELINE_ERROR");
+      expect(reachedModelBoundary).toBe(true);
+    });
+    const current = await core.inspectChapterAuthority({ bookDir });
+    expect(current.activeTransactionId).not.toBe(old.transactionId);
+    expect(JSON.parse(await readFile(join(canonicalRoot, "transaction.json"), "utf8"))).toMatchObject({ truthMode: "CANONICAL_V2", chapterNumber: 2 });
+    expect(await core.loadCommittedTruthForWriter({ bookDir, chapterNumber: 2 })).toMatchObject({ throughChapter: 1 });
+    if (orphanBytes) expect(await readFile(join(canonicalRoot, "first-v2-baseline.json"))).toEqual(orphanBytes);
+    expect(resumeAuditFailedChapterBoundedMock).not.toHaveBeenCalled();
+    await vi.waitFor(async () => {
+      await expect(access(join(storyDir, "runtime/bounded-autonomous/active-job.json"))).rejects.toMatchObject({ code: "ENOENT" });
+    });
+  });
+
   it("routes one Studio start through the shared Core controller, reuses an audit-failed draft, and persists the dynamic-volume checkpoint", async () => {
     const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
     raw.llm = { ...raw.llm, service: "openrouter", defaultModel: "openai/gpt", model: "openai/gpt", services: [{ service: "openrouter" }] };
@@ -6803,6 +6929,16 @@ describe("createStudioServer daemon lifecycle", () => {
     saveChapterIndexMock.mockImplementation(async (_bookId, updated) => { chapters = [...updated]; });
     let requestStop!: () => Promise<void>;
     const actualCore = await vi.importActual<typeof import("@actalk/inkos-core")>("@actalk/inkos-core");
+    const bookDir = join(root, "books", "demo-book");
+    const snapshotDir = join(bookDir, "story/snapshots/4");
+    await mkdir(snapshotDir, { recursive: true });
+    await mkdir(join(bookDir, "chapters"), { recursive: true });
+    await rm(join(bookDir, "chapters/0003_Demo.md"), { force: true });
+    for (const chapter of chapters) await writeFile(join(bookDir, "chapters", `${String(chapter.number).padStart(4, "0")}_Chapter.md`), `Chapter ${chapter.number}`);
+    await writeFile(join(bookDir, "chapters/index.json"), JSON.stringify(chapters));
+    await writeFile(join(snapshotDir, "current_state.md"), "Committed chapter four state");
+    await actualCore.createChapterGenesis({ bookDir, bookId: "demo-book", lastTrustedChapter: 4, trustedSnapshotDir: snapshotDir });
+    const transaction = await actualCore.beginChapterTransaction({ bookDir, bookId: "demo-book", chapterNumber: 5, productionAuthority: "stop-admission-fixture" });
     const transport = vi.fn(async () => new Response(JSON.stringify({
       choices: [{ message: { content: "must not run" } }],
       usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
@@ -6815,7 +6951,7 @@ describe("createStudioServer daemon lifecycle", () => {
         }) => Promise<void>;
       }).onAutonomousStage;
       await onAutonomousStage({
-        stage: "WRITING", role: "writer", provider: "openrouter", model: "openai/gpt", transactionId: "txn-5",
+        stage: "WRITING", role: "writer", provider: "openrouter", model: "openai/gpt", transactionId: transaction.transactionId,
       });
       await requestStop();
       const deniedClient = {
