@@ -88,6 +88,7 @@ import * as llmProvider from "../llm/provider.js";
 import { canonicalJson, canonicalSha256, sha256Utf8 } from "../state/canonical-json.js";
 import { StateManager } from "../state/manager.js";
 import { createVocabularyCatalogV1 } from "../state/truth-vocabulary.js";
+import * as canonicalModule from "../state/canonical-json.js";
 
 const ZERO_USAGE = { promptTokens: 0, completionTokens: 0, totalTokens: 0 } as const;
 const VALID_PLANNER_MEMO = [
@@ -121,6 +122,101 @@ function baselineTruth(bookId: string): StructuredTruthV1 {
 }
 
 describe("synthetic canonical V2 continuity", () => {
+  it("replays completed stages after BookRules authority failure with no new transports", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-bookrules-replay-")); roots.push(root);
+    const state = new StateManager(root);
+    const bookId = "island-authority";
+    const bookDir = state.bookDir(bookId);
+    const storyDir = join(bookDir, "story");
+    await state.saveBookConfig(bookId, {
+      id: bookId, title: "Island Archive", platform: "tomato", genre: "xuanhuan", status: "active",
+      targetChapters: 10, chapterWordCount: 2_200, language: "en",
+      createdAt: "2026-09-04T00:00:00.000Z", updatedAt: "2026-09-04T00:00:00.000Z",
+    });
+    await mkdir(join(storyDir, "outline"), { recursive: true });
+    await mkdir(join(storyDir, "snapshots", "0"), { recursive: true });
+    await mkdir(join(bookDir, "chapters"), { recursive: true });
+    await writeFile(join(storyDir, "snapshots", "0", "baseline.txt"), "synthetic baseline");
+    await writeFile(join(bookDir, "chapters", "index.json"), "[]\n");
+    await writeFile(join(storyDir, "book_rules.md"), "# Book Rules\n## Era Constraints\n- Period: 1920\n");
+    await writeFile(join(storyDir, "outline", "story_frame.md"), [
+      "# Story Frame — Final Locked Projection", "Locked projection authority.",
+      "## Product promise", "Keep the gate under pressure.",
+      "## Two-level dramatic question", "The visible clock and hidden gate authority collide.",
+      "## World anchor", "Witnessed rules cannot be erased.",
+      "### Volume I — One (Chapters 1–10 center)", "Open the gate without losing the clock.",
+    ].join("\n"));
+    await writeFile(join(storyDir, "outline", "volume_map.md"), [
+      "# Volume Map and Complete Chapter Blueprint Authority", "# PROJECTED VOLUME 1", "Status: locked.",
+      "# Island Archive — Volume I Chapter Blueprint Set v1.1", "Closure: the gate opens.",
+      ...Array.from({ length: 10 }, (_, i) => [`## Chapter ${String(i + 1).padStart(3, "0")} — Fixture ${i + 1}`, "Advance the gate."]).flat(),
+    ].join("\n"));
+    await writeFile(join(storyDir, "outline", "book-production-map.json"), JSON.stringify({
+      schema_version: "1.0", book_id: bookId, authority_book_id: "island", title: "Island Archive", total_chapters: 10,
+      volumes: [{ volume_id: "volume-001", volume_number: 1, title: "One", start_chapter: 1, end_chapter: 10, chapter_count: 10 }],
+    }));
+    await createChapterGenesis({ bookDir, bookId, lastTrustedChapter: 0, trustedSnapshotDir: join(storyDir, "snapshots", "0") });
+    const firstV2Baseline = await installLegacyBaseline(bookDir, baselineTruth(bookId));
+    let stage = { stage: "NOT_STARTED", role: "none", provider: "custom" as string | null, model: "scripted" as string | null, transactionId: undefined as string | undefined, reviewRound: undefined as number | undefined };
+    const client = {
+      provider: "openai", service: "custom", configSource: "studio", apiFormat: "chat", stream: false,
+      _apiKey: "test-only", _piModel: { id: "scripted", name: "scripted", api: "openai-completions", provider: "openai", baseUrl: "https://transport.invalid/v1", contextWindow: 128_000, maxTokens: 16_384 },
+      defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+    } as ConstructorParameters<typeof PipelineRunner>[0]["client"];
+    const roles: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      roles.push(stage.role);
+      const responses: Record<string, string> = {
+        planner: VALID_PLANNER_MEMO,
+        writer: `<!-- PRE_WRITE_CHECK -->\nChecked.\n<!-- CHAPTER_TITLE -->\nIsland Gate\n<!-- CHAPTER_CONTENT -->\n${words(2)}`,
+        "logic-canon-auditor": JSON.stringify({ passed: true, issues: [], summary: "approved", overall_score: 92, dimension_scores: { blueprint_transition: 92, causal_logic: 92, canon_continuity: 92, character_motivation: 92, state_inheritance: 92, hooks_disclosure: 92, narrative_clarity: 92 } }),
+        "commercial-reader": JSON.stringify({ total_score: 92, dimension_scores: { opening_hook: 92, pacing_tension: 92, emotional_investment: 92, plot_clarity: 92, dialogue_appeal: 92, western_cultural_naturalness: 92, commercial_appeal: 92, ending_hook: 92 }, decision: "APPROVED", findings: [] }),
+      };
+      if (!responses[stage.role]) throw new Error(`Unexpected transport: ${stage.role}`);
+      return new Response(JSON.stringify({ choices: [{ message: { content: responses[stage.role] } }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+    const run = () => {
+      const runner = new PipelineRunner({ client, model: "scripted", projectRoot: root, boundedAutonomousReview: true, firstV2Baseline,
+        onAutonomousStage: (event) => { stage = { ...event, transactionId: event.transactionId, reviewRound: event.reviewRound }; },
+      });
+      const execution = createAutonomousProviderExecution({ projectRoot: root, bookId, jobId: "bookrules-replay", getActiveStage: () => ({ ...stage, provider: "custom", model: "scripted" }) });
+      return execution.execute(2, () => runner.writeNextChapter(bookId, 2_200));
+    };
+    await mkdir(join(storyDir, "runtime", "bounded-autonomous"), { recursive: true });
+    await writeFile(join(storyDir, "runtime", "bounded-autonomous", "production-state.json"), JSON.stringify({ jobId: "bookrules-replay", status: "RUNNING", mode: "full-book", nextChapter: 2 }));
+    const originalCanonical = canonicalModule.canonicalJson;
+    const fault = vi.spyOn(canonicalModule, "canonicalJson").mockImplementation((value) => {
+      if ((value as { kind?: string })?.kind === "CANONICAL_TRUTH_COMMITTED_AUTHORITY") throw new Error("bookrules-authority-checkpoint");
+      return originalCanonical(value);
+    });
+    try {
+      await expect(run()).rejects.toThrow("bookrules-authority-checkpoint");
+      expect(roles).toEqual(["planner", "writer", "logic-canon-auditor", "commercial-reader"]);
+      const evidenceDir = join(storyDir, "runtime", "chapter-transactions", "chapter-0002");
+      const immutable = async () => {
+        const paths = (await readdir(evidenceDir, { recursive: true })).filter((path) => /\.(json|md)$/.test(path)).sort();
+        return Promise.all(paths.map(async (path) => [path, sha256Utf8(await readFile(join(evidenceDir, path), "utf8"))]));
+      };
+      const before = await immutable();
+      expect(before.length).toBeGreaterThan(4);
+      const responseDir = join(storyDir, "runtime", "bounded-autonomous", "provider-responses");
+      const responses = async () => Promise.all((await readdir(responseDir)).sort().map(async (path) => [path, sha256Utf8(await readFile(join(responseDir, path), "utf8"))]));
+      const responsesBefore = await responses();
+      fault.mockRestore();
+      const settlement = vi.spyOn(PipelineRunner.prototype, "runCanonicalTruthSettlement").mockImplementation(async (input) => {
+        if (input.committedAuthority === undefined) throw new Error("Missing committed authority");
+        expect(JSON.parse(input.committedAuthority).bookRules).toMatchObject({ eraConstraints: { enabled: true, period: "1920" } });
+        expect(JSON.parse(input.committedAuthority).bookRules.eraConstraints).not.toHaveProperty("region");
+        throw new Error("canonical-safe-settlement-reached");
+      });
+      await expect(run()).rejects.toThrow("canonical-safe-settlement-reached");
+      expect(settlement).toHaveBeenCalledTimes(1);
+      expect(roles).toEqual(["planner", "writer", "logic-canon-auditor", "commercial-reader"]);
+      expect(await immutable()).toEqual(before);
+      expect(await responses()).toEqual(responsesBefore);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
   it.each(["SEMANTIC_VALIDATION", "DELTA_ADMISSION"] as const)("advances three contiguous chapters through public PipelineRunner with %s repair and synthetic scripted local Provider transports", async (repairSource) => {
     const root = await mkdtemp(join(tmpdir(), "inkos-v2-continuity-")); roots.push(root);
     const state = new StateManager(root);

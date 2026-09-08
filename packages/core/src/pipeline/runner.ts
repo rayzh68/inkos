@@ -8,6 +8,7 @@ import type { BookConfig, FanficMode, RevisionGate } from "../models/book.js";
 import type { ChapterMeta } from "../models/chapter.js";
 import type { NotifyChannel, LLMConfig, AgentLLMOverride } from "../models/project.js";
 import type { GenreProfile } from "../models/genre-profile.js";
+import { projectBookRulesForCanonicalAuthority } from "../models/book-rules.js";
 import { ArchitectAgent, type ArchitectOutput } from "../agents/architect.js";
 import {
   FoundationReviewerAgent,
@@ -4011,7 +4012,7 @@ export class PipelineRunner {
           volumeMap: committedVolumeMap,
           parentCanon: committedParentCanon,
           fanficCanon: committedFanficCanon,
-          bookRules: parsedBookRules,
+          bookRules: parsedBookRules === null ? null : projectBookRulesForCanonicalAuthority(parsedBookRules),
           chapterIntent: {
             markdown: writeInput.chapterIntent,
             memo: writeInput.chapterMemo,
