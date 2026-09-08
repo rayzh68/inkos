@@ -42,16 +42,24 @@ export function projectTruthSettlementContext(input: SettlementContextInput): {
 
   const intent = record(authority.chapterIntent) ? authority.chapterIntent : undefined;
   // Validator has no standalone memo: the shared envelope always retains its complete body.
-  const memoBody = intent && record(intent.memo) && typeof intent.memo.body === "string" ? intent.memo.body : undefined;
+  const memo = intent && record(intent.memo) ? intent.memo : undefined;
+  const memoBody = memo && typeof memo.body === "string" ? memo.body : undefined;
   const memoReference = "[See committedAuthority.chapterIntent.memo.body]";
-  const replaceMemo = (text: string): string => memoBody ? text.split(memoBody).join(memoReference) : text;
-  if (intent && typeof intent.markdown === "string") intent.markdown = replaceMemo(intent.markdown);
+  // Planner markdown has no persisted memo-span provenance. Keep it, including coincidental memo substrings.
+  // Composer's runtime/chapter_memo entry does have a fixed goal/optional-opening/body contract.
+  const memoPrefix = memo && typeof memo.goal === "string" && typeof memo.isGoldenOpening === "boolean"
+    ? [`goal=${memo.goal}`, ...(memo.isGoldenOpening ? ["golden-opening=true"] : [])].join(" | ") + " | "
+    : undefined;
   const contextPackage = intent && record(intent.contextPackage) ? intent.contextPackage : undefined;
   if (contextPackage && Array.isArray(contextPackage.selectedContext)) {
     contextPackage.selectedContext = contextPackage.selectedContext.map((entry: unknown) => {
       if (!record(entry) || typeof entry.excerpt !== "string" || entry.excerpt.length === 0) return entry;
       let excerpt = entry.excerpt;
-      if (equalCanonical(parsedCanonicalJson(excerpt), predecessor)) {
+      if (memoBody && entry.source === "runtime/chapter_memo" && excerpt === memoBody) {
+        excerpt = memoReference;
+      } else if (memoBody && entry.source === "runtime/chapter_memo" && memoPrefix !== undefined && excerpt === memoPrefix + memoBody) {
+        excerpt = memoPrefix + memoReference;
+      } else if (equalCanonical(parsedCanonicalJson(excerpt), predecessor)) {
         excerpt = "[See Verified predecessor StructuredTruthV1]";
       } else {
         // References point into complete retained payloads, using JavaScript's exact UTF-16 offsets.
@@ -60,12 +68,18 @@ export function projectTruthSettlementContext(input: SettlementContextInput): {
           ["committedAuthority.storyFrame", authority.storyFrame],
           ["committedAuthority.volumeMap", authority.volumeMap],
         ] as const;
-        const covered = retained.find(([, body]) => typeof body === "string" && body.includes(excerpt));
-        if (covered) {
-          const start = (covered[1] as string).indexOf(excerpt);
-          excerpt = `[See ${covered[0]} UTF-16 ${start}:${start + excerpt.length}]`;
-        } else {
-          excerpt = replaceMemo(excerpt);
+        let uniqueMatch: { target: string; start: number } | undefined;
+        let ambiguous = false;
+        for (const [target, body] of retained) {
+          if (typeof body !== "string") continue;
+          const start = body.indexOf(excerpt);
+          if (start < 0) continue;
+          // Advance one UTF-16 unit, rather than excerpt.length, to also detect overlapping matches.
+          if (uniqueMatch || body.indexOf(excerpt, start + 1) >= 0) { ambiguous = true; break; }
+          uniqueMatch = { target, start };
+        }
+        if (uniqueMatch && !ambiguous) {
+          excerpt = `[See ${uniqueMatch.target} UTF-16 ${uniqueMatch.start}:${uniqueMatch.start + excerpt.length}]`;
         }
       }
       return { ...entry, excerpt };

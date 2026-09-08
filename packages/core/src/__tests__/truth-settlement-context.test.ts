@@ -64,16 +64,17 @@ describe("Canonical Truth settlement model context", () => {
     };
     const candidate = "Ada finds a brass key.".padEnd(14000, " narrative");
     const memo = "Preserve the mystery. ".padEnd(8000, "memo ");
-    const volumeMap = "Complete unique volume plan. ".padEnd(315000, "future event ");
+    // Each selected passage has one provable origin; repeated filler alone is not an offset authority.
+    const volumeMap = Array.from({ length: 10 }, (_, index) => `Unique volume section ${index}. `.padEnd(31500, "future event ")).join("");
     const storyFrame = "Complete unique story frame. ".padEnd(40000, "world rule ");
     const committedAuthority = canonicalJson({ schemaVersion: "1.0", kind: "CANONICAL_TRUTH_COMMITTED_AUTHORITY",
       structuredTruth: predecessor, volumeMap, storyFrame, bookRules: { fanficMode: false },
       chapterIntent: { memo: { body: memo }, markdown: `Unique intent before. ${memo} Unique intent after.`,
         contextPackage: { selectedContext: [
           { source: "truth", reason: "state", excerpt: canonicalJson(predecessor) },
-          { source: "memo", reason: "intent", excerpt: memo },
+          { source: "runtime/chapter_memo", reason: "intent", excerpt: memo },
           ...Array.from({ length: 10 }, (_, index) => ({ source: `volume-${index}`, reason: "planning",
-            excerpt: volumeMap.slice(index * 20000, index * 20000 + 24000) })),
+            excerpt: volumeMap.slice(index * 31500, index * 31500 + 24000) })),
           { source: "author", reason: "unique", excerpt: "Unique author instruction remains exact." },
         ] } } });
     const request: TruthExtractionRequest = { transactionId: "large-budget-transaction", attemptId: "attempt-9", chapterNumber: 17,
@@ -112,9 +113,9 @@ describe("Canonical Truth settlement model context", () => {
       .replace(section(expanded[1]!.content, "Verified vocabulary catalog"), request.vocabularyCatalogJson)
       .replace(section(expanded[1]!.content, "Non-authorizing chapter memo"), memo);
     expect(estimate(expanded)).toBeGreaterThan(111616);
-    expect(estimate(extractor)).toBeLessThanOrEqual(103000);
-    expect(111616 - estimate(extractor)).toBeGreaterThanOrEqual(8600);
-    expect(125952 - estimate(validator)).toBeGreaterThanOrEqual(8000);
+    // Correctness review supersedes the original tighter gate: retained unique/ambiguous text is not clipped.
+    expect(111616 - estimate(extractor)).toBeGreaterThanOrEqual(4000);
+    expect(125952 - estimate(validator)).toBeGreaterThanOrEqual(4000);
     expect(section(validator[1]!.content, "Deterministically resulting StructuredTruthV1")).toBe(resultingTruthJson);
     for (const messages of [extractor, validator]) {
       const projected = JSON.parse(section(messages[1]!.content, "Verified committed authority"));
@@ -146,12 +147,13 @@ describe("Canonical Truth settlement model context", () => {
       expect(section(extractor, "Verified vocabulary catalog")).not.toContain(request.vocabularyCatalogJson);
       expect(extractor).toContain(`vocabularyCatalogSha256=${request.vocabularyCatalogSha256}`);
       expect(extractor.split(request.vocabularyCatalogJson)).toHaveLength(2);
-      expect(extractor.split(memo)).toHaveLength(2);
-      expect(validator.split(memo)).toHaveLength(2);
+      // Memo-like occurrences without span provenance remain in markdown and unique selected prose.
+      expect(extractor.split(memo)).toHaveLength(4);
+      expect(validator.split(memo)).toHaveLength(4);
       expect(projected.chapterIntent.memo).toEqual(authority.chapterIntent.memo);
       expect(projected.chapterIntent.markdown).toContain("Unique opening.");
       expect(projected.chapterIntent.markdown).toContain("Unique conclusion.");
-      expect(projected.chapterIntent.markdown).not.toContain(memo);
+      expect(projected.chapterIntent.markdown).toBe(authority.chapterIntent.markdown);
       for (const key of ["storyFrame", "volumeMap", "parentCanon", "fanficCanon", "bookRules"] as const) {
         expect(projected[key]).toEqual(authority[key]);
       }
@@ -172,11 +174,59 @@ describe("Canonical Truth settlement model context", () => {
       }
       expect(selected[3].excerpt).toContain("Selected prefix.");
       expect(selected[3].excerpt).toContain("Selected suffix.");
-      expect(selected[3].excerpt).not.toContain(memo);
+      expect(selected[3].excerpt).toBe(authority.chapterIntent.contextPackage.selectedContext[3]!.excerpt);
       expect(selected.slice(4)).toEqual(authority.chapterIntent.contextPackage.selectedContext.slice(4));
       expect(request).toEqual(original);
       expect(buildTruthExtractorMessages(structuredClone(request))[1]!.content).toBe(extractor);
     });
+
+  it("preserves short memo collisions while referencing only structurally proven complete memo copies", () => {
+    const { request, authority } = fixture();
+    const memo = { body: "home", goal: "Return home eventually", isGoldenOpening: true };
+    const selected = [
+      { source: "author_intent.md", reason: "unique", excerpt: "She cannot return home yet." },
+      { source: "author_intent.md", reason: "unique one-word intent", excerpt: "home" },
+      { source: "runtime/chapter_memo", reason: "complete dedicated copy", excerpt: "home" },
+      { source: "runtime/chapter_memo", reason: "composer wrapper", excerpt: "goal=Return home eventually | golden-opening=true | home" },
+      { source: "runtime/chapter_memo", reason: "unproven extra suffix", excerpt: "goal=Return home eventually | home | keep unique tail" },
+    ];
+    const committedAuthority = canonicalJson({ ...authority, chapterIntent: { memo,
+      markdown: "She cannot return home yet.", contextPackage: { selectedContext: selected } } });
+    const prompt = buildTruthExtractorMessages({ ...request, committedAuthority, chapterMemo: memo.body })[1]!.content;
+    const projected = JSON.parse(section(prompt, "Verified committed authority"));
+    expect(projected.chapterIntent.markdown).toBe("She cannot return home yet.");
+    const output = projected.chapterIntent.contextPackage.selectedContext;
+    expect(output[0]).toEqual(selected[0]);
+    expect(output[1]).toEqual(selected[1]);
+    expect(output[2].excerpt).toBe("[See committedAuthority.chapterIntent.memo.body]");
+    expect(output[3].excerpt).toBe("goal=Return home eventually | golden-opening=true | [See committedAuthority.chapterIntent.memo.body]");
+    expect(output[4]).toEqual(selected[4]);
+    expect(section(prompt, "Non-authorizing chapter memo")).toBe("[See committedAuthority.chapterIntent.memo.body]");
+  });
+
+  it.each([
+    ["storyFrame", "The gate opens; later the gate opens.", "gate opens"],
+    ["volumeMap", "Volume A: return home. Volume B: return home.", "return home"],
+    ["volumeMap", "aaaa", "aaa"],
+  ] as const)("preserves ambiguous %s excerpt origins including overlapping matches", (field, body, excerpt) => {
+    const { request, authority } = fixture();
+    const selected = { source: `${field}.md`, reason: "selected occurrence has no persisted offset", excerpt };
+    const committedAuthority = canonicalJson({ ...authority, [field]: body,
+      chapterIntent: { ...authority.chapterIntent, contextPackage: { selectedContext: [selected] } } });
+    const prompt = buildTruthExtractorMessages({ ...request, committedAuthority })[1]!.content;
+    const projected = JSON.parse(section(prompt, "Verified committed authority"));
+    expect(projected.chapterIntent.contextPackage.selectedContext).toEqual([selected]);
+    expect(projected[field]).toBe(body);
+  });
+
+  it("keeps an excerpt present once in each of two authorities without choosing an invented origin", () => {
+    const { request, authority } = fixture();
+    const selected = { source: "outline/selection", reason: "no exact source offset", excerpt: "Shared passage" };
+    const committedAuthority = canonicalJson({ ...authority, storyFrame: "Frame: Shared passage.", volumeMap: "Map: Shared passage.",
+      chapterIntent: { ...authority.chapterIntent, contextPackage: { selectedContext: [selected] } } });
+    const prompt = buildTruthExtractorMessages({ ...request, committedAuthority })[1]!.content;
+    expect(JSON.parse(section(prompt, "Verified committed authority")).chapterIntent.contextPackage.selectedContext).toEqual([selected]);
+  });
 
   it("preserves conflicting truth, vocabulary, standalone memo and non-covered excerpt bytes", () => {
     const { request, authority } = fixture();
