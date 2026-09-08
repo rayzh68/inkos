@@ -4,6 +4,7 @@ import { BaseAgent, type AgentContext } from "./base.js";
 import type { TokenUsage } from "./writer.js";
 import type { LLMMessage } from "../llm/provider.js";
 import type { FinalProviderRequestObservation } from "../agent/worker-agent.js";
+import { projectTruthSettlementContext } from "./truth-settlement-context.js";
 
 export interface TruthExtractionRequest {
   readonly transactionId: string;
@@ -111,6 +112,7 @@ export const FROZEN_CHAPTER_DELTA_PROPOSAL_V1_GRAMMAR = {
 
 /** The exact immutable message preimage used by the Truth Extractor transport. */
 export function buildTruthExtractorMessages(input: TruthExtractionRequest): readonly LLMMessage[] {
+  const context = projectTruthSettlementContext(input);
   return [
     {
       role: "system",
@@ -152,11 +154,11 @@ export function buildTruthExtractorMessages(input: TruthExtractionRequest): read
         "## Verified predecessor StructuredTruthV1",
         input.predecessorTruthJson,
         "## Verified vocabulary catalog",
-        input.vocabularyCatalogJson,
+        context.vocabularyCatalogJson,
         "## Verified committed authority",
-        input.committedAuthority,
+        context.committedAuthority,
         "## Non-authorizing chapter memo",
-        input.chapterMemo ?? "(none)",
+        context.chapterMemo ?? "(none)",
       ].filter((part): part is string => part !== undefined).join("\n\n"),
     },
   ];
