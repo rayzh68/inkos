@@ -2288,7 +2288,7 @@ describe("bounded autonomous production controller", () => {
       const currentEvidence = `${JSON.stringify({
         schema_version: "1.0", chapter_number: 4, status: "BLOCKED_CRITICAL_FINDINGS",
         revisionCount: 2, logicReviewCount: 3, commercialReviewCount: 0,
-        baselineRoleUsage: { writer: { promptTokens: 10, completionTokens: 20, totalTokens: 30 } },
+        baselineRoleUsage: { writer: { promptTokens: 10, completionTokens: 20, totalTokens: 35 } },
         roleUsage: { reviser: { promptTokens: 3, completionTokens: 4, totalTokens: 7 }, "logic-canon-auditor": { promptTokens: 5, completionTokens: 6, totalTokens: 11 } },
         stateSettlementProof,
         modelOutcomes: [...historicalOutcomeIds, failedIds.at(-1)!].map((modelCallId) => ({ modelCallId })),
@@ -2319,6 +2319,12 @@ describe("bounded autonomous production controller", () => {
       await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 4 }))
         .rejects.toThrow("OFFLINE_FINALIZATION_EVIDENCE_NOT_PROVABLE");
       await writeFile(bindingPath, bindingBytes);
+      const malformedUsageEvidence = JSON.parse(currentEvidence);
+      malformedUsageEvidence.baselineRoleUsage.writer.totalTokens = 29;
+      await writeFile(join(evidenceDir, "resume-review.json"), JSON.stringify(malformedUsageEvidence), "utf-8");
+      await expect(resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 4 }))
+        .rejects.toMatchObject({ cause: { message: "OFFLINE_FINALIZATION_PROVENANCE_INVALID:baselineRoleUsage:writer" } });
+      await writeFile(join(evidenceDir, "resume-review.json"), currentEvidence, "utf-8");
       const plan = await resolveFormalPendingChapterRecoveryPlan({ projectRoot: root, bookId: "book", jobId, pendingChapterNumber: 4 });
       expect(plan).toMatchObject({ recoveryClass: "FAILED_REENTRY" });
       expect(plan?.kind).not.toBe("FORMAL_PRESERVED_BOUNDED_REVIEW_RESUME");
@@ -2333,7 +2339,7 @@ describe("bounded autonomous production controller", () => {
       expect(result.status).toBe("accepted-with-findings");
       expect(result).toMatchObject({ revisionCount: 2, logicReviewCount: 3, commercialReviewCount: 0 });
       expect(result.roleUsage).toEqual({
-        writer: { promptTokens: 10, completionTokens: 20, totalTokens: 30 },
+        writer: { promptTokens: 10, completionTokens: 20, totalTokens: 35 },
         reviser: { promptTokens: 3, completionTokens: 4, totalTokens: 7 },
         "logic-canon-auditor": { promptTokens: 5, completionTokens: 6, totalTokens: 11 },
       });

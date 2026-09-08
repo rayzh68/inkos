@@ -3,6 +3,8 @@ export interface AutonomousUsageRecord {
   readonly role: string;
   readonly promptTokens: number;
   readonly completionTokens: number;
+  /** Absent only for legacy historical records without a reported total. */
+  readonly totalTokens?: number;
   readonly actualCostUsd?: number;
   /** Catalog-priced token estimate. This is never provider actual cost. */
   readonly calculatedCostUsd?: number;
@@ -82,7 +84,7 @@ export function projectAutonomousEconomics(params: {
       providerCalls: previous.providerCalls + 1,
       promptTokens: previous.promptTokens + record.promptTokens,
       completionTokens: previous.completionTokens + record.completionTokens,
-      totalTokens: previous.totalTokens + record.promptTokens + record.completionTokens,
+      totalTokens: previous.totalTokens + (record.totalTokens ?? record.promptTokens + record.completionTokens),
       actualCostUsd: costVerified ? previous.actualCostUsd! + record.actualCostUsd! : null,
     };
   }
@@ -126,7 +128,7 @@ export function projectAutonomousEconomics(params: {
       providerCalls: records.length,
       promptTokens,
       completionTokens,
-      totalTokens: promptTokens + completionTokens,
+      totalTokens: records.reduce((sum, record) => sum + (record.totalTokens ?? record.promptTokens + record.completionTokens), 0),
       costUsd: actualCostUsd,
       estimatedCostUsd,
       costStatus,

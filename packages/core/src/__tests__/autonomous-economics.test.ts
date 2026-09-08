@@ -2,6 +2,15 @@ import { describe, expect, it } from "vitest";
 import { projectAutonomousEconomics } from "../production/autonomous-economics.js";
 
 describe("autonomous production economics", () => {
+  it("preserves reported totals without charging unclassified tokens twice", () => {
+    const result = projectAutonomousEconomics({ completedChapters: 1, currentVolumeRemaining: 1, fullBookRemaining: 1,
+      records: [{ identity: "review-1", role: "reviewer", promptTokens: 100, completionTokens: 20, totalTokens: 125,
+        actualCostUsd: 0.3, calculatedCostUsd: 0.2 }] });
+    expect(result.actual.totalTokens).toBe(125);
+    expect(result.byRole.reviewer.totalTokens).toBe(125);
+    expect(result.actual.costUsd).toBe(0.3);
+    expect(result.actual.estimatedCostUsd).toBe(0.2);
+  });
   it("deduplicates actuals and forecasts chapter, volume, and book ranges from samples", () => {
     const result = projectAutonomousEconomics({
       completedChapters: 4,

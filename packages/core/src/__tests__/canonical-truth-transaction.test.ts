@@ -91,6 +91,7 @@ import {
   recordChapterTransactionCandidate,
   recordChapterTransactionReviewEvidence,
   reserveChapterTransactionProviderRequest,
+  revalidateCanonicalTruthProviderEvidence,
 } from "../production/chapter-transaction.js";
 import { createAutonomousProviderExecution } from "../production/bounded-autonomous-controller.js";
 import { fingerprintReviewProviderRequest } from "../agents/commercial-reader.js";
@@ -822,6 +823,91 @@ describe("canonical truth transaction", () => {
 
     await writeFile(join(truthRoot, "accepted/accepted-delta.json"), "{}\n");
     await expect(runCanonicalTruthTransaction(input)).rejects.toThrow(/immutable|accepted delta|authority/i);
+  });
+
+  it("resumes a persisted surplus-total repair with real Provider revalidation and zero new extraction transports", async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), "inkos-usage-repair-")); roots.push(projectRoot);
+    const bookDir = join(projectRoot, "books", "book-1");
+    await mkdir(join(bookDir, "story/runtime/bounded-autonomous"), { recursive: true });
+    await writeFile(join(bookDir, "story/runtime/bounded-autonomous/production-state.json"), JSON.stringify({ jobId: "usage-job", status: "RUNNING", mode: "current-volume", nextChapter: 2 }));
+    const candidate = "Ada opens the gate.";
+    const { transaction } = await beginTruthTransaction(bookDir);
+    let activeStage = { stage: "TRUTH_EXTRACTION", role: "truth-extractor", provider: "test-provider", model: "truth-extractor-model", transactionId: transaction.transactionId };
+    const execution = createAutonomousProviderExecution({ projectRoot, bookId: "book-1", jobId: "usage-job", getActiveStage: () => activeStage });
+    const counts = { initial: 0, repair: 0, validator: 0 };
+    const providerPaths: string[] = [];
+    const reported = { promptTokens: 97988, completionTokens: 1233, totalTokens: 101004, actualCostUsd: 0.4 };
+    const call = async (role: "truth-extractor" | "truth-validator", ordinal: number, frozen: CanonicalTruthExecutionIdentity) => {
+      const stage = role === "truth-validator" ? "TRUTH_VALIDATION" : ordinal === 0 ? "TRUTH_EXTRACTION" : "TRUTH_EXTRACTION_REPAIR";
+      activeStage = { ...activeStage, role, stage, model: frozen.model };
+      const reservation = await reserveChapterTransactionProviderRequest({ bookDir, transactionId: transaction.transactionId,
+        chapterNumber: 2, candidateSha256: sha256Utf8(candidate), role, stage, requestOrdinal: ordinal,
+        request: { provider: frozen.provider, model: frozen.model, messages: frozen.messages, temperature: frozen.temperature,
+          maxTokens: frozen.maxTokens, stream: frozen.stream, webSearch: frozen.webSearch, extra: frozen.extra } });
+      const response = await execution.runProviderCall(2, async () => {
+        counts[role === "truth-validator" ? "validator" : ordinal === 0 ? "initial" : "repair"]++;
+        return { content: role === "truth-validator" ? '{"verdict":"PASS","diagnostics":[]}' : ordinal === 0 ? "not-json" : readyProposal(), usage: ordinal === 0 ? USAGE : reported };
+      }, { provider: frozen.provider, model: frozen.model, inputFingerprint: frozen.inputFingerprint });
+      const artifactPath = execution.responseArtifactPath(frozen.inputFingerprint, frozen.provider, frozen.model, 2);
+      providerPaths.push(artifactPath);
+      const bytes = await readFile(artifactPath, "utf8");
+      const logicalOperationId = artifactPath.split(/[\\/]/u).at(-1)!.replace(/\.json$/u, "");
+      const artifact = { logicalOperationId, inputFingerprint: frozen.inputFingerprint, providerArtifactSha256: sha256Utf8(bytes), responseContentSha256: sha256Utf8(response.content), usage: response.usage };
+      await bindChapterTransactionProviderRequest({ bookDir, transactionId: transaction.transactionId, reservationId: reservation.reservationId,
+        providerReference: { transactionId: transaction.transactionId, chapterNumber: 2, role, stage, provider: frozen.provider, requestedModel: frozen.model,
+          logicalOperationId, inputFingerprint: frozen.inputFingerprint, artifactRelativePath: `story/runtime/bounded-autonomous/provider-responses/${logicalOperationId}.json`,
+          artifactSha256: artifact.providerArtifactSha256, responseContentSha256: artifact.responseContentSha256, responseArtifactStatus: "COMPLETE" } });
+      return { artifact, content: response.content };
+    };
+    const input = { bookDir, transactionId: transaction.transactionId, attemptId: "attempt-1", attemptNumber: 1, chapterNumber: 2,
+      candidate, candidateSha256: sha256Utf8(candidate), predecessorCommitSha256: transaction.previousAuthoritySha256,
+      predecessor: await loadCommittedTruthForWriter({ bookDir, chapterNumber: 2 }),
+      revalidateProviderEvidence: (evidence: Parameters<typeof revalidateCanonicalTruthProviderEvidence>[0]["evidence"]) =>
+        revalidateCanonicalTruthProviderEvidence({ bookDir, transactionId: transaction.transactionId, chapterNumber: 2, candidate, evidence }),
+      extractor: async (request: TruthExtractionRequest, frozen: CanonicalTruthExecutionIdentity) => {
+        const result = await call("truth-extractor", request.repairOrdinal, frozen);
+        return { ...result.artifact, rawProposal: result.content };
+      },
+      validator: async (_request: TruthValidationRequest, frozen: CanonicalTruthExecutionIdentity) => {
+        const result = await call("truth-validator", 1, frozen);
+        return { ...result.artifact, verdict: "PASS", diagnostics: [], rawResponse: result.content };
+      },
+    };
+    const repairRoot = join(bookDir, "story/runtime/chapter-transactions/chapter-0002/staging/evidence/truth", sha256Utf8(candidate), "repair");
+    const originalLink = fs.link;
+    const injected = vi.spyOn(fs, "link").mockImplementation(async (from, to) => {
+      await originalLink(from, to);
+      if (String(to) === join(repairRoot, "extraction.json")) throw new Error("HISTORICAL_USAGE_FAILURE_BOUNDARY");
+    });
+    try { await expect(runCanonicalTruthTransaction(input)).rejects.toThrow("HISTORICAL_USAGE_FAILURE_BOUNDARY"); }
+    finally { injected.mockRestore(); }
+    const retainedPaths = [...providerPaths, join(repairRoot, "extraction.json"), join(repairRoot, "extraction-context.json")];
+    const before = await Promise.all(retainedPaths.map((path) => readFile(path, "utf8")));
+    expect(counts).toEqual({ initial: 1, repair: 1, validator: 0 });
+    const result = await runCanonicalTruthTransaction(input);
+    expect(result.status).toBe("PASS");
+    expect(counts).toEqual({ initial: 1, repair: 1, validator: 1 });
+    expect(await Promise.all(retainedPaths.map((path) => readFile(path, "utf8")))).toEqual(before);
+    expect(result.usageByRole["truth-extractor"]).toEqual({ promptTokens: 97990, completionTokens: 1236, totalTokens: 101009, actualCostUsd: 0.4 });
+  });
+
+  it("accepts reported extraction and validator totals wider than classified tokens", async () => {
+    const bookDir = await mkdtemp(join(tmpdir(), "inkos-usage-contract-")); roots.push(bookDir);
+    const candidate = "Ada opens the gate.";
+    const { transaction } = await beginTruthTransaction(bookDir);
+    const pass = '{"verdict":"PASS","diagnostics":[]}';
+    const usage = { promptTokens: 97988, completionTokens: 1233, totalTokens: 101004, actualCostUsd: 0.4 };
+    const result = await runCanonicalTruthTransaction({ bookDir, transactionId: transaction.transactionId,
+      attemptId: "attempt-1", attemptNumber: 1, chapterNumber: 2, candidate, candidateSha256: sha256Utf8(candidate),
+      predecessorCommitSha256: transaction.previousAuthoritySha256,
+      predecessor: await loadCommittedTruthForWriter({ bookDir, chapterNumber: 2 }),
+      extractor: async () => ({ rawProposal: readyProposal(), logicalOperationId: "extract", inputFingerprint: SHA_B,
+        providerArtifactSha256: SHA_C, responseContentSha256: sha256Utf8(readyProposal()), usage }),
+      validator: async () => ({ verdict: "PASS", diagnostics: [], rawResponse: pass, logicalOperationId: "validate",
+        inputFingerprint: SHA_C, providerArtifactSha256: SHA_D, responseContentSha256: sha256Utf8(pass), usage }),
+    });
+    expect(result.status).toBe("PASS");
+    expect(result.usageByRole).toEqual({ "truth-extractor": usage, "truth-validator": usage });
   });
 
   it("permits one candidate-bound delta-only repair and fails closed on the second defect", async () => {
